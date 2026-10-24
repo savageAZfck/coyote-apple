@@ -52,7 +52,6 @@ name = "coyote"
 version = "0.1.0"
 dependencies = [
  "half",
- "metal",
  "mil_infer",
 ]
 
@@ -61,6 +60,7 @@ name = "coyote-apple"
 version = "0.1.0"
 dependencies = [
  "coyote",
+ "metal",
 ]
 
 [[package]]

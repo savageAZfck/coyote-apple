@@ -15,24 +15,11 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-fn coyote_bin() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    // 1. same target dir (monorepo workspace build)
-    let sib = exe.with_file_name("coyote");
-    if sib.is_file() {
-        return Ok(sib);
-    }
-    // 2. sibling repo: coyote-apple/target/... → coyote/target/{debug,release}
-    if let Some(repo) = exe.ancestors().nth(3) {
-        for prof in ["release", "debug"] {
-            let cand = repo.join("../coyote/target").join(prof).join("coyote");
-            if cand.is_file() {
-                return Ok(cand);
-            }
-        }
-    }
-    // 3. PATH
-    Ok(PathBuf::from("coyote"))
+/// The gate invokes THIS binary's `run` passthrough — the public
+/// `coyote` binary deliberately cannot dispatch every stratum (gpu and
+/// any future first-party targets only have engines registered here).
+fn self_bin() -> Result<PathBuf, String> {
+    std::env::current_exe().map_err(|e| e.to_string())
 }
 
 struct RunOut {
@@ -52,7 +39,7 @@ fn coyote_run(file: &str, dir: &PathBuf, steps: usize, cpu: bool) -> Result<RunO
     if cpu {
         a.push("--cpu".into());
     }
-    let out = Command::new(coyote_bin()?)
+    let out = Command::new(self_bin()?)
         .args(&a)
         .output()
         .map_err(|e| format!("spawn coyote: {e}"))?;
@@ -63,16 +50,19 @@ fn coyote_run(file: &str, dir: &PathBuf, steps: usize, cpu: bool) -> Result<RunO
     })
 }
 
-/// worst `|ane−cpu| pred` / `w` numbers from `coyote run` output, plus
-/// the single-shot `max |ane - cpu| =` line if present.
-fn diffs(text: &str) -> (f64, f64) {
+/// worst `|<backend>−cpu| pred` / `w` numbers from `run` output, plus
+/// the single-shot `max |<backend> - cpu| =` line if present. Returns
+/// the backend label actually seen (ane, gpu, …) for reporting.
+fn diffs(text: &str) -> (f64, f64, &'static str) {
     let (mut pred, mut w) = (0f64, 0f64);
+    let mut label = "sil";
     for l in text.lines() {
-        if l.contains("ane−cpu| pred")
-            || l.contains("ane-cpu| pred")
-            || l.contains("gpu−cpu| pred")
-            || l.contains("gpu-cpu| pred")
-        {
+        if l.contains("−cpu| pred") || l.contains("-cpu| pred") {
+            for b in ["gpu", "ane"] {
+                if l.contains(&format!("{b}−cpu")) || l.contains(&format!("{b}-cpu")) {
+                    label = b;
+                }
+            }
             if let Some(v) = l
                 .split("pred ")
                 .nth(1)
@@ -91,11 +81,7 @@ fn diffs(text: &str) -> (f64, f64) {
                     w = w.max(v);
                 }
             }
-        } else if l.contains("max |ane - cpu| =")
-            || l.contains("max |ane − cpu| =")
-            || l.contains("max |gpu - cpu| =")
-            || l.contains("max |gpu − cpu| =")
-        {
+        } else if l.contains("max |") && l.contains("cpu| =") {
             if let Some(v) = l.rsplit('=').next() {
                 if let Ok(v) = v.trim().parse::<f64>() {
                     pred = pred.max(v);
@@ -103,7 +89,7 @@ fn diffs(text: &str) -> (f64, f64) {
             }
         }
     }
-    (pred, w)
+    (pred, w, label)
 }
 
 pub fn run(args: &[String]) -> Result<(), i32> {
@@ -180,16 +166,16 @@ pub fn run(args: &[String]) -> Result<(), i32> {
                 ));
             }
             // tensor mode — harvest the per-step parity diffs
-            let (pred, w) = diffs(&ane.stdout);
+            let (pred, w, label) = diffs(&ane.stdout);
             let pass = pred <= tol;
             if json {
                 println!(
-                    "{{\"file\":{file:?},\"mode\":\"tensor-parity\",\"steps\":{steps},\"max_pred_diff\":{pred:.6},\"max_state_diff\":{w:.6},\"tol\":{tol},\"verdict\":\"{}\"}}",
+                    "{{\"file\":{file:?},\"mode\":\"tensor-parity\",\"backend\":{label:?},\"steps\":{steps},\"max_pred_diff\":{pred:.6},\"max_state_diff\":{w:.6},\"tol\":{tol},\"verdict\":\"{}\"}}",
                     if pass { "pass" } else { "fail" }
                 );
             } else {
                 println!("oracle — silicon vs spec ({file}, {steps} steps)");
-                println!("  max |ane−cpu| pred {pred:.6}   state/w {w:.6}   tol {tol}");
+                println!("  max |{label}−cpu| pred {pred:.6}   state/w {w:.6}   tol {tol}");
                 println!(
                     "{}",
                     if pass {

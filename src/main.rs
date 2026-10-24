@@ -27,12 +27,15 @@
 //! lib/ automatically (user paths still win).
 
 mod audit;
+mod backend_metal;
 mod bench;
 mod diff;
 mod doc;
 mod emit;
 mod genmask;
 mod gold;
+mod gpu_emit;
+mod gpu_rt;
 mod new;
 mod oracle;
 mod package;
@@ -64,6 +67,12 @@ fn usage() {
 }
 
 fn main() {
+    // the gpu stratum's engine lives here — the public crate parses
+    // `gpu fn` but only this distribution can lower and run it.
+    coyote::backend::register_backend(
+        coyote::ast::Target::Gpu,
+        std::sync::Arc::new(backend_metal::MetalBackend),
+    );
     // the distribution's stdlib rides on CYO_PATH — user's own entries
     // come first, our lib/ last, so project modules always win.
     if let Ok(exe) = std::env::current_exe() {

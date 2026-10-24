@@ -42,6 +42,37 @@ coyote-apple emit     <file.cy> --swift    typed Swift bridge over libcoyote
 coyote-apple <any coyote verb>             passthrough — check/build/run/repl
 ```
 
+## the gpu stratum — first-party compute
+
+`gpu fn` is parsed and typechecked by the public language, but its
+*engine* lives only here. The public crate exposes a backend seam —
+`coyote::backend::register_backend(target, impl Backend)` — and this
+distribution registers `MetalBackend` at startup:
+
+```
+gpu fn block(x: f16[64]) -> f16[64] {
+    rmsnorm(x + x @ wq, rw)
+}
+```
+
+- `src/gpu_emit.rs` lowers the typed AST to Metal Shading Language —
+  one kernel per program, one thread per output element, elementwise
+  fused inline, matmul/softmax/rmsnorm/gather as per-thread loops.
+- `src/gpu_rt.rs` compiles the MSL via the `metal` crate and dispatches
+  over `StorageModeShared` buffers — unified memory means the staging
+  write IS the device buffer. Weights stay resident across calls.
+- `net.msl` + `coyote_build.json` land in the build dir, so `audit`,
+  `package`, `diff`, and `gold` cover gpu builds exactly like ane
+  builds. `oracle` gates them automatically.
+- Bare `coyote` parses `gpu fn` but fails at emit — "no backend
+  registered". The capability is the distribution's.
+- v1 scope: forward passes only. `grad`/`adam`/param updates and state
+  writes are compile errors on this backend, not silent wrongness.
+
+Same-file mixing is the point: `fn` → ANE Mach-O nodes, `gpu fn` →
+Metal kernels, `host fn` → bytecode VM — one type system, one witness
+chain, all three silicons.
+
 ## the stdlib — `lib/std/`
 
 The distribution ships a standard library. `import "std/lora"` (or

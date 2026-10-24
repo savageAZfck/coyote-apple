@@ -37,6 +37,7 @@ coyote-apple bench    <file.cy> [--runs N] e2e + organism-exec timing
 coyote-apple package  <file.cy> [-o pkg]   single-file .cypack distributable
 coyote-apple verify   <pkg.cypack>         integrity check a package
 coyote-apple unpack   <pkg.cypack> -o dir  extract a package
+coyote-apple emit     <file.cy> --swift    typed Swift bridge over libcoyote
 
 coyote-apple <any coyote verb>             passthrough — check/build/run/repl
 ```

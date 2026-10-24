@@ -68,7 +68,11 @@ fn coyote_run(file: &str, dir: &PathBuf, steps: usize, cpu: bool) -> Result<RunO
 fn diffs(text: &str) -> (f64, f64) {
     let (mut pred, mut w) = (0f64, 0f64);
     for l in text.lines() {
-        if l.contains("ane−cpu| pred") || l.contains("ane-cpu| pred") {
+        if l.contains("ane−cpu| pred")
+            || l.contains("ane-cpu| pred")
+            || l.contains("gpu−cpu| pred")
+            || l.contains("gpu-cpu| pred")
+        {
             if let Some(v) = l
                 .split("pred ")
                 .nth(1)
@@ -87,7 +91,11 @@ fn diffs(text: &str) -> (f64, f64) {
                     w = w.max(v);
                 }
             }
-        } else if l.contains("max |ane - cpu| =") || l.contains("max |ane − cpu| =") {
+        } else if l.contains("max |ane - cpu| =")
+            || l.contains("max |ane − cpu| =")
+            || l.contains("max |gpu - cpu| =")
+            || l.contains("max |gpu − cpu| =")
+        {
             if let Some(v) = l.rsplit('=').next() {
                 if let Ok(v) = v.trim().parse::<f64>() {
                     pred = pred.max(v);

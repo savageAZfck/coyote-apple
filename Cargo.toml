@@ -1,0 +1,13 @@
+[package]
+name = "coyote-apple"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "coyote, internal profile — org-grade provenance, packaging, introspection, and benchmarking on the same source-to-silicon pipeline"
+
+[[bin]]
+name = "coyote-apple"
+path = "src/main.rs"
+
+[dependencies]
+coyote = { path = "../coyote" }

@@ -46,12 +46,15 @@ pub enum Arg {
     In(String),
     Param(String),
     State(String),
+    /// materialized-subexpression buffer — allocated zeroed by the
+    /// runtime, written by a prelude kernel, read like an input.
+    Scratch(String, usize),
 }
 
 impl Arg {
     pub fn port(&self) -> &str {
         match self {
-            Arg::In(p) | Arg::Param(p) | Arg::State(p) => p,
+            Arg::In(p) | Arg::Param(p) | Arg::State(p) | Arg::Scratch(p, _) => p,
         }
     }
 }
@@ -82,12 +85,34 @@ struct Ge {
     /// Entries are (scope index, position) — a bound expr can open a
     /// nested Block, so the limit travels with its scope.
     resolve_limit: Vec<(usize, usize)>,
-    /// `w op= s*grad(loss, w)` steps — lowered to one update kernel
-    /// per statement, dispatched before the main kernel (eval applies
-    /// updates before materializing ret).
-    updates: Vec<(String, f64, Typed)>,
+    /// kernels queued in dispatch order — scratch kernels (materialized
+    /// reductions) and update kernels (`w op= s*grad(loss, w)`) land
+    /// here as they're discovered; the main out-kernel is appended
+    /// last by `emit`, matching eval's stmt→ret order.
+    emit_q: Vec<EK>,
+    /// completed scratch kernels awaiting queue placement — inner
+    /// scratches finish before their outer (nested bodies resolve
+    /// while the outer body is still generating).
+    scratch: Vec<EK>,
+    /// expr pointer → scratch buffer name, dedup for non-named
+    /// subexprs read repeatedly (let binds get buffer idents instead).
+    mat_ptr: HashMap<usize, String>,
+    /// scratch buffer creation order — sig/arg indices follow it.
+    scratch_args: Vec<(String, usize)>,
+    /// param name → numel, for update-kernel dispatch sizes.
+    param_numel: HashMap<String, usize>,
     lines: Vec<String>,
     tmp: usize,
+}
+
+/// a queued kernel: msl function name, dispatch size, body lines, and
+/// the param it may write (update kernels only — everyone else is
+/// read-only over params).
+struct EK {
+    name: String,
+    numel: usize,
+    body: Vec<String>,
+    writable: Option<String>,
 }
 
 impl Ge {
@@ -171,7 +196,95 @@ impl Ge {
             .collect()
     }
 
+    /// true when `e`'s subtree contains a reduction — matmul or a
+    /// row-loop builtin — so per-element inlining would recompute
+    /// superlinear work per read. Such tensors materialize to a
+    /// scratch buffer via a prelude kernel instead (what a CUDA
+    /// programmer does by hand; here it's automatic).
+    fn needs_scratch(e: &Typed) -> bool {
+        match &e.e {
+            TExpr::Lit(_) | TExpr::Int(_) | TExpr::Ident(_) | TExpr::Field(..) => false,
+            TExpr::Unary(_, a) | TExpr::Transpose(a) => Self::needs_scratch(a),
+            TExpr::Index(a, _) => Self::needs_scratch(a),
+            TExpr::Bin(op, a, b) => {
+                *op == BinOp::MatMul || Self::needs_scratch(a) || Self::needs_scratch(b)
+            }
+            TExpr::Call(n, args, _) => {
+                matches!(
+                    n.as_str(),
+                    "softmax" | "rmsnorm" | "gather" | "embed" | "outer"
+                ) || args.iter().any(Self::needs_scratch)
+            }
+            TExpr::Block(stmts, ret) => {
+                stmts.iter().any(|s| match s {
+                    TStmt::Let { expr, .. } => Self::needs_scratch(expr),
+                    _ => false,
+                }) || Self::needs_scratch(ret)
+            }
+            TExpr::Grad { .. } => true,
+        }
+    }
+
+    /// element-read entry: non-scalar subexprs containing reductions
+    /// materialize to a scratch buffer (one prelude kernel, dispatched
+    /// in discovery order) instead of recomputing per read. Kernel
+    /// roots call `gen_raw` — they ARE the computation.
     fn gen(&mut self, e: &Typed, coords: &[String]) -> Result<String, String> {
+        if e.ty.numel() > 1 && Self::needs_scratch(e) {
+            let buf = self.scratch_of(e)?;
+            let f = Self::flat(&e.ty.dims, coords, &Kind::Row);
+            return Ok(format!("{buf}[{f}]"));
+        }
+        self.gen_raw(e, coords)
+    }
+
+    /// materialize `e` to `b__m{n}`: emit a prelude kernel writing the
+    /// whole tensor row-major, return the buffer name. Nested
+    /// scratchable subexprs register their own kernels first — the
+    /// `scratch` queue's push order IS dependency order.
+    fn scratch_of(&mut self, e: &Typed) -> Result<String, String> {
+        let key = e as *const Typed as usize;
+        if let Some(b) = self.mat_ptr.get(&key) {
+            return Ok(b.clone());
+        }
+        let buf = format!("b__m{}", self.scratch_args.len());
+        let dims = e.ty.dims.clone();
+        let numel = e.ty.numel() as usize;
+        self.scratch_args.push((buf.clone(), numel));
+        self.mat_ptr.insert(key, buf.clone());
+        // registered as a row-major buffer so rebound let-names
+        // (Ident(b__mN)) and direct reads both hit storage.
+        self.bufs
+            .insert(buf.clone(), (buf.clone(), e.ty.clone(), Kind::Row));
+
+        let saved = std::mem::take(&mut self.lines);
+        let mut coords = Vec::new();
+        for (i, &d) in dims.iter().enumerate() {
+            let cname = format!("s_c{i}");
+            let stride: i64 = dims[i + 1..].iter().product();
+            if dims.len() == 1 {
+                self.lines.push(format!("uint {cname} = gid;"));
+            } else if stride == 1 {
+                self.lines.push(format!("uint {cname} = gid % {d};"));
+            } else {
+                self.lines
+                    .push(format!("uint {cname} = (gid / {stride}) % {d};"));
+            }
+            coords.push(cname);
+        }
+        let v = self.gen_raw(e, &coords)?;
+        self.lines.push(format!("{buf}[gid] = ({v});"));
+        let body = std::mem::replace(&mut self.lines, saved);
+        self.scratch.push(EK {
+            name: format!("mat_{buf}"),
+            numel,
+            body,
+            writable: None,
+        });
+        Ok(buf)
+    }
+
+    fn gen_raw(&mut self, e: &Typed, coords: &[String]) -> Result<String, String> {
         match &e.e {
             TExpr::Lit(v) => Ok(format!("float({v:e})")),
             TExpr::Int(i) => Ok(format!("float({i})")),
@@ -923,15 +1036,51 @@ impl Ge {
     fn stmt(&mut self, s: &TStmt) -> Result<(), String> {
         match s {
             TStmt::Let { name, expr } => {
-                self.scopes
-                    .last_mut()
-                    .unwrap()
-                    .push((name.clone(), expr.clone()));
+                // eval binds eagerly — a reduction-valued let becomes a
+                // scratch buffer NOW (at stmt position, so later param
+                // updates can't retroactively change its value), and
+                // the name rebinds to a buffer ident that every reader
+                // (rhs_read, backward helpers) resolves as storage.
+                if expr.ty.numel() > 1 && Self::needs_scratch(expr) {
+                    let buf = self.scratch_of(expr)?;
+                    self.emit_q.extend(self.scratch.drain(..));
+                    let e = Typed {
+                        e: TExpr::Ident(buf),
+                        ty: expr.ty.clone(),
+                    };
+                    self.scopes.last_mut().unwrap().push((name.clone(), e));
+                } else {
+                    self.scopes
+                        .last_mut()
+                        .unwrap()
+                        .push((name.clone(), expr.clone()));
+                }
                 Ok(())
             }
             TStmt::ParamUpdate { param, scale, grad } => match &grad.e {
                 TExpr::Grad { loss, wrt } if wrt == param && self.is_param(param) => {
-                    self.updates.push((param.clone(), *scale, *loss.clone()));
+                    // body generated at stmt position — lets bound so
+                    // far are exactly eval's visible set.
+                    let numel = self
+                        .param_numel
+                        .get(param)
+                        .copied()
+                        .ok_or_else(|| format!("gpu emit: {param} not a param"))?;
+                    let mark = self.scratch.len();
+                    let saved = std::mem::take(&mut self.lines);
+                    let g = self
+                        .grad_elem(loss, param, "gid")?
+                        .ok_or_else(|| format!("gpu emit: loss does not depend on {param}"))?;
+                    self.lines
+                        .push(format!("b_{param}[gid] += float({scale}) * ({g});"));
+                    let body = std::mem::replace(&mut self.lines, saved);
+                    self.emit_q.extend(self.scratch.drain(mark..));
+                    self.emit_q.push(EK {
+                        name: format!("upd_{param}_{}", self.emit_q.len()),
+                        numel,
+                        body,
+                        writable: Some(param.clone()),
+                    });
                     Ok(())
                 }
                 _ => Err("gpu emit: param updates expect `grad(loss, param)` on a param".into()),
@@ -952,93 +1101,59 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         bufs: HashMap::new(),
         scopes: vec![Vec::new()],
         resolve_limit: Vec::new(), // (scope, pos) pairs
-        updates: Vec::new(),
+        emit_q: Vec::new(),
+        scratch: Vec::new(),
+        mat_ptr: HashMap::new(),
+        scratch_args: Vec::new(),
+        param_numel: p
+            .params
+            .iter()
+            .map(|t| (t.name.clone(), t.ty.numel() as usize))
+            .collect(),
         lines: Vec::new(),
         tmp: 0,
     };
-    // (buffer index, arg name, writable) — param buffers go writable
-    // in update kernels; the main kernel keeps them const.
-    let mut sig = vec![format!(
-        "device float* _out [[buffer({})]]",
-        0 // out is always buffer 0
-    )];
+    // arg names — buffer indices are assigned once scratch buffers
+    // are counted (they append after the declared args).
+    let mut base_args: Vec<(String, String, bool)> = Vec::new(); // (arg, port, state?)
     let mut args = Vec::new();
-    let mut bi = 1usize;
     for (port, dir, ty) in &p.ios {
         if *dir != IoDir::In {
             continue;
         }
         let arg = format!("b_{port}");
-        sig.push(format!("device const float* {arg} [[buffer({bi})]]"));
-        ge.bufs.insert(port.clone(), (arg, ty.clone(), Kind::Row));
+        ge.bufs
+            .insert(port.clone(), (arg.clone(), ty.clone(), Kind::Row));
+        base_args.push((arg, port.clone(), false));
         args.push(Arg::In(port.clone()));
-        bi += 1;
     }
     for t in &p.params {
         let arg = format!("b_{}", t.name);
-        sig.push(format!("device const float* {arg} [[buffer({bi})]]"));
         ge.bufs
-            .insert(t.name.clone(), (arg, t.ty.clone(), Kind::ParamT));
+            .insert(t.name.clone(), (arg.clone(), t.ty.clone(), Kind::ParamT));
+        base_args.push((arg, t.name.clone(), false));
         args.push(Arg::Param(t.name.clone()));
-        bi += 1;
     }
     let mut states = Vec::new();
     for (key, port, ty) in &p.states {
         let arg = format!("b_{port}");
-        sig.push(format!("device float* {arg} [[buffer({bi})]]"));
-        ge.bufs.insert(key.clone(), (arg, ty.clone(), Kind::Row));
+        ge.bufs
+            .insert(key.clone(), (arg.clone(), ty.clone(), Kind::Row));
         states.push((key.clone(), port.clone(), ty.clone()));
+        base_args.push((arg, port.clone(), true));
         args.push(Arg::State(port.clone()));
-        bi += 1;
     }
 
-    // body: lets inline; param-update stmts collect into `updates`
+    // body walk emits kernels in discovery order: let-bound
+    // reductions materialize eagerly (eval binds eagerly), updates
+    // generate at their stmt position.
     for s in &p.body {
         ge.stmt(s)?;
     }
 
-    // one update kernel per `w op= s*grad(loss, w)` — gid over the
-    // param's [N,K] storage, `w += scale * grads(w)[gid]`. Dispatched
-    // BEFORE the main kernel to match eval's stmt-before-ret order.
-    let mut kernel_srcs = Vec::new();
-    let mut kernels = Vec::new();
-    for (param, scale, loss) in std::mem::take(&mut ge.updates) {
-        let numel = p
-            .params
-            .iter()
-            .find(|t| t.name == param)
-            .map(|t| t.ty.numel() as usize)
-            .ok_or_else(|| format!("gpu emit: update target {param} not a param"))?;
-        ge.lines.clear();
-        let g = ge
-            .grad_elem(&loss, &param, "gid")?
-            .ok_or_else(|| format!("gpu emit: loss does not depend on {param}"))?;
-        ge.lines
-            .push(format!("b_{param}[gid] += float({scale}) * ({g});"));
-        let up_sig: Vec<String> = sig
-            .iter()
-            .map(|s| {
-                s.replace(
-                    &format!("device const float* b_{param}"),
-                    &format!("device float* b_{param}"),
-                )
-            })
-            .collect();
-        let kname = format!("coyote_{name}_upd_{param}");
-        kernel_srcs.push(format!(
-            "kernel void {kname}(\n    {},\n    uint gid [[thread_position_in_grid]])\n{{\n{}\n}}\n",
-            up_sig.join(",\n    "),
-            ge.lines
-                .iter()
-                .map(|l| format!("    {l}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ));
-        kernels.push((kname, numel));
-    }
-
+    // main out-kernel — last in dispatch order.
+    let mark = ge.scratch.len();
     ge.lines.clear();
-    // gid → out coords (row-major over the output's dims)
     let mut coords = Vec::new();
     let r = oty.dims.len();
     for i in 0..r {
@@ -1055,19 +1170,61 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         }
         coords.push(cname);
     }
-    let v = ge.gen(&p.ret, &coords)?;
+    let v = ge.gen_raw(&p.ret, &coords)?;
     ge.lines.push(format!("_out[gid] = ({v});"));
+    ge.emit_q.extend(ge.scratch.drain(mark..));
+    ge.emit_q.push(EK {
+        name: "main".into(),
+        numel: oty.numel() as usize,
+        body: std::mem::take(&mut ge.lines),
+        writable: None,
+    });
 
-    kernel_srcs.push(format!(
-        "kernel void coyote_{name}(\n    {},\n    uint gid [[thread_position_in_grid]])\n{{\n{}\n}}\n",
-        sig.join(",\n    "),
-        ge.lines
+    // signature: out + declared args + scratch buffers, in order.
+    let mut sig = vec!["device float* _out [[buffer(0)]]".to_string()];
+    let mut bi = 1usize;
+    for (arg, _port, writable) in &base_args {
+        let qual = if *writable {
+            "device float*"
+        } else {
+            "device const float*"
+        };
+        sig.push(format!("{qual} {arg} [[buffer({bi})]]"));
+        bi += 1;
+    }
+    for (buf, n) in &ge.scratch_args {
+        sig.push(format!("device float* {buf} [[buffer({bi})]]"));
+        args.push(Arg::Scratch(buf.clone(), *n));
+        bi += 1;
+    }
+
+    // format every queued kernel; update kernels re-declare their
+    // param arg writable.
+    let mut kernel_srcs = Vec::new();
+    let mut kernels = Vec::new();
+    for ek in &ge.emit_q {
+        let kname = format!("coyote_{name}_{}", ek.name);
+        let ksig: Vec<String> = sig
             .iter()
-            .map(|l| format!("    {l}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    ));
-    kernels.push((format!("coyote_{name}"), oty.numel() as usize));
+            .map(|s| match &ek.writable {
+                Some(param) => s.replace(
+                    &format!("device const float* b_{param}"),
+                    &format!("device float* b_{param}"),
+                ),
+                None => s.clone(),
+            })
+            .collect();
+        kernel_srcs.push(format!(
+            "kernel void {kname}(\n    {},\n    uint gid [[thread_position_in_grid]])\n{{\n{}\n}}\n",
+            ksig.join(",\n    "),
+            ek.body
+                .iter()
+                .map(|l| format!("    {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        kernels.push((kname, ek.numel));
+    }
 
     let msl = format!(
         "// coyote gpu emit — {name}\n#include <metal_stdlib>\nusing namespace metal;\n\n{}",

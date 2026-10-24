@@ -120,6 +120,10 @@ impl GpuRuntime {
                     bufs.push(buf_f32(&dev, &data));
                     elems.push(data.len());
                 }
+                Arg::Scratch(_name, numel) => {
+                    bufs.push(buf_f32(&dev, &vec![0.0; *numel]));
+                    elems.push(*numel);
+                }
             }
         }
         Ok(Self {

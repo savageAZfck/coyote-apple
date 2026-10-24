@@ -65,6 +65,11 @@ gpu fn block(x: f16[64]) -> f16[64] {
 - `net.msl` + `coyote_build.json` land in the build dir, so `audit`,
   `package`, `diff`, and `gold` cover gpu builds exactly like ane
   builds. `oracle` gates them automatically.
+- Reduction subexpressions materialize automatically: a tensor whose
+  subtree contains matmul/softmax/rmsnorm/gather gets its own prelude
+  kernel + scratch buffer in discovery order (let-bound reductions
+  materialize at bind position, matching eval's eager `let`). Without
+  this, `softmax(q@k.T)@v` inlined to 1G MACs — with it, ~1M.
 - Bare `coyote` parses `gpu fn` but fails at emit — "no backend
   registered". The capability is the distribution's.
 - `grad(loss, w)` lowers reverse-mode on-device — same rule set and

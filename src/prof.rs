@@ -66,12 +66,15 @@ fn prof_ext(src: &str, prog: &TProgram, dir: &PathBuf, runs: usize) -> Result<St
     }
     let mut host = Vec::new();
     let mut dev = Vec::new();
-    let mut got = Vec::new();
-    for _ in 0..=runs {
+    // parity compares the FIRST run's output — update programs
+    // legitimately evolve weights every dispatch, so only step 0 is
+    // spec-equivalent to a single eval pass.
+    let mut first = Vec::new();
+    for i in 0..=runs {
         let t = Instant::now();
         let r = rt.run(&writes)?;
-        if !r.is_empty() {
-            got = r;
+        if i == 0 && !r.is_empty() {
+            first = r;
         }
         host.push(t.elapsed().as_secs_f64() * 1e3);
         if let Some(d) = rt.device_ms() {
@@ -95,7 +98,7 @@ fn prof_ext(src: &str, prog: &TProgram, dir: &PathBuf, runs: usize) -> Result<St
         host_avg,
         dev_min,
         dev_avg,
-        parity: eval_parity(prog, &inputs, &got),
+        parity: eval_parity(prog, &inputs, &first),
         outs: out.output.1.numel() as usize,
     })
 }

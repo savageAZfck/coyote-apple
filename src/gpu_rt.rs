@@ -20,7 +20,7 @@ pub struct GpuRuntime {
     queue: metal::CommandQueue,
     /// (pipeline, dispatch size) per kernel — update kernels first,
     /// the main out kernel last, matching eval's stmt→ret order.
-    pipes: Vec<(metal::ComputePipelineState, usize)>,
+    pipes: Vec<(metal::ComputePipelineState, crate::gpu_emit::Dispatch)>,
     out_n: usize,
     /// buffer objects in arg order — index 0 is out.
     bufs: Vec<metal::Buffer>,
@@ -56,14 +56,14 @@ impl GpuRuntime {
                 )
             })?;
         let mut pipes = Vec::new();
-        for (kname, numel) in &out.kernels {
+        for (kname, disp) in &out.kernels {
             let f = lib
                 .get_function(kname, None)
                 .map_err(|e| format!("msl kernel ({name}:{kname}): {e:?}"))?;
             let pipe = dev
                 .new_compute_pipeline_state_with_function(&f)
                 .map_err(|e| format!("msl pipeline ({name}:{kname}): {e:?}"))?;
-            pipes.push((pipe, *numel));
+            pipes.push((pipe, *disp));
         }
         let queue = dev.new_command_queue();
 
@@ -164,17 +164,33 @@ impl GpuRuntime {
         let cb = self.queue.new_command_buffer();
         // one encoder per dispatch — encoders serialize, so update
         // kernels fully complete before the out kernel reads params.
-        for (pipe, numel) in &self.pipes {
+        for (pipe, disp) in &self.pipes {
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(pipe);
             for (i, b) in self.bufs.iter().enumerate() {
                 enc.set_buffer(i as u64, Some(b), 0);
             }
-            let n = *numel as u64;
-            let tg = (pipe.max_total_threads_per_threadgroup() as u64)
-                .min(n)
-                .max(1);
-            enc.dispatch_threads(MTLSize::new(n, 1, 1), MTLSize::new(tg, 1, 1));
+            match disp {
+                crate::gpu_emit::Dispatch::Linear(numel) => {
+                    let n = *numel as u64;
+                    let tg = (pipe.max_total_threads_per_threadgroup() as u64)
+                        .min(n)
+                        .max(1);
+                    enc.dispatch_threads(MTLSize::new(n, 1, 1), MTLSize::new(tg, 1, 1));
+                }
+                crate::gpu_emit::Dispatch::Tiled { m, n, t, mt } => {
+                    // each thread covers an mt×mt micro-tile → the grid
+                    // is n/(t·mt) blocks × t threads. Grid is rounded
+                    // UP to whole threadgroups — tile loads are
+                    // lid-indexed and read by every member, so partial
+                    // groups would leave stale threadgroup memory;
+                    // kernel guards keep out-of-range threads clean.
+                    let (tt, mt) = (*t as u64, *mt as u64);
+                    let gx = (*n as u64).div_ceil(tt * mt) * tt;
+                    let gy = (*m as u64).div_ceil(tt * mt) * tt;
+                    enc.dispatch_threads(MTLSize::new(gx, gy, 1), MTLSize::new(tt, tt, 1));
+                }
+            }
             enc.end_encoding();
         }
         cb.commit();

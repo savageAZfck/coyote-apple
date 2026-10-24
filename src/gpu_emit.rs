@@ -37,8 +37,19 @@ pub struct GpuOut {
     pub output: (String, CTy),
     /// kernels to dispatch in order — the main program kernel is
     /// always LAST (eval runs stmts incl. updates before ret); each
-    /// entry is (msl function name, dispatch size).
-    pub kernels: Vec<(String, usize)>,
+    /// entry is (msl function name, dispatch shape).
+    pub kernels: Vec<(String, Dispatch)>,
+}
+
+/// how a kernel maps threads: flat elementwise (`Linear`) or a
+/// threadgroup-cooperative tiled matmul over a `t×t` tile
+/// (`Tiled` — grid is n×m threads in t×t threadgroups).
+#[derive(Debug, Clone, Copy)]
+pub enum Dispatch {
+    Linear(usize),
+    /// grid = ceil(n/(t·mt))×t × ceil(m/(t·mt))×t threads, t×t groups —
+    /// each thread owns an mt×mt micro-tile of the output.
+    Tiled { m: usize, n: usize, t: usize, mt: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -105,15 +116,23 @@ struct Ge {
     tmp: usize,
 }
 
-/// a queued kernel: msl function name, dispatch size, body lines, and
-/// the param it may write (update kernels only — everyone else is
-/// read-only over params).
+/// a queued kernel: msl function name, dispatch shape, body lines,
+/// and the param it may write (update kernels only — everyone else
+/// is read-only over params).
 struct EK {
     name: String,
-    numel: usize,
+    dispatch: Dispatch,
     body: Vec<String>,
     writable: Option<String>,
 }
+
+/// cooperative-matmul geometry: a TT×TT threadgroup covers a
+/// TILE×TILE output block, each thread computing TM×TM outputs —
+/// the register-blocking structure cuBLAS-style kernels use.
+const TILE: usize = 32;
+const TT: usize = 8;
+const TM: usize = 4;
+const BK: usize = 16;
 
 impl Ge {
     fn tmp(&mut self) -> String {
@@ -258,30 +277,152 @@ impl Ge {
             .insert(buf.clone(), (buf.clone(), e.ty.clone(), Kind::Row));
 
         let saved = std::mem::take(&mut self.lines);
-        let mut coords = Vec::new();
-        for (i, &d) in dims.iter().enumerate() {
-            let cname = format!("s_c{i}");
-            let stride: i64 = dims[i + 1..].iter().product();
-            if dims.len() == 1 {
-                self.lines.push(format!("uint {cname} = gid;"));
-            } else if stride == 1 {
-                self.lines.push(format!("uint {cname} = gid % {d};"));
-            } else {
-                self.lines
-                    .push(format!("uint {cname} = (gid / {stride}) % {d};"));
+        let (body, dispatch) = match self.tiled_body(e, &buf) {
+            Some((b, d)) => (b, d),
+            None => {
+                let mut coords = Vec::new();
+                for (i, &d) in dims.iter().enumerate() {
+                    let cname = format!("s_c{i}");
+                    let stride: i64 = dims[i + 1..].iter().product();
+                    if dims.len() == 1 {
+                        self.lines.push(format!("uint {cname} = gid;"));
+                    } else if stride == 1 {
+                        self.lines.push(format!("uint {cname} = gid % {d};"));
+                    } else {
+                        self.lines
+                            .push(format!("uint {cname} = (gid / {stride}) % {d};"));
+                    }
+                    coords.push(cname);
+                }
+                let v = self.gen_raw(e, &coords)?;
+                self.lines.push(format!("{buf}[gid] = ({v});"));
+                (std::mem::take(&mut self.lines), Dispatch::Linear(numel))
             }
-            coords.push(cname);
-        }
-        let v = self.gen_raw(e, &coords)?;
-        self.lines.push(format!("{buf}[gid] = ({v});"));
-        let body = std::mem::replace(&mut self.lines, saved);
+        };
+        self.lines = saved;
         self.scratch.push(EK {
             name: format!("mat_{buf}"),
-            numel,
+            dispatch,
             body,
             writable: None,
         });
         Ok(buf)
+    }
+
+    /// chase `let`-bound names to their underlying buffer — eagerly
+    /// materialized binds rebind to `Ident(b__mN)`, so one hop usually
+    /// suffices; loop guards deeper alias chains.
+    fn resolve_buf(&self, e: &Typed) -> Option<(String, CTy, Kind)> {
+        let mut cur = e;
+        for _ in 0..8 {
+            let TExpr::Ident(s) = &cur.e else { return None };
+            if let Some((a, t, k)) = self.bufs.get(s) {
+                return Some((a.clone(), t.clone(), *k));
+            }
+            match self.pos_of(s) {
+                Some((_, _, b)) => cur = b,
+                None => return None,
+            }
+        }
+        None
+    }
+
+    /// If `e` is a plain `A @ B` over buffers, emit the cooperative-
+    /// tile kernel: a TILE×TILE threadgroup loads A/B slices into
+    /// threadgroup memory once and reuses them — the difference
+    /// between a memory-bound ~150 GFLOP/s naive pass and a
+    /// compute-bound kernel. Index formulas reuse eval's conventions:
+    /// lhs row-major `a[m*K+k]`; named rhs flat `b[n*K+k]`; the one
+    /// strided case (non-square param `.T`) reads `b[k*N+n]`. Bounds
+    /// are guarded so any M,N,K shape works; accumulation order is
+    /// still sequential-k, so parity vs eval is unchanged.
+    fn tiled_body(&self, e: &Typed, out_buf: &str) -> Option<(Vec<String>, Dispatch)> {
+        let TExpr::Bin(BinOp::MatMul, a, b) = &e.e else {
+            return None;
+        };
+        if a.ty.dims.len() != 2 || b.ty.dims.len() != 2 {
+            return None;
+        }
+        let (m_dim, k_dim, n_dim) = (
+            a.ty.dims[0] as usize,
+            a.ty.dims[1] as usize,
+            b.ty.dims[1] as usize,
+        );
+        let (a_arg, _, _) = self.resolve_buf(a)?;
+        let a_e = format!("{a_arg}[(m)*{k_dim}+(tk)]");
+        let b_e = match &b.e {
+            TExpr::Ident(_) => {
+                let (arg, _, _) = self.resolve_buf(b)?;
+                format!("{arg}[(bn)*{k_dim}+(tk)]")
+            }
+            TExpr::Transpose(inner) => {
+                let (arg, ity, kind) = self.resolve_buf(inner)?;
+                if matches!(kind, Kind::ParamT) && ity.dims[0] != ity.dims[1] {
+                    format!("{arg}[(tk)*{n_dim}+(bn)]")
+                } else {
+                    format!("{arg}[(bn)*{k_dim}+(tk)]")
+                }
+            }
+            _ => return None,
+        };
+        let (t, tt, tm, bk) = (TILE, TT, TM, BK);
+        let mut l = Vec::new();
+        // Register-blocked tile: TT×TT threads cover a TILE×TILE block,
+        // each thread owns a TM×TM micro-tile. Cooperative loads fill
+        // As/Bs once per BK-deep k-slice; the inner loop then does
+        // TM+TM shared reads per TM² FMAs — the compute-per-byte ratio
+        // that separates a tuned GEMM from a naive one. +1 pad on the
+        // tile stride kills bank conflicts.
+        l.push(format!("threadgroup float As[{t}][{}];", bk + 1));
+        l.push(format!("threadgroup float Bs[{t}][{}];", bk + 1));
+        l.push(format!("uint lf = lid2.y*{tt} + lid2.x;"));
+        // block origin = threadgroup origin × micro-tile: each thread
+        // owns TM outputs, so the tgid offset scales by TM.
+        l.push(format!("uint m0 = (gid2.y - lid2.y)*{tm};"));
+        l.push(format!("uint n0 = (gid2.x - lid2.x)*{tm};"));
+        l.push(format!("float acc[{tm}][{tm}];"));
+        l.push(format!(
+            "for (uint i = 0; i < {tm}; ++i) for (uint j = 0; j < {tm}; ++j) acc[i][j] = 0.0f;"
+        ));
+        l.push(format!("for (uint t = 0; t < {k_dim}; t += {bk}) {{"));
+        // cooperative load: TILE×BK elems per operand over TT² threads
+        let each = t * bk / (tt * tt);
+        l.push(format!(
+            "    for (uint i = 0; i < {each}; ++i) {{ uint idx = lf + i*{ttsq}; uint r = idx/{bk}; uint c = idx%{bk};",
+            ttsq = tt * tt
+        ));
+        l.push(format!(
+            "        As[r][c] = (m0 + r < {m_dim} && t + c < {k_dim}) ? ({}) : 0.0f;",
+            a_e.replace("(m)", "(m0 + r)").replace("(tk)", "(t + c)")
+        ));
+        l.push(format!(
+            "        Bs[r][c] = (n0 + r < {n_dim} && t + c < {k_dim}) ? ({}) : 0.0f;",
+            b_e.replace("(bn)", "(n0 + r)").replace("(tk)", "(t + c)")
+        ));
+        l.push("    }".into());
+        l.push("    threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+        l.push(format!("    for (uint kk = 0; kk < {bk}; ++kk) {{"));
+        l.push(format!(
+            "        float av[{tm}], bv[{tm}]; for (uint i = 0; i < {tm}; ++i) {{ av[i] = As[lid2.y*{tm}+i][kk]; bv[i] = Bs[lid2.x*{tm}+i][kk]; }}"
+        ));
+        l.push(format!(
+            "        for (uint i = 0; i < {tm}; ++i) for (uint j = 0; j < {tm}; ++j) acc[i][j] += av[i]*bv[j];"
+        ));
+        l.push("    }".into());
+        l.push("    threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+        l.push("}".into());
+        l.push(format!(
+            "for (uint i = 0; i < {tm}; ++i) for (uint j = 0; j < {tm}; ++j) {{ uint m = m0 + lid2.y*{tm} + i; uint n = n0 + lid2.x*{tm} + j; if (m < {m_dim} && n < {n_dim}) {out_buf}[(m)*{n_dim}+(n)] = acc[i][j]; }}"
+        ));
+        Some((
+            l,
+            Dispatch::Tiled {
+                m: m_dim,
+                n: n_dim,
+                t: tt,
+                mt: tm,
+            },
+        ))
     }
 
     fn gen_raw(&mut self, e: &Typed, coords: &[String]) -> Result<String, String> {
@@ -1077,7 +1218,7 @@ impl Ge {
                     self.emit_q.extend(self.scratch.drain(mark..));
                     self.emit_q.push(EK {
                         name: format!("upd_{param}_{}", self.emit_q.len()),
-                        numel,
+                        dispatch: Dispatch::Linear(numel),
                         body,
                         writable: Some(param.clone()),
                     });
@@ -1151,32 +1292,42 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         ge.stmt(s)?;
     }
 
-    // main out-kernel — last in dispatch order.
+    // main out-kernel — last in dispatch order. A bare `A @ B` ret
+    // takes the cooperative-tile path instead of per-element loops.
     let mark = ge.scratch.len();
-    ge.lines.clear();
-    let mut coords = Vec::new();
-    let r = oty.dims.len();
-    for i in 0..r {
-        let cname = format!("c{i}");
-        let stride: i64 = oty.dims[i + 1..].iter().product();
-        let d = oty.dims[i];
-        if r == 1 {
-            ge.lines.push(format!("uint {cname} = gid;"));
-        } else if stride == 1 {
-            ge.lines.push(format!("uint {cname} = gid % {d};"));
-        } else {
-            ge.lines
-                .push(format!("uint {cname} = (gid / {stride}) % {d};"));
+    let (body, dispatch) = match ge.tiled_body(&p.ret, "_out") {
+        Some((b, d)) => (b, d),
+        None => {
+            ge.lines.clear();
+            let mut coords = Vec::new();
+            let r = oty.dims.len();
+            for i in 0..r {
+                let cname = format!("c{i}");
+                let stride: i64 = oty.dims[i + 1..].iter().product();
+                let d = oty.dims[i];
+                if r == 1 {
+                    ge.lines.push(format!("uint {cname} = gid;"));
+                } else if stride == 1 {
+                    ge.lines.push(format!("uint {cname} = gid % {d};"));
+                } else {
+                    ge.lines
+                        .push(format!("uint {cname} = (gid / {stride}) % {d};"));
+                }
+                coords.push(cname);
+            }
+            let v = ge.gen_raw(&p.ret, &coords)?;
+            ge.lines.push(format!("_out[gid] = ({v});"));
+            (
+                std::mem::take(&mut ge.lines),
+                Dispatch::Linear(oty.numel() as usize),
+            )
         }
-        coords.push(cname);
-    }
-    let v = ge.gen_raw(&p.ret, &coords)?;
-    ge.lines.push(format!("_out[gid] = ({v});"));
+    };
     ge.emit_q.extend(ge.scratch.drain(mark..));
     ge.emit_q.push(EK {
         name: "main".into(),
-        numel: oty.numel() as usize,
-        body: std::mem::take(&mut ge.lines),
+        dispatch,
+        body,
         writable: None,
     });
 
@@ -1214,8 +1365,14 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
                 None => s.clone(),
             })
             .collect();
+        let thread_decl = match ek.dispatch {
+            Dispatch::Linear(_) => "uint gid [[thread_position_in_grid]]",
+            Dispatch::Tiled { .. } => {
+                "uint2 gid2 [[thread_position_in_grid]],\n    uint2 lid2 [[thread_position_in_threadgroup]]"
+            }
+        };
         kernel_srcs.push(format!(
-            "kernel void {kname}(\n    {},\n    uint gid [[thread_position_in_grid]])\n{{\n{}\n}}\n",
+            "kernel void {kname}(\n    {},\n    {thread_decl})\n{{\n{}\n}}\n",
             ksig.join(",\n    "),
             ek.body
                 .iter()
@@ -1223,7 +1380,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
                 .collect::<Vec<_>>()
                 .join("\n"),
         ));
-        kernels.push((kname, ek.numel));
+        kernels.push((kname, ek.dispatch));
     }
 
     let msl = format!(

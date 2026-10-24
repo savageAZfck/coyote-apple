@@ -11,7 +11,7 @@
 //!   coyote-apple verify   <pkg.cypack>         integrity check a package
 //!   coyote-apple unpack   <pkg.cypack> -o dir  extract a package
 //!   coyote-apple bench    <file.cy> [--runs N] e2e + organism-exec timing
-//!   coyote-apple oracle   <file.cy> [--steps N] [--json] [--cpu]
+//!   coyote-apple oracle   <file.cy> [--steps N] [--json]
 //!                                            semantic parity gate (ANE vs CPU)
 //!   coyote-apple genmask  <name>:<rank>:<dim>  rank-selector mask → safetensors
 //!   coyote-apple diff     <dirA> <dirB>        build-vs-build artifact delta
@@ -41,7 +41,7 @@ fn usage() {
     eprintln!("  verify   <pkg.cypack>");
     eprintln!("  unpack   <pkg.cypack> -o <dir>");
     eprintln!("  bench    <file.cy> [-o dir] [--steps N] [--runs N] [--cpu] [--json]");
-    eprintln!("  oracle   <file.cy> [--steps N] [--json] [--cpu]   semantic parity gate");
+    eprintln!("  oracle   <file.cy> [--steps N] [--json]   semantic parity gate");
     eprintln!("  genmask  <name>:<rank>:<dim> [--rows] -o mask.safetensors");
     eprintln!("  diff     <dirA> <dirB>   per-file delta between two build dirs");
     eprintln!("  test     <file.cy> [--cpu]       run host fn test_*() cases");

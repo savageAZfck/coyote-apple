@@ -19,18 +19,26 @@
 //!   coyote-apple new      <name>               scaffold a coyote project
 //!   coyote-apple weights  <inspect|slice>      safetensors checkpoint tooling
 //!   coyote-apple doc      <file.cy>            generated API markdown
+//!   coyote-apple gold     <record|check>       golden-output regression
+//!   coyote-apple watch    <file.cy> [--run]    rebuild on save
+//!
+//! The distribution also ships `lib/std/` — the stdlib. `import "std/x"`
+//! resolves through CYO_PATH, which this binary extends with its own
+//! lib/ automatically (user paths still win).
 
 mod audit;
 mod bench;
 mod diff;
 mod doc;
 mod genmask;
+mod gold;
 mod new;
 mod oracle;
 mod package;
 mod spec;
 mod stfile;
 mod test;
+mod watch;
 mod weights;
 
 fn usage() {
@@ -48,10 +56,24 @@ fn usage() {
     eprintln!("  new      <name> [--program]      scaffold a coyote project");
     eprintln!("  weights  inspect|slice ...       safetensors checkpoint tooling");
     eprintln!("  doc      <file.cy> [-o doc.md]   generated API markdown");
+    eprintln!("  gold     record|check <file.cy>  golden-output regression");
+    eprintln!("  watch    <file.cy> [--run]       rebuild on save");
     eprintln!("  + all coyote verbs (check/build/run/repl) pass through unchanged");
 }
 
 fn main() {
+    // the distribution's stdlib rides on CYO_PATH — user's own entries
+    // come first, our lib/ last, so project modules always win.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(repo) = exe.ancestors().nth(3) {
+            let lib = repo.join("lib");
+            if lib.is_dir() {
+                let cur = std::env::var("CYO_PATH").unwrap_or_default();
+                let sep = if cur.is_empty() { "" } else { ":" };
+                std::env::set_var("CYO_PATH", format!("{cur}{sep}{}", lib.display()));
+            }
+        }
+    }
     let args: Vec<String> = std::env::args().collect();
     let Some(cmd) = args.get(1).map(|s| s.as_str()) else {
         usage();
@@ -71,6 +93,8 @@ fn main() {
         "new" => new::run(&args[2..]),
         "weights" => weights::run(&args[2..]),
         "doc" => doc::run(&args[2..]),
+        "gold" => gold::run(&args[2..]),
+        "watch" => watch::run(&args[2..]),
         _ => coyote::cli::run(&args),
     };
     if let Err(code) = r {

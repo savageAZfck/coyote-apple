@@ -18,7 +18,9 @@
 //! raw-grad kernel stmt-position and the on-device moment update
 //! (m/v/step in persistent zero-init scratch, fp16-rounded weight
 //! writeback like `adam_step`) after the out kernel. State writes
-//! and `Assign` on params still emit honest errors, not silent
+//! (`s.f op= e`, one-hot scatters `s.f[p] op= e`) emit stmt-position
+//! kernels against the resident state buffer — the kv-cache story.
+//! `Assign` on params still emits an honest error, not silent
 //! wrongness.
 
 use coyote::ast::{BinOp, IoDir, Qual, UnOp};
@@ -648,6 +650,22 @@ impl Ge {
                 self.gen(inner, &c)
             }
             TExpr::Index(base, idxs) => {
+                // eval's 2-D `base[r]` is a one-hot gather under the
+                // rhs storage convention — `out[j] = base[j*D0 + r]` —
+                // a column read over flat storage, NOT a row slice.
+                if base.ty.dims.len() == 2 && idxs.len() == 1 {
+                    if let TIndex::Lit(r) = idxs[0] {
+                        let Some(j) = coords.first() else {
+                            return Err("gpu emit: index result needs a free coord".into());
+                        };
+                        let d0 = base.ty.dims[0];
+                        let arg = match self.resolve_buf(base) {
+                            Some((a, _, _)) => a,
+                            None => self.scratch_of(base)?,
+                        };
+                        return Ok(format!("{arg}[({j})*{d0} + {r}]"));
+                    }
+                }
                 // index ops consume leading dims of base: Lit pins,
                 // Range offsets. Remaining coords fill free dims.
                 let mut c = Vec::new();
@@ -1417,8 +1435,49 @@ impl Ge {
                 }
                 _ => Err("gpu emit: adam expects `adam(param, grad(loss, param) [, lr])`".into()),
             },
-            TStmt::Assign { .. } | TStmt::StateUpdate { .. } => {
-                Err("gpu stratum: state/assign updates not lowered — SGD and adam steps only".into())
+            TStmt::StateUpdate { key, port, expr } => {
+                // typeck already desugared `s.f op= e` / `s.f[p] op= e`
+                // into the full new field value — emit a stmt-position
+                // kernel writing it into the resident state buffer.
+                // eval's env-insert semantics fall out for free: later
+                // statements read the same device buffer.
+                let numel = self
+                    .bufs
+                    .get(key)
+                    .map(|(_, t, _)| t.numel() as usize)
+                    .ok_or_else(|| format!("gpu emit: {key} not a state field"))?;
+                let mark = self.scratch.len();
+                let saved = std::mem::take(&mut self.lines);
+                let r = expr.ty.dims.len();
+                let mut coords = Vec::new();
+                for i in 0..r {
+                    let cname = format!("c{i}");
+                    let stride: i64 = expr.ty.dims[i + 1..].iter().product();
+                    let d = expr.ty.dims[i];
+                    if r == 1 {
+                        self.lines.push(format!("uint {cname} = gid;"));
+                    } else if stride == 1 {
+                        self.lines.push(format!("uint {cname} = gid % {d};"));
+                    } else {
+                        self.lines
+                            .push(format!("uint {cname} = (gid / {stride}) % {d};"));
+                    }
+                    coords.push(cname);
+                }
+                let v = self.gen(expr, &coords)?;
+                self.lines.push(format!("b_{port}[gid] = ({v});"));
+                let body = std::mem::replace(&mut self.lines, saved);
+                self.emit_q.extend(self.scratch.drain(mark..));
+                self.emit_q.push(EK {
+                    name: format!("stw_{port}_{}", self.emit_q.len()),
+                    dispatch: Dispatch::Linear(numel),
+                    body,
+                    writable: None, // state args are device float* in every sig
+                });
+                Ok(())
+            }
+            TStmt::Assign { .. } => {
+                Err("gpu stratum: Assign-on-params not lowered — SGD, adam, and state writes only".into())
             }
             TStmt::Expr(_) => Ok(()),
         }

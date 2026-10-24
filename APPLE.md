@@ -92,6 +92,16 @@ gpu fn block(x: f16[64]) -> f16[64] {
   silicon, gated for newer hardware. `CYO_TILE`/`CYO_TM`/`CYO_BK`
   override tile geometry for autotuning sweeps — 32/4/16 is the
   measured sweet spot on dev silicon.
+- Vector-lhs matmuls (`x @ w`, `q @ kv.k.T`, `s @ kv.v` — the decode
+  shape) emit a dedicated GEMV kernel: one thread per output, serial-k
+  accumulator in eval's exact order, contraction row consumed as
+  `float4` loads — a quarter of the load instructions. Column-
+  contraction cases keep one-thread-per-output serial-t. On the
+  D=1024/T=256 decode probe: device 1.617 → 0.762 ms, dominant
+  matvecs 0.30 → 0.10 ms each, parity unchanged at 0.000027.
+  (A cooperative threadgroup-staging variant measured 2.4× slower on
+  this silicon — barriers expose latency where sequential rows
+  already prefetch — `CYO_NOGEMV=1` falls back for A/B work.)
 - `softmax`/`rmsnorm` emit fused single-threadgroup kernels — the
   order-free half (max) tree-reduces in parallel, the
   order-sensitive sum stays serial in eval's exact accumulation

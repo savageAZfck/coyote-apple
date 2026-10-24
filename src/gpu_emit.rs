@@ -19,11 +19,12 @@
 //! (m/v/step in persistent zero-init scratch, fp16-rounded weight
 //! writeback like `adam_step`) after the out kernel. State writes
 //! (`s.f op= e`, one-hot scatters `s.f[p] op= e`) emit stmt-position
-//! kernels against the resident state buffer — the kv-cache story.
-//! `Assign` on params still emits an honest error, not silent
-//! wrongness.
+//! kernels against the resident state buffer — the kv-cache story —
+//! and `Assign` lowers both ways: param assigns write the buffer at
+//! stmt position; let-assigns shadow-bind the scope (eval's
+//! env.insert, with `resolve_limit` keeping `a = a*2` honest).
 
-use coyote::ast::{BinOp, IoDir, Qual, UnOp};
+use coyote::ast::{AssignOp, BinOp, IoDir, Qual, UnOp};
 use coyote::lower::sha256_hex;
 use coyote::typeck::{CTy, TExpr, TIndex, TProgram, TStmt, Typed};
 use std::collections::HashMap;
@@ -1476,8 +1477,90 @@ impl Ge {
                 });
                 Ok(())
             }
-            TStmt::Assign { .. } => {
-                Err("gpu stratum: Assign-on-params not lowered — SGD, adam, and state writes only".into())
+            TStmt::Assign { name, op, expr } => {
+                if self.is_param(name) {
+                    // eval computes `nv = cur op v` elementwise and
+                    // inserts it — a stmt-position kernel writing the
+                    // param buffer mirrors that, and later readers see
+                    // the device-side update.
+                    let numel = self
+                        .param_numel
+                        .get(name)
+                        .copied()
+                        .ok_or_else(|| format!("gpu emit: {name} not a param"))?;
+                    let mark = self.scratch.len();
+                    let saved = std::mem::take(&mut self.lines);
+                    let r = expr.ty.dims.len();
+                    let mut coords = Vec::new();
+                    for i in 0..r {
+                        let cname = format!("c{i}");
+                        let stride: i64 = expr.ty.dims[i + 1..].iter().product();
+                        let d = expr.ty.dims[i];
+                        if r == 1 {
+                            self.lines.push(format!("uint {cname} = gid;"));
+                        } else if stride == 1 {
+                            self.lines.push(format!("uint {cname} = gid % {d};"));
+                        } else {
+                            self.lines
+                                .push(format!("uint {cname} = (gid / {stride}) % {d};"));
+                        }
+                        coords.push(cname);
+                    }
+                    if coords.is_empty() {
+                        coords.push("gid".to_string());
+                    }
+                    let v = self.gen(expr, &coords)?;
+                    let op_s = match op {
+                        AssignOp::Set => "=",
+                        AssignOp::Add => "+=",
+                        AssignOp::Sub => "-=",
+                        AssignOp::Mul => "*=",
+                        AssignOp::Div => "/=",
+                    };
+                    self.lines.push(format!("b_{name}[gid] {op_s} ({v});"));
+                    let body = std::mem::replace(&mut self.lines, saved);
+                    self.emit_q.extend(self.scratch.drain(mark..));
+                    self.emit_q.push(EK {
+                        name: format!("asg_{name}_{}", self.emit_q.len()),
+                        dispatch: Dispatch::Linear(numel),
+                        body,
+                        writable: Some(name.clone()),
+                    });
+                    return Ok(());
+                }
+                // let-name assign — eval's env.insert: shadow-bind in
+                // the current scope. `rposition` finds the newest `a`;
+                // `resolve_limit` keeps an `a` INSIDE the new expr
+                // (`a = a * 2`) resolving to the previous binding.
+                let op_t = match op {
+                    AssignOp::Set => None,
+                    AssignOp::Add => Some(BinOp::Add),
+                    AssignOp::Sub => Some(BinOp::Sub),
+                    AssignOp::Mul => Some(BinOp::Mul),
+                    AssignOp::Div => Some(BinOp::Div),
+                };
+                if self.pos_of(name).is_none() && self.bufs.get(name).is_none() {
+                    return Err(format!("gpu emit: assign to unbound {name}"));
+                }
+                let new_e = match op_t {
+                    None => expr.clone(),
+                    Some(bop) => Typed {
+                        ty: expr.ty.clone(),
+                        e: TExpr::Bin(
+                            bop,
+                            Box::new(Typed {
+                                ty: expr.ty.clone(),
+                                e: TExpr::Ident(name.clone()),
+                            }),
+                            Box::new(expr.clone()),
+                        ),
+                    },
+                };
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .push((name.clone(), new_e));
+                Ok(())
             }
             TStmt::Expr(_) => Ok(()),
         }

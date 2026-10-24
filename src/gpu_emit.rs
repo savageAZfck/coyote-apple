@@ -312,7 +312,7 @@ impl Ge {
             TExpr::Call(n, args, _) => {
                 matches!(
                     n.as_str(),
-                    "softmax" | "rmsnorm" | "gather" | "embed" | "outer"
+                    "softmax" | "rsoftmax" | "rmsnorm" | "gather" | "embed" | "outer"
                 ) || args.iter().any(Self::needs_scratch)
             }
             TExpr::Block(stmts, ret) => {
@@ -554,6 +554,35 @@ impl Ge {
         let TExpr::Call(name, args, _) = &e.e else {
             return Ok(None);
         };
+        // rsoftmax is a different fusion shape: one thread per row,
+        // serial inside the row in eval's exact accumulation order —
+        // parallel across rows instead of one threadgroup for the
+        // whole tensor, so attention scales with L not L².
+        if name == "rsoftmax" {
+            let x = &args[0];
+            let (rows, cols) = (x.ty.dims[0], x.ty.dims[1]);
+            let cs: Vec<String> = vec!["gid".into(), "j".into()];
+            let saved = std::mem::take(&mut self.lines);
+            self.lines.push("float m = -3.402823e38f;".into());
+            self.lines
+                .push(format!("for (uint j = 0; j < {cols}; ++j) {{"));
+            let v = self.gen(x, &cs)?;
+            self.lines.push(format!("m = fmax(m, {v});"));
+            self.lines.push("}".into());
+            self.lines.push("float s = 0.0f;".into());
+            self.lines
+                .push(format!("for (uint j = 0; j < {cols}; ++j) {{"));
+            let v = self.gen(x, &cs)?;
+            self.lines.push(format!(
+                "float ex = exp({v} - m); {out_buf}[gid*{cols}+j] = ex; s += ex;"
+            ));
+            self.lines.push("}".into());
+            self.lines.push(format!(
+                "for (uint j = 0; j < {cols}; ++j) {out_buf}[gid*{cols}+j] /= s;"
+            ));
+            let body = std::mem::replace(&mut self.lines, saved);
+            return Ok(Some((body, Dispatch::Linear(rows as usize))));
+        }
         if !matches!(name.as_str(), "softmax" | "rmsnorm") {
             return Ok(None);
         }
@@ -1230,32 +1259,54 @@ impl Ge {
                     _ => None,
                 };
                 let mut out = None;
+                let m_batch = if a.ty.dims.len() == 2 {
+                    a.ty.dims[0] as usize
+                } else {
+                    1
+                };
                 if let Some(p) = &pname {
                     if p == wrt && self.is_param(p) {
-                        // dW[n,k] = adj[n] · x[k] — [N,K] storage order.
+                        // dW[j,i] = Σ_br adj[br,j] · x[br,i] — [N,K]
+                        // storage; batch rows accumulate into the
+                        // shared weight.
                         let sc = Self::coords_of(f, &[nn as i64, kd as i64]);
-                        let av = adj(self, &sc[..1])?;
-                        let xv = self.gen(a, &sc[1..])?;
-                        out = Some(format!("(({av}) * ({xv}))"));
+                        if m_batch == 1 {
+                            let av = adj(self, &sc[..1])?;
+                            let xv = self.gen(a, &sc[1..])?;
+                            out = Some(format!("(({av}) * ({xv}))"));
+                        } else {
+                            let acc = self.tmp();
+                            let br = self.tmp();
+                            self.lines.push(format!("float {acc} = 0.0f;"));
+                            self.lines.push(format!(
+                                "for (int {br} = 0; {br} < {m_batch}; ++{br}) {{"
+                            ));
+                            let av = adj(self, &[br.clone(), sc[0].clone()])?;
+                            let xv = self.gen(a, &[br.clone(), sc[1].clone()])?;
+                            self.lines.push(format!("{acc} += ({av}) * ({xv});"));
+                            self.lines.push("}".into());
+                            out = Some(acc);
+                        }
                     }
                 }
                 if self.can_grad(a, wrt) {
-                    if a.ty.dims.len() != 1 {
-                        return Err(
-                            "gpu grad: matmul lhs grads cover [K] @ [K,N] — same v1 scope as eval"
-                                .into(),
-                        );
-                    }
                     let b2 = (**b).clone();
+                    let batched = a.ty.dims.len() == 2;
                     let ra = self.back(a, wrt, f, &mut |em: &mut Ge, c: &[String]| {
-                        // dx[i] = Σ_j adj[j] · w[j*K + i]
+                        // dx[br,i] = Σ_j adj[br,j] · w[j,i] — vector
+                        // lhs is the br=0 case with 1-D coords.
                         let acc = em.tmp();
                         let j = em.tmp();
                         em.lines.push(format!("float {acc} = 0.0f;"));
                         em.lines
                             .push(format!("for (int {j} = 0; {j} < {nn}; ++{j}) {{"));
-                        let av = adj(em, &[j.clone()])?;
-                        let wv = em.rhs_read(&b2, &[c[0].clone(), j.clone()], kd as i64)?;
+                        let av = if batched {
+                            adj(em, &[c[0].clone(), j.clone()])?
+                        } else {
+                            adj(em, &[j.clone()])?
+                        };
+                        let kc = if batched { c[1].clone() } else { c[0].clone() };
+                        let wv = em.rhs_read(&b2, &[kc, j.clone()], kd as i64)?;
                         em.lines.push(format!("{acc} += ({av}) * ({wv});"));
                         em.lines.push("}".into());
                         Ok(acc)
@@ -1311,6 +1362,25 @@ impl Ge {
                                 .push(format!("for (int {j} = 0; {j} < {n}; ++{j}) {{"));
                             let av = adj(em, &[j.clone()])?;
                             let sv = em.gen(&es, &[j.clone()])?;
+                            em.lines.push(format!("{dot} += ({av}) * ({sv});"));
+                            em.lines.push("}".into());
+                            let d = adj(em, c)?;
+                            let s = em.gen(&es, c)?;
+                            Ok(format!("({s}) * (({d}) - {dot})"))
+                        })
+                    }
+                    "rsoftmax" => {
+                        // per-row: dx[r,j] = s[r,j]·(adj[r,j] − Σ_k adj[r,k]·s[r,k])
+                        let es = e2.clone();
+                        let cols = x.ty.dims[1];
+                        self.back(&x, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                            let dot = em.tmp();
+                            let k = em.tmp();
+                            em.lines.push(format!("float {dot} = 0.0f;"));
+                            em.lines
+                                .push(format!("for (int {k} = 0; {k} < {cols}; ++{k}) {{"));
+                            let av = adj(em, &[c[0].clone(), k.clone()])?;
+                            let sv = em.gen(&es, &[c[0].clone(), k.clone()])?;
                             em.lines.push(format!("{dot} += ({av}) * ({sv});"));
                             em.lines.push("}".into());
                             let d = adj(em, c)?;

@@ -17,9 +17,11 @@
 
 // Single-head attention over an [L, D] activation. `q` must arrive
 // pre-scaled by 1/sqrt(d) — the language has no const-dim arithmetic,
-// so the scale lives in the caller's weight init.
+// so the scale lives in the caller's weight init. `rsoftmax`
+// normalizes each query row over the keys — the flat `softmax`
+// would mix probability mass across rows.
 fn attn<L>(q: f16[L, 64], k: f16[L, 64], v: f16[L, 64]) -> f16[L, 64] {
-    softmax(q @ k.T) @ v
+    rsoftmax(q @ k.T) @ v
 }
 
 // Vector query variant — scores are a length-L distribution over

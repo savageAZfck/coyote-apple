@@ -75,8 +75,27 @@ gpu fn block(x: f16[64]) -> f16[64] {
 - `grad(loss, w)` lowers reverse-mode on-device — same rule set and
   `mse`-terminal scope as the evaluator — and `w op= s*grad` folds to
   an update kernel dispatched before the out kernel (eval's
-  stmt→ret order). `adam`, `Assign` on params, and state writes are
-  still compile errors on this backend, not silent wrongness.
+  stmt→ret order).
+- `adam(w, grad(loss, w), lr)` trains on-device: moments + step live
+  in persistent zero-init scratch; the apply kernel runs AFTER the
+  out kernel because eval leaves the param untouched during `main`
+  (the driver applies `adam_step` between calls — same math, same
+  fp16 writeback rounding).
+- State writes (`s.f op= e`, one-hot scatters `s.f[p] op= e`) emit
+  stmt-position kernels against the resident state buffer — the
+  kv-cache story. `w op= e` on params writes at stmt position;
+  `a op= e` on lets shadow-binds the scope. Every `TStmt` lowers —
+  no honest-error statement left.
+- Matmuls emit cooperative-tile kernels (32×32 blocks, 8×8 groups,
+  4×4 register micro-tile, padded threadgroup staging); `CYO_SIMD=1`
+  swaps in the `simdgroup_matrix` path — correct but slower on this
+  silicon, gated for newer hardware.
+- `CYO_HALF=1` stages `f16` params as real `half` buffers — compute
+  stays fp32, reads promote, writes round (eval's f16 param-init is
+  bit-identical; SGD-update programs see ~1e-3 rounding drift, adam
+  stays exact). Measured ~2× on the param-heavy FFN bench.
+- `prof --dump` reads trained weights back vs deterministic init —
+  the on-device checkpoint export (`GpuRuntime::read_buf`).
 
 Same-file mixing is the point: `fn` → ANE Mach-O nodes, `gpu fn` →
 Metal kernels, `host fn` → bytecode VM — one type system, one witness

@@ -28,6 +28,9 @@ pub struct GpuRuntime {
     slot: HashMap<String, usize>,
     /// numel per buffer, for staging writes.
     elems: Vec<usize>,
+    /// buffer indices backed by `half` storage (`CYO_HALF` params) —
+    /// `read_buf` decodes f16 → f32 for the host.
+    half_slots: std::collections::HashSet<usize>,
     /// GPU-side duration of the last dispatch (command buffer
     /// GPUStartTime→GPUEndTime), milliseconds.
     last_ms: f64,
@@ -37,6 +40,15 @@ fn buf_f32(dev: &metal::Device, data: &[f32]) -> metal::Buffer {
     dev.new_buffer_with_data(
         data.as_ptr() as *const c_void,
         (data.len() * 4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    )
+}
+
+fn buf_f16(dev: &metal::Device, data: &[f32]) -> metal::Buffer {
+    let h: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
+    dev.new_buffer_with_data(
+        h.as_ptr() as *const c_void,
+        (h.len() * 2) as u64,
         MTLResourceOptions::StorageModeShared,
     )
 }
@@ -70,6 +82,7 @@ impl GpuRuntime {
         let mut bufs = Vec::new();
         let mut slot = HashMap::new();
         let mut elems = Vec::new();
+        let mut half_slots = std::collections::HashSet::new();
         let out_n = out.output.1.numel() as usize;
         bufs.push(buf_f32(&dev, &vec![0.0f32; out_n]));
         slot.insert("out".into(), 0);
@@ -100,7 +113,7 @@ impl GpuRuntime {
                     bufs.push(buf_f32(&dev, &vec![0.0; n]));
                     elems.push(n);
                 }
-                Arg::Param(pname) => {
+                Arg::Param(pname) | Arg::ParamHalf(pname) => {
                     let t = p
                         .params
                         .iter()
@@ -117,7 +130,12 @@ impl GpuRuntime {
                         t.src.as_deref(),
                         coyote::weights::param_fallback,
                     )?;
-                    bufs.push(buf_f32(&dev, &data));
+                    if matches!(a, Arg::ParamHalf(_)) {
+                        bufs.push(buf_f16(&dev, &data));
+                        half_slots.insert(i);
+                    } else {
+                        bufs.push(buf_f32(&dev, &data));
+                    }
                     elems.push(data.len());
                 }
                 Arg::Scratch(_name, numel) => {
@@ -134,6 +152,7 @@ impl GpuRuntime {
             bufs,
             slot,
             elems,
+            half_slots,
             last_ms: 0.0,
         })
     }
@@ -221,10 +240,19 @@ impl GpuRuntime {
     /// checkpoint lives here, not in `param_outs`.
     pub fn read_buf(&self, port: &str) -> Option<Vec<f32>> {
         let &i = self.slot.get(port)?;
-        Some(unsafe {
-            std::slice::from_raw_parts(self.bufs[i].contents() as *const f32, self.elems[i])
-                .to_vec()
-        })
+        let n = self.elems[i];
+        if self.half_slots.contains(&i) {
+            Some(unsafe {
+                std::slice::from_raw_parts(self.bufs[i].contents() as *const u16, n)
+                    .iter()
+                    .map(|&b| half::f16::from_bits(b).to_f32())
+                    .collect()
+            })
+        } else {
+            Some(unsafe {
+                std::slice::from_raw_parts(self.bufs[i].contents() as *const f32, n).to_vec()
+            })
+        }
     }
 }
 

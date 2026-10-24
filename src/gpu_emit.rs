@@ -9,7 +9,13 @@
 //! evaluator see), so `x @ w` reads coalesced rows of `w`.
 //!
 //! GPU v1 computes in `float` — dtype annotations still typecheck,
-//! device storage is f32. `grad(loss, w)` lowers reverse-mode —
+//! device storage is f32 unless `CYO_HALF` is set: then `f16`-declared
+//! params stage as real `half` buffers (bandwidth halves on
+//! param-heavy kernels; eval already f16-quantizes param init, so
+//! values are bit-identical). Reads wrap `float()`, writes round
+//! through `half` — matching the f16 surface drivers write back to;
+//! SGD updates gain ~1e-3 rounding drift vs the f32 eval env chain
+//! (adam is exact — eval rounds adam writeback too). `grad(loss, w)`
 //! mirroring `Evaluator::back` rule-for-rule, ending in `mse` like
 //! eval's v1 scope — and `w op= s*grad` folds to per-param update
 //! kernels dispatched before the main kernel (eval's stmt→ret
@@ -24,7 +30,7 @@
 //! stmt position; let-assigns shadow-bind the scope (eval's
 //! env.insert, with `resolve_limit` keeping `a = a*2` honest).
 
-use coyote::ast::{AssignOp, BinOp, IoDir, Qual, UnOp};
+use coyote::ast::{AssignOp, BinOp, DType, IoDir, Qual, UnOp};
 use coyote::lower::sha256_hex;
 use coyote::typeck::{CTy, TExpr, TIndex, TProgram, TStmt, Typed};
 use std::collections::HashMap;
@@ -79,12 +85,21 @@ pub enum Arg {
     /// materialized-subexpression buffer — allocated zeroed by the
     /// runtime, written by a prelude kernel, read like an input.
     Scratch(String, usize),
+    /// an `f16`-declared param staged as a half buffer (`CYO_HALF`) —
+    /// kernels load `float(b[i])` for fp32 compute; update kernels
+    /// write `half(v)`, matching the surface round-trip eval drivers
+    /// already perform.
+    ParamHalf(String),
 }
 
 impl Arg {
     pub fn port(&self) -> &str {
         match self {
-            Arg::In(p) | Arg::Param(p) | Arg::State(p) | Arg::Scratch(p, _) => p,
+            Arg::In(p)
+            | Arg::Param(p)
+            | Arg::State(p)
+            | Arg::Scratch(p, _)
+            | Arg::ParamHalf(p) => p,
         }
     }
 }
@@ -137,6 +152,9 @@ struct Ge {
     scratch_args: Vec<(String, usize)>,
     /// param name → numel, for update-kernel dispatch sizes.
     param_numel: HashMap<String, usize>,
+    /// arg names (`b_w`) backed by `half` storage under `CYO_HALF` —
+    /// every read site wraps `float(...)`, every write wraps `half(...)`.
+    half_args: std::collections::HashSet<String>,
     lines: Vec<String>,
     tmp: usize,
 }
@@ -204,6 +222,37 @@ impl Ge {
             terms.push(format!("({ci})*{stride}"));
         }
         terms.join("+")
+    }
+
+    /// buffer element read honoring half storage — `float(b[i])`
+    /// under `CYO_HALF`, `b[i]` otherwise. `idx` is the raw index
+    /// expression; callers compute it with the usual conventions.
+    fn ld(&self, arg: &str, idx: &str) -> String {
+        if self.half_args.contains(arg) {
+            format!("float({arg}[{idx}])")
+        } else {
+            format!("{arg}[{idx}]")
+        }
+    }
+
+    /// writable-param store at `gid` honoring storage dtype — `op_s`
+    /// is the MSL assignment operator (`=`,`+=`,`-=`,`*=`,`/=`); half
+    /// buffers do an explicit float read-modify-write.
+    fn param_st(&self, param: &str, op_s: &str, v: &str) -> String {
+        let arg = format!("b_{param}");
+        if self.half_args.contains(&arg) {
+            let cur = format!("float({arg}[gid])");
+            let expr = match op_s {
+                "=" => v.to_string(),
+                "+=" => format!("({cur} + ({v}))"),
+                "-=" => format!("({cur} - ({v}))"),
+                "*=" => format!("({cur} * ({v}))"),
+                _ => format!("({cur} / ({v}))"),
+            };
+            format!("{arg}[gid] = half({expr});")
+        } else {
+            format!("{arg}[gid] {op_s} ({v});")
+        }
     }
 
     /// element access for `e` in an elementwise context at `coords`
@@ -375,18 +424,18 @@ impl Ge {
             b.ty.dims[1] as usize,
         );
         let (a_arg, _, _) = self.resolve_buf(a)?;
-        let a_e = format!("{a_arg}[(m)*{k_dim}+(tk)]");
+        let a_e = self.ld(&a_arg, &format!("(m)*{k_dim}+(tk)"));
         let b_e = match &b.e {
             TExpr::Ident(_) => {
                 let (arg, _, _) = self.resolve_buf(b)?;
-                format!("{arg}[(bn)*{k_dim}+(tk)]")
+                self.ld(&arg, &format!("(bn)*{k_dim}+(tk)"))
             }
             TExpr::Transpose(inner) => {
                 let (arg, ity, kind) = self.resolve_buf(inner)?;
                 if matches!(kind, Kind::ParamT) && ity.dims[0] != ity.dims[1] {
-                    format!("{arg}[(tk)*{n_dim}+(bn)]")
+                    self.ld(&arg, &format!("(tk)*{n_dim}+(bn)"))
                 } else {
-                    format!("{arg}[(bn)*{k_dim}+(tk)]")
+                    self.ld(&arg, &format!("(bn)*{k_dim}+(tk)"))
                 }
             }
             _ => return None,
@@ -572,7 +621,7 @@ impl Ge {
                 // [N,K] storage IS the value (matches the evaluator);
                 // the transposed read only applies in matmul rhs.
                 let flat = Self::flat(&ty.dims, coords, &Kind::Row);
-                Ok(format!("{arg}[{flat}]"))
+                Ok(self.ld(&arg, &flat))
             }
             TExpr::Field(base, f) => {
                 // `kv.k` — state field access.
@@ -664,7 +713,7 @@ impl Ge {
                             Some((a, _, _)) => a,
                             None => self.scratch_of(base)?,
                         };
-                        return Ok(format!("{arg}[({j})*{d0} + {r}]"));
+                        return Ok(self.ld(&arg, &format!("({j})*{d0} + {r}")));
                     }
                 }
                 // index ops consume leading dims of base: Lit pins,
@@ -802,7 +851,7 @@ impl Ge {
                 let tv = match &tab.e {
                     TExpr::Ident(s) if self.bufs.contains_key(s) => {
                         let (arg, _, _) = self.bufs.get(s).unwrap().clone();
-                        format!("{arg}[{f}]")
+                        self.ld(&arg, &f)
                     }
                     _ => {
                         let cs = Self::coords_of(&f, &tab.ty.dims);
@@ -860,9 +909,9 @@ impl Ge {
                     _ => unreachable!(),
                 };
                 if matches!(kind, Kind::ParamT) && ty.dims[0] != ty.dims[1] {
-                    Ok(format!("{arg}[{}]", Self::flat(&b.ty.dims, rc, &Kind::Row)))
+                    Ok(self.ld(&arg, &Self::flat(&b.ty.dims, rc, &Kind::Row)))
                 } else {
-                    Ok(format!("{arg}[{kf}]"))
+                    Ok(self.ld(&arg, &kf))
                 }
             }
             TExpr::Transpose(i) => {
@@ -871,7 +920,7 @@ impl Ge {
             }
             TExpr::Ident(s) if self.bufs.contains_key(s) => {
                 let (arg, _, _) = self.bufs.get(s).unwrap().clone();
-                Ok(format!("{arg}[{kf}]"))
+                Ok(self.ld(&arg, &kf))
             }
             _ => {
                 let cs = Self::coords_of(&kf, &b.ty.dims);
@@ -1357,7 +1406,7 @@ impl Ge {
                         .grad_elem(loss, param, "gid")?
                         .ok_or_else(|| format!("gpu emit: loss does not depend on {param}"))?;
                     self.lines
-                        .push(format!("b_{param}[gid] += float({scale}) * ({g});"));
+                        .push(self.param_st(param, "+=", &format!("float({scale}) * ({g})")));
                     let body = std::mem::replace(&mut self.lines, saved);
                     self.emit_q.extend(self.scratch.drain(mark..));
                     self.emit_q.push(EK {
@@ -1408,6 +1457,15 @@ impl Ge {
                     // adam_step parity: b1=0.9 b2=0.999 eps=1e-2
                     // (fp16-safe), w rounded to half after the update.
                     let i = self.post_q.len();
+                    let wline = if self.half_args.contains(&format!("b_{param}")) {
+                        format!(
+                            "b_{param}[gid] = half(float(b_{param}[gid]) - {lr} * (m / bc1) / (sqrt(v / bc2) + 1e-2f));"
+                        )
+                    } else {
+                        format!(
+                            "b_{param}[gid] = float(half(b_{param}[gid] - {lr} * (m / bc1) / (sqrt(v / bc2) + 1e-2f)));"
+                        )
+                    };
                     self.post_q.push(EK {
                         name: format!("adm_{param}_{i}"),
                         dispatch: Dispatch::Linear(numel),
@@ -1420,9 +1478,7 @@ impl Ge {
                             format!("float v = 0.999f * av_{param}[gid] + 0.001f * g * g;"),
                             format!("am_{param}[gid] = m;"),
                             format!("av_{param}[gid] = v;"),
-                            format!(
-                                "b_{param}[gid] = float(half(b_{param}[gid] - {lr} * (m / bc1) / (sqrt(v / bc2) + 1e-2f)));"
-                            ),
+                            wline,
                         ],
                         writable: Some(param.clone()),
                     });
@@ -1517,7 +1573,7 @@ impl Ge {
                         AssignOp::Mul => "*=",
                         AssignOp::Div => "/=",
                     };
-                    self.lines.push(format!("b_{name}[gid] {op_s} ({v});"));
+                    self.lines.push(self.param_st(name, op_s, &v));
                     let body = std::mem::replace(&mut self.lines, saved);
                     self.emit_q.extend(self.scratch.drain(mark..));
                     self.emit_q.push(EK {
@@ -1580,6 +1636,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         scratch: Vec::new(),
         mat_ptr: HashMap::new(),
         scratch_args: Vec::new(),
+        half_args: std::collections::HashSet::new(),
         param_numel: p
             .params
             .iter()
@@ -1602,12 +1659,22 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         base_args.push((arg, port.clone(), false));
         args.push(Arg::In(port.clone()));
     }
+    // CYO_HALF: f16-declared params stage as real half buffers —
+    // bandwidth halves on param-heavy kernels while compute stays
+    // fp32. Update writes round through `half`, matching the f16
+    // surface the eval drivers already write back to.
+    let half_mode = std::env::var_os("CYO_HALF").is_some();
     for t in &p.params {
         let arg = format!("b_{}", t.name);
         ge.bufs
             .insert(t.name.clone(), (arg.clone(), t.ty.clone(), Kind::ParamT));
+        if half_mode && t.ty.dt == DType::F16 {
+            ge.half_args.insert(arg.clone());
+            args.push(Arg::ParamHalf(t.name.clone()));
+        } else {
+            args.push(Arg::Param(t.name.clone()));
+        }
         base_args.push((arg, t.name.clone(), false));
-        args.push(Arg::Param(t.name.clone()));
     }
     let mut states = Vec::new();
     for (key, port, ty) in &p.states {
@@ -1672,10 +1739,15 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
     let mut sig = vec!["device float* _out [[buffer(0)]]".to_string()];
     let mut bi = 1usize;
     for (arg, _port, writable) in &base_args {
-        let qual = if *writable {
-            "device float*"
+        let elem_ty = if ge.half_args.contains(arg) {
+            "half"
         } else {
-            "device const float*"
+            "float"
+        };
+        let qual = if *writable {
+            format!("device {elem_ty}*")
+        } else {
+            format!("device const {elem_ty}*")
         };
         sig.push(format!("{qual} {arg} [[buffer({bi})]]"));
         bi += 1;
@@ -1695,10 +1767,15 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         let ksig: Vec<String> = sig
             .iter()
             .map(|s| match &ek.writable {
-                Some(param) => s.replace(
-                    &format!("device const float* b_{param}"),
-                    &format!("device float* b_{param}"),
-                ),
+                Some(param) => s
+                    .replace(
+                        &format!("device const float* b_{param}"),
+                        &format!("device float* b_{param}"),
+                    )
+                    .replace(
+                        &format!("device const half* b_{param}"),
+                        &format!("device half* b_{param}"),
+                    ),
                 None => s.clone(),
             })
             .collect();

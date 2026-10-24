@@ -212,6 +212,12 @@ impl GpuRuntime {
                         .max(1);
                     enc.dispatch_threads(MTLSize::new(n, 1, 1), MTLSize::new(tg, 1, 1));
                 }
+                crate::gpu_emit::Dispatch::Group(threads) => {
+                    // exactly one threadgroup — barriers in the kernel
+                    // only synchronize within a group.
+                    let t = *threads as u64;
+                    enc.dispatch_threads(MTLSize::new(t, 1, 1), MTLSize::new(t, 1, 1));
+                }
                 crate::gpu_emit::Dispatch::Tiled { m, n, t, mt } => {
                     let (tt, mt) = (*t as u64, *mt as u64);
                     let gx = (*n as u64).div_ceil(tt * mt) * tt;

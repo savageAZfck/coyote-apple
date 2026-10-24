@@ -61,6 +61,9 @@ pub struct GpuOut {
 #[derive(Debug, Clone, Copy)]
 pub enum Dispatch {
     Linear(usize),
+    /// one threadgroup of N threads — kernels that need threadgroup
+    /// barriers to cover the whole problem (fused softmax/rmsnorm).
+    Group(usize),
     /// grid = ceil(n/(t·mt))×t × ceil(m/(t·mt))×t threads, t×t groups —
     /// each thread owns an mt×mt micro-tile of the output.
     Tiled {
@@ -357,8 +360,10 @@ impl Ge {
         let saved = std::mem::take(&mut self.lines);
         let (body, dispatch) = match self.matmul_body(e, &buf) {
             Some((b, d)) => (b, d),
-            None => {
-                let mut coords = Vec::new();
+            None => match self.reduce_pair(e, &buf)? {
+                Some(r) => r,
+                None => {
+                    let mut coords = Vec::new();
                 for (i, &d) in dims.iter().enumerate() {
                     let cname = format!("s_c{i}");
                     let stride: i64 = dims[i + 1..].iter().product();
@@ -375,6 +380,7 @@ impl Ge {
                 let v = self.gen_raw(e, &coords)?;
                 self.lines.push(format!("{buf}[gid] = ({v});"));
                 (std::mem::take(&mut self.lines), Dispatch::Linear(numel))
+                }
             }
         };
         self.lines = saved;
@@ -529,6 +535,92 @@ impl Ge {
             }
         }
         self.tiled_body(e, out_buf)
+    }
+
+    /// softmax / rmsnorm — one threadgroup does the whole op. The
+    /// order-free part (max) tree-reduces in parallel; the
+    /// order-sensitive part (the sum) stays serial on thread 0 so the
+    /// accumulation sequence is eval's — bit-exact parity preserved.
+    /// exp goes parallel into a scratch buffer between the two, so
+    /// the serial tail is plain adds. Without this fusion every
+    /// element's thread re-ran the whole reduction — the O(n²)
+    /// inlining trap that cost a 64×64 softmax ~0.18ms.
+    fn reduce_pair(
+        &mut self,
+        e: &Typed,
+        out_buf: &str,
+    ) -> Result<Option<(Vec<String>, Dispatch)>, String> {
+        const T: usize = 256;
+        let TExpr::Call(name, args, _) = &e.e else {
+            return Ok(None);
+        };
+        if !matches!(name.as_str(), "softmax" | "rmsnorm") {
+            return Ok(None);
+        }
+        let x = &args[0];
+        let dims = x.ty.dims.clone();
+        let n: i64 = dims.iter().product();
+        let cs = Self::coords_of(&"i".to_string(), &dims);
+
+        let saved = std::mem::take(&mut self.lines);
+        match name.as_str() {
+            "softmax" => {
+                // scratch holding exp(x - m) between the parallel exp
+                // and the serial sum — same values eval sums, in the
+                // same order.
+                let eb = format!("b__e{}", self.scratch_args.len());
+                self.scratch_args.push((eb.clone(), n as usize));
+                self.lines.push(format!("threadgroup float tr[{T}];"));
+                self.lines.push("threadgroup float ts;".into());
+                // max is order-free — tree-reduce it.
+                self.lines.push("float part = -3.402823e38f;".into());
+                self.lines.push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
+                let v = self.gen(x, &cs)?;
+                self.lines.push(format!("part = fmax(part, {v});"));
+                self.lines.push("}".into());
+                self.lines.push("tr[lid] = part;".into());
+                self.lines.push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+                self.lines.push(format!("for (uint s = {}; s > 0; s >>= 1) {{", T / 2));
+                self.lines.push("if (lid < s) tr[lid] = fmax(tr[lid], tr[lid + s]);".into());
+                self.lines.push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+                self.lines.push("}".into());
+                // exp is elementwise — parallel, then the
+                // device-memory barrier makes every thread's writes
+                // visible to the serial sum.
+                self.lines.push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
+                let v = self.gen(x, &cs)?;
+                self.lines.push(format!("{eb}[i] = exp({v} - tr[0]);"));
+                self.lines.push("}".into());
+                self.lines.push("threadgroup_barrier(mem_flags::mem_device);".into());
+                // the sum is order-sensitive — serial, eval order.
+                self.lines.push(format!(
+                    "if (lid == 0) {{ float s = 0.0f; for (uint i = 0; i < {n}; ++i) s += {eb}[i]; ts = s; }}"
+                ));
+                self.lines.push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+                self.lines.push(format!(
+                    "for (uint i = lid; i < {n}; i += {T}) {out_buf}[i] = {eb}[i] / ts;"
+                ));
+            }
+            _ => {
+                self.lines.push("threadgroup float tv;".into());
+                self.lines.push("if (lid == 0) {".into());
+                self.lines.push("float acc = 0.0f;".into());
+                self.lines.push(format!("for (uint i = 0; i < {n}; ++i) {{"));
+                let v = self.gen(x, &cs)?;
+                self.lines.push(format!("acc += ({v}) * ({v});"));
+                self.lines.push("}".into());
+                self.lines.push(format!("tv = rsqrt(acc / float({n}) + 1e-5f);"));
+                self.lines.push("}".into());
+                self.lines.push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+                let wv = self.gen(&args[1], &cs)?;
+                self.lines.push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
+                let v = self.gen(x, &cs)?;
+                self.lines.push(format!("{out_buf}[i] = ({v}) * tv * ({wv});"));
+                self.lines.push("}".into());
+            }
+        }
+        let body = std::mem::replace(&mut self.lines, saved);
+        Ok(Some((body, Dispatch::Group(T))))
     }
 
     /// If `e` is a plain `A @ B` over buffers, emit the cooperative-
@@ -1698,8 +1790,10 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
     let mark = ge.scratch.len();
     let (body, dispatch) = match ge.matmul_body(&p.ret, "_out") {
         Some((b, d)) => (b, d),
-        None => {
-            ge.lines.clear();
+        None => match ge.reduce_pair(&p.ret, "_out")? {
+            Some(r) => r,
+            None => {
+                ge.lines.clear();
             let mut coords = Vec::new();
             let r = oty.dims.len();
             for i in 0..r {
@@ -1722,6 +1816,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
                 std::mem::take(&mut ge.lines),
                 Dispatch::Linear(oty.numel() as usize),
             )
+            }
         }
     };
     ge.emit_q.extend(ge.scratch.drain(mark..));
@@ -1781,6 +1876,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
             .collect();
         let thread_decl = match ek.dispatch {
             Dispatch::Linear(_) => "uint gid [[thread_position_in_grid]]",
+            Dispatch::Group(_) => "uint lid [[thread_position_in_threadgroup]]",
             Dispatch::Tiled { .. } => {
                 "uint2 gid2 [[thread_position_in_grid]],\n    uint2 lid2 [[thread_position_in_threadgroup]]"
             }

@@ -263,4 +263,7 @@ impl coyote::backend::BackendExec for GpuRuntime {
     fn device_ms(&self) -> Option<f64> {
         Some(self.last_ms)
     }
+    fn read(&self, port: &str) -> Option<Vec<f32>> {
+        self.read_buf(port)
+    }
 }

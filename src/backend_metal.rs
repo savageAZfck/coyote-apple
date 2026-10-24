@@ -4,7 +4,7 @@
 
 use crate::{gpu_emit, gpu_rt};
 use coyote::backend::{Backend, BackendEmit, BackendExec};
-use coyote::typeck::TProgram;
+use coyote::typeck::{CTy, TProgram};
 use std::path::Path;
 
 pub struct MetalBackend;
@@ -23,12 +23,25 @@ impl Backend for MetalBackend {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         std::fs::write(dir.join("net.msl"), &out.msl).map_err(|e| e.to_string())?;
         std::fs::write(dir.join("coyote_build.json"), &out.manifest).map_err(|e| e.to_string())?;
+        // params and state live resident on-device — updates land in
+        // the same buffers the host store reads back through `read`,
+        // so param_outs/state_outs simply mirror the resident ports.
+        let param_outs: Vec<(String, String, CTy)> = out
+            .trainable
+            .iter()
+            .map(|(n, port, ty, _)| (n.clone(), port.clone(), ty.clone()))
+            .collect();
+        let state_outs: Vec<(String, String, CTy)> = out
+            .states
+            .iter()
+            .map(|(_k, port, ty)| (port.clone(), port.clone(), ty.clone()))
+            .collect();
         Ok(BackendEmit {
             inputs: out.inputs.clone(),
             trainable: out.trainable.clone(),
             states: out.states.clone(),
-            param_outs: Vec::new(),
-            state_outs: Vec::new(),
+            param_outs,
+            state_outs,
             output: out.output.clone(),
             note: format!("msl sha {}", &out.msl_sha[..16]),
             opaque: Box::new(out),

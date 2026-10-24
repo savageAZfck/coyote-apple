@@ -1,3 +1,6 @@
 /target
 coyote_out/
 coyote_bench/
+
+# model checkpoints — fetched separately, never committed
+models/

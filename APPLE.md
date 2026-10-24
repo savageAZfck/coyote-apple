@@ -139,11 +139,18 @@ rest of the platform uses, reached through its SLICKS socket:
   `invoke_tool`, `run_agent_task`, `audit_event`, …); `mind_witness`
   lands events on the organism's hash-chained ledger; `mind_task`/
   `mind_tasks`/`mind_tool` cover delegation and tools.
+- `mind_gen` takes the plain-prompt route instead of the agent
+  envelope — same generation path as the CLI, but Done frames carry
+  telemetry the envelope drops: `decode_tps`, `total_tps`, `tier`,
+  `prefix_cache`, `speculative`, `draft_accept_pct` — the
+  cross-silicon draft/verify surface, observable from a `.cy` program.
 - Language-side verbs in `lib/mind.cy`: `think`, `ask`, `gen`,
-  `models`, `remember`, `delegate` — every call is `stoch` + `cap
-  mind`, checked by the same constitution as every other capability.
+  `timed` (telemetry), `models`, `remember`, `delegate` — every call
+  is `stoch` + `cap mind`, checked by the same constitution as every
+  other capability.
 - `run` is intercepted in the distribution so every Vm it builds gets
-  `mind::bind_all`; `bench`'s exec path binds too.
+  `mind::bind_all`; `bench`, `test`, and `oracle` bind on their Vm
+  paths too (`repl` doesn't — its Vm is built inside the public cli).
 - Verified live: `tests/probes/mind_probe.cy` — status → models → a
   real generation → a ledger witness, all through the socket.
 - The VM skips param/state staging when the host tensor handle is

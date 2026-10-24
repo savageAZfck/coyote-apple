@@ -45,6 +45,7 @@ pub fn run(args: &[String]) -> Result<(), i32> {
             ));
         }
         let mut vm = coyote::load_vm(path, &dir, use_cpu, rebuild, true)?;
+        crate::mind::bind_all(&mut vm);
         println!(
             "test — {file}  ({} backend)",
             if use_cpu { "cpu" } else { "ane" }

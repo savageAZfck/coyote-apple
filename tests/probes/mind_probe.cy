@@ -28,7 +28,24 @@ host fn main() -> i64 {
         return 4;
     }
     print("infer: " + slice_str(text, 0, 80));
-    if !remember("mind_probe: infer verified") {
+    match timed("Say the word telemetry", 32) {
+        Json::Obj(t) => {
+            if jstr(t, "status") != "ok" {
+                print("gen: not ok");
+                return 5;
+            }
+            var line = "gen: ok tps=" + str(jnumf(t, "decode_tps"));
+            if has(t, "draft_accept_pct") {
+                line = line + " accept=" + str(jnumf(t, "draft_accept_pct")) + "%";
+            }
+            if has(t, "tier") {
+                line = line + " tier=" + jstr(t, "tier");
+            }
+            print(line);
+        }
+        _ => { return 6; }
+    }
+    if !remember("mind_probe: infer+gen verified") {
         print("witness: ledger unreachable");
     }
     return 0;

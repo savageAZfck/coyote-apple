@@ -257,6 +257,50 @@ pub fn bind_all(vm: &mut Vm) {
         });
     }
 
+    // mind_gen(prompt, max_tokens) -> Json — the plain-prompt path:
+    // same generation as the CLI query route, which unlike the agent
+    // envelope returns Done metrics (tier, decode_tps, draft_accept_pct,
+    // speculative) — the cross-silicon telemetry surface.
+    {
+        let j = JsonIdx {
+            en: j.en,
+            null: j.null,
+            boolv: j.boolv,
+            num: j.num,
+            strv: j.strv,
+            arr: j.arr,
+            obj: j.obj,
+        };
+        vm.bind_extern("mind_gen", move |args| {
+            let prompt = arg_str(args, 0)?;
+            let max_tokens = arg_i64(args, 1)?.max(1) as usize;
+            if !substrate::available() {
+                return Ok(json_to_val(
+                    &json!({"status": "unavailable", "text": ""}),
+                    &j,
+                ));
+            }
+            match substrate::query(&prompt, max_tokens) {
+                Ok((text, metrics)) => {
+                    let mut o = serde_json::Map::new();
+                    o.insert("status".into(), json!("ok"));
+                    o.insert("text".into(), json!(text));
+                    if let Some(m) = metrics {
+                        for k in ["tokens", "decode_tps", "total_tps",
+                                  "draft_accept_pct", "tier", "prefix_cache", "speculative"]
+                        {
+                            if let Some(v) = m.get(k) {
+                                o.insert(k.into(), v.clone());
+                            }
+                        }
+                    }
+                    Ok(json_to_val(&Value::Object(o), &j))
+                }
+                Err(e) => Ok(err_json(&j, e)),
+            }
+        });
+    }
+
     // mind_witness(event) -> bool — drop an audit_event onto the
     // organism's hash-chained ledger through the daemon.
     vm.bind_extern("mind_witness", move |args| {

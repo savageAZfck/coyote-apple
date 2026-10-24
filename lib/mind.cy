@@ -24,6 +24,12 @@ extern stoch fn mind_status() -> Json cap mind;
 // → Json {status: "ok"|"unavailable"|"err", text: str, err?: str}
 extern stoch fn mind_infer(prompt: str, system: str, max_tokens: i64, temperature: f64, brain: str) -> Json cap mind;
 
+// Generation through the plain-prompt path — same route the CLI uses,
+// which unlike the agent envelope returns Done-frame telemetry:
+// → Json {status, text, tokens?, decode_tps?, total_tps?,
+//         draft_accept_pct?, tier?, prefix_cache?, speculative?}
+extern stoch fn mind_gen(prompt: str, max_tokens: i64) -> Json cap mind;
+
 // The generic agent surface — any daemon method + Json params:
 // "list_models", "model_info", "runtime_status", "audit_tail",
 // "switch_main_model", "invoke_tool", … → Json (the daemon's result)
@@ -63,6 +69,13 @@ host det fn jnum(o: {str: Json}, k: str) -> i64 {
         match o[k] { Json::Num(n) => { return i64(n); } _ => { } }
     }
     return 0;
+}
+
+host det fn jnumf(o: {str: Json}, k: str) -> f64 {
+    if has(o, k) {
+        match o[k] { Json::Num(n) => { return n; } _ => { } }
+    }
+    return 0.0;
 }
 
 host det fn jobj(o: {str: Json}, k: str) -> {str: Json} {
@@ -116,4 +129,11 @@ host fn remember(event: str) -> bool cap mind {
 // delegate — hand the daemon a bounded goal → Json {task_id, status}
 host fn delegate(goal: str, max_steps: i64) -> Json cap mind {
     return mind_task(goal, max_steps);
+}
+
+// timed — generate + telemetry: {status, text, decode_tps, tier,
+// draft_accept_pct, speculative, prefix_cache} — the cross-silicon
+// performance surface (draft-on-ANE verify-on-GPU shows up here).
+host fn timed(prompt: str, max_tokens: i64) -> Json cap mind {
+    return mind_gen(prompt, max_tokens);
 }

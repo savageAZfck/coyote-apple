@@ -37,12 +37,15 @@ mod gold;
 mod gpu_emit;
 mod gpu_rt;
 mod lsp;
+mod mind;
 mod new;
 mod oracle;
 mod package;
 mod prof;
+mod run;
 mod spec;
 mod stfile;
+mod substrate;
 mod test;
 mod watch;
 mod weights;
@@ -109,6 +112,10 @@ fn main() {
         "weights" => weights::run(&args[2..]),
         "doc" => doc::run(&args[2..]),
         "gold" => gold::run(&args[2..]),
+        // `run` is intercepted: the public pipeline builds the VM
+        // internally, so organisms that declare `mind_*` externs need
+        // this distribution to build (and bind) it instead.
+        "run" => run::run(&args[2..]),
         "watch" => watch::run(&args[2..]),
         "emit" => emit::run(&args[2..]),
         "lsp" => lsp::run().map_err(|_| 1i32),

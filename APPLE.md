@@ -121,6 +121,31 @@ gpu fn block(x: f16[64]) -> f16[64] {
   command buffer per kernel — the breakdown that caught both the
   O(n²) softmax and the staging overhead. `prof --dump` reads
   trained weights back vs deterministic init.
+
+## mind — intelligence as a language primitive
+
+`lib/mind.cy` + `src/substrate.rs` + `src/mind.rs` give organisms a
+checked, cap-gated path to the resident mind — the same daemon the
+rest of the platform uses, reached through its SLICKS socket:
+
+- `substrate.rs` is a self-contained SLICKS client: Hello →
+  Challenge → Execute over `/var/run/badapple/substrate.sock`, v2
+  (identity-agent Secure Enclave signatures, TOFU-pinned server key)
+  when the identity agent is up, v1 shared-key HMAC otherwise — same
+  auto-resolution as the reference client. Nothing links back into
+  bad_apple; the contract is the wire protocol.
+- `mind_infer` reaches the daemon's `inference` agent method;
+  `mind_call` covers the whole agent surface (`list_models`,
+  `invoke_tool`, `run_agent_task`, `audit_event`, …); `mind_witness`
+  lands events on the organism's hash-chained ledger; `mind_task`/
+  `mind_tasks`/`mind_tool` cover delegation and tools.
+- Language-side verbs in `lib/mind.cy`: `think`, `ask`, `gen`,
+  `models`, `remember`, `delegate` — every call is `stoch` + `cap
+  mind`, checked by the same constitution as every other capability.
+- `run` is intercepted in the distribution so every Vm it builds gets
+  `mind::bind_all`; `bench`'s exec path binds too.
+- Verified live: `tests/probes/mind_probe.cy` — status → models → a
+  real generation → a ledger witness, all through the socket.
 - The VM skips param/state staging when the host tensor handle is
   unchanged (`staged_ext` in public `vm.rs`) — after `read`-back the
   mirror holds device values, so a re-dispatch doesn't round-trip

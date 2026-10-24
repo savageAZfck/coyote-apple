@@ -14,28 +14,8 @@
 //!   am:8:64:64      →  "am"  [64,64],  am[i,j] = 1 iff j < 8 (column mask)
 //!   am:8:64:64 rows →  `--rows` makes it a row mask instead
 
+use crate::stfile::safetensors_f32;
 use std::path::PathBuf;
-
-fn safetensors_f32(name: &str, shape: &[usize], data: &[f32]) -> Vec<u8> {
-    let nbytes = data.len() * 4;
-    let shape_s = shape
-        .iter()
-        .map(|d| d.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let header = format!(
-        "{{\"{name}\":{{\"dtype\":\"F32\",\"shape\":[{shape_s}],\"data_offsets\":[0, {nbytes}]}}}}"
-    );
-    let pad = (8 - (header.len() % 8)) % 8;
-    let header = format!("{header}{:pad$}", "", pad = pad);
-    let mut out = Vec::with_capacity(8 + header.len() + nbytes);
-    out.extend_from_slice(&(header.len() as u64).to_le_bytes());
-    out.extend_from_slice(header.as_bytes());
-    for v in data {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    out
-}
 
 pub fn run(args: &[String]) -> Result<(), i32> {
     let usage = || {

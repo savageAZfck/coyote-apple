@@ -13,8 +13,13 @@
 //! mirroring `Evaluator::back` rule-for-rule, ending in `mse` like
 //! eval's v1 scope — and `w op= s*grad` folds to per-param update
 //! kernels dispatched before the main kernel (eval's stmt→ret
-//! order). `adam`, state writes, and `Assign` on params still emit
-//! honest errors, not silent wrongness.
+//! order). `adam(w, g, lr)` keeps eval's within-call semantics —
+//! the param reads unchanged until `main` returns — by running the
+//! raw-grad kernel stmt-position and the on-device moment update
+//! (m/v/step in persistent zero-init scratch, fp16-rounded weight
+//! writeback like `adam_step`) after the out kernel. State writes
+//! and `Assign` on params still emit honest errors, not silent
+//! wrongness.
 
 use coyote::ast::{BinOp, IoDir, Qual, UnOp};
 use coyote::lower::sha256_hex;
@@ -112,6 +117,12 @@ struct Ge {
     /// here as they're discovered; the main out-kernel is appended
     /// last by `emit`, matching eval's stmt→ret order.
     emit_q: Vec<EK>,
+    /// kernels dispatched AFTER the out kernel — `adam(w, g, lr)`:
+    /// eval leaves the param untouched during the call (the driver
+    /// applies moments between steps), so the on-device moment update
+    /// must not precede the output read. Adam grad kernels still go
+    /// in `emit_q` (grad is stmt-position, pre-ret).
+    post_q: Vec<EK>,
     /// completed scratch kernels awaiting queue placement — inner
     /// scratches finish before their outer (nested bodies resolve
     /// while the outer body is still generating).
@@ -1340,8 +1351,74 @@ impl Ge {
                 }
                 _ => Err("gpu emit: param updates expect `grad(loss, param)` on a param".into()),
             },
-            TStmt::Assign { .. } | TStmt::AdamUpdate { .. } | TStmt::StateUpdate { .. } => {
-                Err("gpu stratum: adam/state/assign updates not lowered — SGD steps only".into())
+            TStmt::AdamUpdate { param, lr, grad } => match &grad.e {
+                TExpr::Grad { loss, wrt } if wrt == param && self.is_param(param) => {
+                    // eval's AdamUpdate records the raw gradient; the
+                    // driver applies m/v moments between calls. On the
+                    // GPU the whole step rides along: per-param state
+                    // (ag/am/av/at) lives in zero-init scratch that
+                    // persists across dispatches, the grad kernel runs
+                    // stmt-position like any update, and the moment
+                    // apply + step bump run AFTER the out kernel —
+                    // eval leaves `param` untouched during `main`.
+                    let numel = self
+                        .param_numel
+                        .get(param)
+                        .copied()
+                        .ok_or_else(|| format!("gpu emit: {param} not a param"))?;
+                    for (tag, n) in [("ag", numel), ("am", numel), ("av", numel), ("at", 1)] {
+                        let b = format!("{tag}_{param}");
+                        if !self.scratch_args.iter().any(|(x, _)| x == &b) {
+                            self.scratch_args.push((b, n));
+                        }
+                    }
+                    let mark = self.scratch.len();
+                    let saved = std::mem::take(&mut self.lines);
+                    let g = self
+                        .grad_elem(loss, param, "gid")?
+                        .ok_or_else(|| format!("gpu emit: loss does not depend on {param}"))?;
+                    self.lines.push(format!("ag_{param}[gid] = ({g});"));
+                    let body = std::mem::replace(&mut self.lines, saved);
+                    self.emit_q.extend(self.scratch.drain(mark..));
+                    self.emit_q.push(EK {
+                        name: format!("grd_{param}_{}", self.emit_q.len()),
+                        dispatch: Dispatch::Linear(numel),
+                        body,
+                        writable: None, // writes ag_ scratch — always device
+                    });
+                    // adam_step parity: b1=0.9 b2=0.999 eps=1e-2
+                    // (fp16-safe), w rounded to half after the update.
+                    let i = self.post_q.len();
+                    self.post_q.push(EK {
+                        name: format!("adm_{param}_{i}"),
+                        dispatch: Dispatch::Linear(numel),
+                        body: vec![
+                            format!("float t = at_{param}[0] + 1.0f;"),
+                            "float bc1 = 1.0f - pow(0.9f, t);".into(),
+                            "float bc2 = 1.0f - pow(0.999f, t);".into(),
+                            format!("float g = ag_{param}[gid];"),
+                            format!("float m = 0.9f * am_{param}[gid] + 0.1f * g;"),
+                            format!("float v = 0.999f * av_{param}[gid] + 0.001f * g * g;"),
+                            format!("am_{param}[gid] = m;"),
+                            format!("av_{param}[gid] = v;"),
+                            format!(
+                                "b_{param}[gid] = float(half(b_{param}[gid] - {lr} * (m / bc1) / (sqrt(v / bc2) + 1e-2f)));"
+                            ),
+                        ],
+                        writable: Some(param.clone()),
+                    });
+                    self.post_q.push(EK {
+                        name: format!("bump_{param}_{i}"),
+                        dispatch: Dispatch::Linear(1),
+                        body: vec![format!("at_{param}[0] += 1.0f;")],
+                        writable: None,
+                    });
+                    Ok(())
+                }
+                _ => Err("gpu emit: adam expects `adam(param, grad(loss, param) [, lr])`".into()),
+            },
+            TStmt::Assign { .. } | TStmt::StateUpdate { .. } => {
+                Err("gpu stratum: state/assign updates not lowered — SGD and adam steps only".into())
             }
             TStmt::Expr(_) => Ok(()),
         }
@@ -1357,6 +1434,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         scopes: vec![Vec::new()],
         resolve_limit: Vec::new(), // (scope, pos) pairs
         emit_q: Vec::new(),
+        post_q: Vec::new(),
         scratch: Vec::new(),
         mat_ptr: HashMap::new(),
         scratch_args: Vec::new(),
@@ -1444,6 +1522,9 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         body,
         writable: None,
     });
+    // adam applies land after main — eval leaves the param untouched
+    // within the call.
+    ge.emit_q.extend(ge.post_q.drain(..));
 
     // signature: out + declared args + scratch buffers, in order.
     let mut sig = vec!["device float* _out [[buffer(0)]]".to_string()];

@@ -46,14 +46,45 @@ fn eval_parity(prog: &TProgram, inputs: &[(String, Vec<f32>)], got: &[f32]) -> f
 
 /// Registered-backend program (gpu today): host wall + device kernel
 /// time + parity.
-fn prof_ext(src: &str, prog: &TProgram, dir: &PathBuf, runs: usize) -> Result<Stats, String> {
+fn prof_ext(
+    src: &str,
+    prog: &TProgram,
+    dir: &PathBuf,
+    runs: usize,
+    dump: bool,
+) -> Result<Stats, String> {
     let be = coyote::backend::backend_for(prog.target)?;
     let t0 = Instant::now();
     let out = be.emit(src, "main", prog, dir)?;
     let emit_ms = t0.elapsed().as_secs_f64() * 1e3;
-    let mut rt = be
-        .load(prog, "main", &out, dir)
-        .map_err(|e| format!("ext load: {e}"))?;
+    // gpu loads concretely so the run loop keeps buffer access
+    // (`read_buf` for --dump); other backends go through the trait.
+    enum Rt {
+        Gpu(crate::gpu_rt::GpuRuntime),
+        Other(Box<dyn coyote::backend::BackendExec>),
+    }
+    impl Rt {
+        fn run(&mut self, w: &[(String, Vec<f32>)]) -> Result<Vec<f32>, String> {
+            match self {
+                Rt::Gpu(r) => r.run(w),
+                Rt::Other(r) => r.run(w),
+            }
+        }
+        fn device_ms(&self) -> Option<f64> {
+            match self {
+                Rt::Gpu(r) => coyote::backend::BackendExec::device_ms(r),
+                Rt::Other(r) => r.device_ms(),
+            }
+        }
+    }
+    let mut rt = if let Some(g) = out.opaque.downcast_ref::<crate::gpu_emit::GpuOut>() {
+        Rt::Gpu(crate::gpu_rt::GpuRuntime::load(prog, "main", g)?)
+    } else {
+        Rt::Other(
+            be.load(prog, "main", &out, dir)
+                .map_err(|e| format!("ext load: {e}"))?,
+        )
+    };
     let mut writes: Vec<(String, Vec<f32>)> = Vec::new();
     let mut inputs = Vec::new();
     for (name, ty, _c) in &out.inputs {
@@ -92,6 +123,34 @@ fn prof_ext(src: &str, prog: &TProgram, dir: &PathBuf, runs: usize) -> Result<St
         let (mn, av) = summarize(&mut dev);
         (Some(mn), Some(av))
     };
+    if dump {
+        if let Rt::Gpu(g) = &rt {
+            for (pname, _port, ty, src) in &out.trainable {
+                let expect: Vec<usize> = if ty.dims.len() == 2 {
+                    vec![ty.dims[1] as usize, ty.dims[0] as usize]
+                } else {
+                    vec![ty.numel() as usize]
+                };
+                let init =
+                    coyote::weights::resolve(pname, Some(&expect), src.as_deref(), init_weight_pub)
+                        .unwrap_or_default();
+                if let Some(got) = g.read_buf(pname) {
+                    let drift = got
+                        .iter()
+                        .zip(&init)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    println!(
+                        "  param {pname:<8} max|Δ vs init| {drift:.6}   w[0] {:.6} (init {:.6})",
+                        got.first().copied().unwrap_or(0.0),
+                        init.first().copied().unwrap_or(0.0),
+                    );
+                }
+            }
+        } else {
+            println!("  dump    n/a — backend exposes no buffer readback");
+        }
+    }
     Ok(Stats {
         emit_ms,
         host_min,
@@ -171,6 +230,7 @@ pub fn run(args: &[String]) -> Result<(), i32> {
         return Err(2);
     };
     let json = args.iter().any(|a| a == "--json");
+    let dump = args.iter().any(|a| a == "--dump");
     let runs: usize = args
         .windows(2)
         .find(|w| w[0] == "--runs")
@@ -194,7 +254,7 @@ pub fn run(args: &[String]) -> Result<(), i32> {
             .clone();
         let s = match prog.target {
             coyote::ast::Target::Ane => prof_ane(&src, &prog, &dir, runs),
-            _ => prof_ext(&src, &prog, &dir, runs),
+            _ => prof_ext(&src, &prog, &dir, runs, dump),
         }?;
         if json {
             println!(

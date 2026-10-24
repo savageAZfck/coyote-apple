@@ -214,6 +214,18 @@ impl GpuRuntime {
         };
         Ok(out)
     }
+
+    /// read a resident buffer (param `p`, io port, or scratch name)
+    /// back to the host — the trained-weight export path: kernels
+    /// mutate `b_param` in place across dispatches, so the owner's
+    /// checkpoint lives here, not in `param_outs`.
+    pub fn read_buf(&self, port: &str) -> Option<Vec<f32>> {
+        let &i = self.slot.get(port)?;
+        Some(unsafe {
+            std::slice::from_raw_parts(self.bufs[i].contents() as *const f32, self.elems[i])
+                .to_vec()
+        })
+    }
 }
 
 impl coyote::backend::BackendExec for GpuRuntime {

@@ -49,7 +49,18 @@ pub enum Dispatch {
     Linear(usize),
     /// grid = ceil(n/(t·mt))×t × ceil(m/(t·mt))×t threads, t×t groups —
     /// each thread owns an mt×mt micro-tile of the output.
-    Tiled { m: usize, n: usize, t: usize, mt: usize },
+    Tiled {
+        m: usize,
+        n: usize,
+        t: usize,
+        mt: usize,
+    },
+    /// 64×64 blocks, 128 threads (4 simdgroups) each — grid is
+    /// ceil(n/64) block-columns × ceil(m/64) block-rows.
+    Simdgemm {
+        m: usize,
+        n: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +144,10 @@ const TILE: usize = 32;
 const TT: usize = 8;
 const TM: usize = 4;
 const BK: usize = 16;
+/// simdgroup path: SGTHREADS threads (4 simdgroups) per SGBLK×SGBLK
+/// block — each simdgroup owns a 32×32 quadrant of 8×8 fragments.
+const SGBLK: usize = 64;
+const SGTHREADS: usize = 128;
 
 impl Ge {
     fn tmp(&mut self) -> String {
@@ -277,7 +292,7 @@ impl Ge {
             .insert(buf.clone(), (buf.clone(), e.ty.clone(), Kind::Row));
 
         let saved = std::mem::take(&mut self.lines);
-        let (body, dispatch) = match self.tiled_body(e, &buf) {
+        let (body, dispatch) = match self.matmul_body(e, &buf) {
             Some((b, d)) => (b, d),
             None => {
                 let mut coords = Vec::new();
@@ -327,16 +342,13 @@ impl Ge {
         None
     }
 
-    /// If `e` is a plain `A @ B` over buffers, emit the cooperative-
-    /// tile kernel: a TILE×TILE threadgroup loads A/B slices into
-    /// threadgroup memory once and reuses them — the difference
-    /// between a memory-bound ~150 GFLOP/s naive pass and a
-    /// compute-bound kernel. Index formulas reuse eval's conventions:
-    /// lhs row-major `a[m*K+k]`; named rhs flat `b[n*K+k]`; the one
-    /// strided case (non-square param `.T`) reads `b[k*N+n]`. Bounds
-    /// are guarded so any M,N,K shape works; accumulation order is
-    /// still sequential-k, so parity vs eval is unchanged.
-    fn tiled_body(&self, e: &Typed, out_buf: &str) -> Option<(Vec<String>, Dispatch)> {
+    /// If `e` is a plain `A @ B` over buffers, produce the operand
+    /// index expressions both matmul templates share: `a_e(m, tk)`,
+    /// `b_e(bn, tk)`, dims (m, k, n). Index formulas reuse eval's
+    /// conventions: lhs row-major `a[m*K+k]`; named rhs flat
+    /// `b[n*K+k]`; the one strided case (non-square param `.T`) reads
+    /// `b[k*N+n]`.
+    fn matmul_operands(&self, e: &Typed) -> Option<(String, String, usize, usize, usize)> {
         let TExpr::Bin(BinOp::MatMul, a, b) = &e.e else {
             return None;
         };
@@ -365,6 +377,108 @@ impl Ge {
             }
             _ => return None,
         };
+        Some((a_e, b_e, m_dim, k_dim, n_dim))
+    }
+
+    /// simdgroup_matrix path — the tensor-core analog: 4 simdgroups
+    /// per threadgroup, each owning a 32×32 quadrant of 8×8
+    /// `simdgroup_float8x8` fragments inside a 64×64 block. As loads
+    /// `[m][k]`; Bs is stored TRANSPOSED `[k][n]` so fragments feed
+    /// `simdgroup_multiply_accumulate` directly. Edge blocks store
+    /// frags to a Cs scratch and scalar-copy the in-bounds region —
+    /// any M,N,K ≥ 8 works. k-order is preserved at 8-granularity;
+    /// intra-frag reduction order is hardware-defined, so parity may
+    /// drift to ~1e-4 (still honest, still gated).
+    fn simd_body(&self, e: &Typed, out_buf: &str) -> Option<(Vec<String>, Dispatch)> {
+        let (a_e, b_e, m_dim, k_dim, n_dim) = self.matmul_operands(e)?;
+        if m_dim < 8 || n_dim < 8 || k_dim < 8 {
+            return None;
+        }
+        let (blk, sgt, bk) = (SGBLK, SGTHREADS, BK);
+        let a_e = a_e.replace("(m)", "(m0 + r)").replace("(tk)", "(t + c)");
+        let b_e = b_e.replace("(bn)", "(n0 + r)").replace("(tk)", "(t + c)");
+        let each = blk * bk / sgt;
+        let mut l = Vec::new();
+        l.push(format!("threadgroup float As[{blk}][{}];", bk + 1));
+        l.push(format!("threadgroup float Bs[{bk}][{}];", blk + 1));
+        l.push(format!("threadgroup float Cs[{blk}][{}];", blk + 1));
+        l.push("uint lid = lid2.x;".into());
+        l.push("uint sg = lid / 32;".into());
+        l.push("uint sgr = sg / 2, sgc = sg % 2;".into());
+        l.push(format!("uint m0 = tgid2.y*{blk};"));
+        l.push(format!("uint n0 = tgid2.x*{blk};"));
+        l.push("simdgroup_float8x8 acc[4][4];".into());
+        l.push(format!("for (uint t = 0; t < {k_dim}; t += {bk}) {{"));
+        l.push(format!("    for (uint i = 0; i < {each}; ++i) {{ uint idx = lid + i*{sgt}; uint r = idx/{bk}; uint c = idx%{bk};"));
+        l.push(format!(
+            "        As[r][c] = (m0 + r < {m_dim} && t + c < {k_dim}) ? ({a_e}) : 0.0f;"
+        ));
+        l.push(format!(
+            "        Bs[c][r] = (n0 + r < {n_dim} && t + c < {k_dim}) ? ({b_e}) : 0.0f;"
+        ));
+        l.push("    }".into());
+        l.push("    threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+        l.push("    simdgroup_float8x8 af, bf;".into());
+        l.push(format!("    for (uint kk = 0; kk < {bk}; kk += 8) {{"));
+        l.push("        for (uint i = 0; i < 4; ++i) {".into());
+        l.push(format!(
+            "            simdgroup_load(af, &As[sgr*32 + i*8][kk], {});",
+            bk + 1
+        ));
+        l.push("            for (uint j = 0; j < 4; ++j) {".into());
+        l.push(format!(
+            "                simdgroup_load(bf, &Bs[kk][sgc*32 + j*8], {});",
+            blk + 1
+        ));
+        l.push(
+            "                if (t == 0 && kk == 0) simdgroup_multiply(acc[i][j], af, bf);".into(),
+        );
+        l.push(
+            "                else simdgroup_multiply_accumulate(acc[i][j], af, bf, acc[i][j]);"
+                .into(),
+        );
+        l.push("            }".into());
+        l.push("        }".into());
+        l.push("    }".into());
+        l.push("    threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+        l.push("}".into());
+        l.push("for (uint i = 0; i < 4; ++i) for (uint j = 0; j < 4; ++j)".into());
+        l.push(format!(
+            "    simdgroup_store(acc[i][j], &Cs[sgr*32 + i*8][sgc*32 + j*8], {});",
+            blk + 1
+        ));
+        l.push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+        l.push(format!(
+            "for (uint idx = lid; idx < {}; idx += {sgt}) {{ uint r = idx/{blk}, c = idx%{blk}; uint m = m0 + r, n = n0 + c; if (m < {m_dim} && n < {n_dim}) {out_buf}[(m)*{n_dim}+(n)] = Cs[r][c]; }}",
+            blk * blk
+        ));
+        Some((l, Dispatch::Simdgemm { m: m_dim, n: n_dim }))
+    }
+
+    /// matmul template selection: cooperative-tile is the measured
+    /// winner on this GPU (f32 simdgroup_matrix is ALU-emulated
+    /// pre-M4); `CYO_SIMD=1` forces the simdgroup path for
+    /// benchmarking on matrix-hardware silicon.
+    fn matmul_body(&self, e: &Typed, out_buf: &str) -> Option<(Vec<String>, Dispatch)> {
+        if std::env::var_os("CYO_SIMD").is_some() {
+            if let Some(r) = self.simd_body(e, out_buf) {
+                return Some(r);
+            }
+        }
+        self.tiled_body(e, out_buf)
+    }
+
+    /// If `e` is a plain `A @ B` over buffers, emit the cooperative-
+    /// tile kernel: a TILE×TILE threadgroup loads A/B slices into
+    /// threadgroup memory once and reuses them — the difference
+    /// between a memory-bound ~150 GFLOP/s naive pass and a
+    /// compute-bound kernel. Index formulas reuse eval's conventions:
+    /// lhs row-major `a[m*K+k]`; named rhs flat `b[n*K+k]`; the one
+    /// strided case (non-square param `.T`) reads `b[k*N+n]`. Bounds
+    /// are guarded so any M,N,K shape works; accumulation order is
+    /// still sequential-k, so parity vs eval is unchanged.
+    fn tiled_body(&self, e: &Typed, out_buf: &str) -> Option<(Vec<String>, Dispatch)> {
+        let (a_e, b_e, m_dim, k_dim, n_dim) = self.matmul_operands(e)?;
         let (t, tt, tm, bk) = (TILE, TT, TM, BK);
         let mut l = Vec::new();
         // Register-blocked tile: TT×TT threads cover a TILE×TILE block,
@@ -1295,7 +1409,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
     // main out-kernel — last in dispatch order. A bare `A @ B` ret
     // takes the cooperative-tile path instead of per-element loops.
     let mark = ge.scratch.len();
-    let (body, dispatch) = match ge.tiled_body(&p.ret, "_out") {
+    let (body, dispatch) = match ge.matmul_body(&p.ret, "_out") {
         Some((b, d)) => (b, d),
         None => {
             ge.lines.clear();
@@ -1370,6 +1484,9 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
             Dispatch::Tiled { .. } => {
                 "uint2 gid2 [[thread_position_in_grid]],\n    uint2 lid2 [[thread_position_in_threadgroup]]"
             }
+            Dispatch::Simdgemm { .. } => {
+                "uint2 tgid2 [[threadgroup_position_in_grid]],\n    uint2 lid2 [[thread_position_in_threadgroup]]"
+            }
         };
         kernel_srcs.push(format!(
             "kernel void {kname}(\n    {},\n    {thread_decl})\n{{\n{}\n}}\n",
@@ -1384,7 +1501,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
     }
 
     let msl = format!(
-        "// coyote gpu emit — {name}\n#include <metal_stdlib>\nusing namespace metal;\n\n{}",
+        "// coyote gpu emit — {name}\n#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n\n{}",
         kernel_srcs.join("\n")
     );
     let msl_sha = sha256_hex(msl.as_bytes());

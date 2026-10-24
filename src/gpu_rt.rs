@@ -190,6 +190,13 @@ impl GpuRuntime {
                     let gy = (*m as u64).div_ceil(tt * mt) * tt;
                     enc.dispatch_threads(MTLSize::new(gx, gy, 1), MTLSize::new(tt, tt, 1));
                 }
+                crate::gpu_emit::Dispatch::Simdgemm { m, n } => {
+                    // one 128-thread group per 64×64 block: threadgroup
+                    // position IS the block origin (tgid2·64).
+                    let gx = (*n as u64).div_ceil(64) * 128;
+                    let gy = (*m as u64).div_ceil(64);
+                    enc.dispatch_threads(MTLSize::new(gx, gy, 1), MTLSize::new(128, 1, 1));
+                }
             }
             enc.end_encoding();
         }

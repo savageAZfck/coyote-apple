@@ -39,6 +39,7 @@ mod gpu_rt;
 mod new;
 mod oracle;
 mod package;
+mod prof;
 mod spec;
 mod stfile;
 mod test;
@@ -53,6 +54,7 @@ fn usage() {
     eprintln!("  verify   <pkg.cypack>");
     eprintln!("  unpack   <pkg.cypack> -o <dir>");
     eprintln!("  bench    <file.cy> [-o dir] [--steps N] [--runs N] [--cpu] [--json]");
+    eprintln!("  prof     <file.cy> [--runs N] [--json]   per-dispatch + device timing");
     eprintln!("  oracle   <file.cy> [--steps N] [--json]   semantic parity gate");
     eprintln!("  genmask  <name>:<rank>:<dim> [--rows] -o mask.safetensors");
     eprintln!("  diff     <dirA> <dirB>   per-file delta between two build dirs");
@@ -97,6 +99,7 @@ fn main() {
         "verify" => package::verify(&args[2..]),
         "unpack" => package::unpack(&args[2..]),
         "bench" => bench::run(&args[2..]),
+        "prof" => prof::run(&args[2..]),
         "oracle" => oracle::run(&args[2..]),
         "genmask" => genmask::run(&args[2..]),
         "diff" => diff::run(&args[2..]),

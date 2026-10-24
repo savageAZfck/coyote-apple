@@ -62,9 +62,18 @@ enum Kind {
 struct Ge {
     /// name → (arg, ty, kind) for every visible buffer
     bufs: HashMap<String, (String, CTy, Kind)>,
-    /// let-bound names → their typed tree (inlined lazily, recomputed
-    /// per element — correctness first, fusion later)
-    scopes: Vec<HashMap<String, Typed>>,
+    /// let-bound names → their typed tree, *in binding order* (inlined
+    /// lazily, recomputed per element — correctness first, fusion later)
+    scopes: Vec<Vec<(String, Typed)>>,
+    /// while resolving a let-bound expr at position i of scope s, only
+    /// earlier bindings *of s* are visible — the evaluator binds
+    /// eagerly in order; the emitter mirrors that lazily. This is what
+    /// keeps inliner alias pairs (`__arg0 := w`, `w := __arg0`) and
+    /// shadow-lets (`let x = x*2`) from recursing forever: the inner
+    /// `w`/`x` refers to whatever was bound *before*, i.e. the buffer.
+    /// Entries are (scope index, position) — a bound expr can open a
+    /// nested Block, so the limit travels with its scope.
+    resolve_limit: Vec<(usize, usize)>,
     lines: Vec<String>,
     tmp: usize,
 }
@@ -72,11 +81,25 @@ struct Ge {
 impl Ge {
     fn tmp(&mut self) -> String {
         self.tmp += 1;
-        format!("_t{}", self.tmp)
+        format!("t{}", self.tmp)
     }
 
-    fn lookup(&self, name: &str) -> Option<&Typed> {
-        self.scopes.iter().rev().find_map(|s| s.get(name))
+    /// find `name` among let bindings, innermost scope first, honoring
+    /// `resolve_limit` per scope. Returns (scope, position, expr).
+    fn pos_of(&self, name: &str) -> Option<(usize, usize, &Typed)> {
+        for (si, s) in self.scopes.iter().enumerate().rev() {
+            let lim = self
+                .resolve_limit
+                .iter()
+                .rev()
+                .find(|(s2, _)| *s2 == si)
+                .map(|(_, p)| *p)
+                .unwrap_or(s.len());
+            if let Some(p) = s[..lim.min(s.len())].iter().rposition(|(n, _)| n == name) {
+                return Some((si, p, &s[p].1));
+            }
+        }
+        None
     }
 
     /// flat buffer index for node dims `dims` at logical coords `c`,
@@ -139,9 +162,12 @@ impl Ge {
             TExpr::Lit(v) => Ok(format!("float({v:e})")),
             TExpr::Int(i) => Ok(format!("float({i})")),
             TExpr::Ident(s) => {
-                if let Some(b) = self.lookup(s) {
+                if let Some((si, pos, b)) = self.pos_of(s) {
                     let b = b.clone();
-                    return self.gen(&b, coords);
+                    self.resolve_limit.push((si, pos));
+                    let r = self.gen(&b, coords);
+                    self.resolve_limit.pop();
+                    return r;
                 }
                 let Some((arg, ty, _kind)) = self.bufs.get(s) else {
                     return Err(format!("gpu emit: unbound tensor {s}"));
@@ -193,31 +219,48 @@ impl Ge {
                     _ => return Err(format!("gpu emit: matmul {:?} @ {:?} not lowered", ad, bd)),
                 };
                 let lv = self.gen(a, &lc)?;
-                // matmul rhs conventions: `p` reads [N,K] storage
-                // (n*K+k), `p.T` reads row-major over p.T's dims — both
-                // are the same bytes, contracted on different axes.
-                // Anything else is a materialized value, row-major.
+                // matmul rhs — eval reads EVERY named rhs's storage
+                // flat as `w[n*K + k]` (params are physically [N,K];
+                // io/state/let buffers get the same linear reinterpret).
+                // `p.T` non-square is the one real storage swap; a
+                // square-param `.T` is a no-op. State fields keep their
+                // own logical convention (`kv.v` column contract,
+                // `kv.k.T` swapped). A materialized rhs resolves to the
+                // element at flat index n*K+k of its declared [K,N] view.
+                let kf = if rc.len() > 1 {
+                    format!("({n})*{k}+({kk})", n = rc[1], k = k, kk = rc[0])
+                } else {
+                    rc[0].clone()
+                };
                 let rv = match &b.e {
-                    TExpr::Ident(s) if matches!(self.bufs.get(s), Some((_, _, Kind::ParamT))) => {
-                        let (arg, ty, _) = self.bufs.get(s).unwrap().clone();
-                        format!("{arg}[{}]", Self::flat(&ty.dims, &rc, &Kind::ParamT))
-                    }
-                    TExpr::Transpose(i) if matches!(&i.e, TExpr::Ident(s) if matches!(self.bufs.get(s), Some((_, _, Kind::ParamT)))) =>
+                    TExpr::Field(..) => self.gen(b, &rc)?,
+                    TExpr::Transpose(i) if matches!(&i.e, TExpr::Field(..)) => self.gen(b, &rc)?,
+                    TExpr::Transpose(i) if matches!(&i.e, TExpr::Ident(s) if self.bufs.contains_key(s)) =>
                     {
-                        let (arg, ty, _) = match &i.e {
+                        let (arg, ty, kind) = match &i.e {
                             TExpr::Ident(s) => self.bufs.get(s).unwrap().clone(),
                             _ => unreachable!(),
                         };
-                        // matches eval + ane emit: `.T` on a square rhs
-                        // can't reorder the storage — no-op by
-                        // convention; non-square transposes for real.
-                        if ty.dims[0] == ty.dims[1] {
-                            format!("{arg}[{}]", Self::flat(&ty.dims, &rc, &Kind::ParamT))
-                        } else {
+                        if matches!(kind, Kind::ParamT) && ty.dims[0] != ty.dims[1] {
                             format!("{arg}[{}]", Self::flat(&b.ty.dims, &rc, &Kind::Row))
+                        } else {
+                            format!("{arg}[{kf}]")
                         }
                     }
-                    _ => self.gen(b, &rc)?,
+                    TExpr::Transpose(i) => {
+                        // `.T` on a materialized name — element at flat
+                        // n*K+k of the INNER tensor's declared layout.
+                        let cs = Self::coords_of(&kf, &i.ty.dims);
+                        self.gen(i, &cs)?
+                    }
+                    TExpr::Ident(s) if self.bufs.contains_key(s) => {
+                        let (arg, _, _) = self.bufs.get(s).unwrap().clone();
+                        format!("{arg}[{kf}]")
+                    }
+                    _ => {
+                        let cs = Self::coords_of(&kf, &b.ty.dims);
+                        self.gen(b, &cs)?
+                    }
                 };
                 self.lines.push(format!("{acc} += ({lv}) * ({rv});"));
                 self.lines.push("}".into());
@@ -282,7 +325,7 @@ impl Ge {
                 self.gen(base, &c)
             }
             TExpr::Block(stmts, last) => {
-                self.scopes.push(HashMap::new());
+                self.scopes.push(Vec::new());
                 for s in stmts {
                     self.stmt(s)?;
                 }
@@ -369,14 +412,26 @@ impl Ge {
                 Ok(format!("({acc} / float({n}))"))
             }
             "gather" | "embed" => {
-                // table[V, D] · onehot[V] → out[D]: weighted row sum.
+                // eval synthesizes `idx @ tab` — rhs convention applies:
+                // element at flat n*K+k of tab's storage (params: the
+                // [N,K] storage row n). one-hot → storage row select.
                 let (tab, idx) = (&args[0], &args[1]);
                 let v = tab.ty.dims[0];
                 let (acc, iv) = (self.tmp(), self.tmp());
+                let f = format!("({})*{v}+({iv})", coords[0]);
+                let tv = match &tab.e {
+                    TExpr::Ident(s) if self.bufs.contains_key(s) => {
+                        let (arg, _, _) = self.bufs.get(s).unwrap().clone();
+                        format!("{arg}[{f}]")
+                    }
+                    _ => {
+                        let cs = Self::coords_of(&f, &tab.ty.dims);
+                        self.gen(tab, &cs)?
+                    }
+                };
                 self.lines.push(format!("float {acc} = 0.0f;"));
                 self.lines
                     .push(format!("for (int {iv} = 0; {iv} < {v}; ++{iv}) {{"));
-                let tv = self.gen(tab, &[iv.clone(), coords[0].clone()])?;
                 let wv = self.gen(idx, &[iv.clone()])?;
                 self.lines.push(format!("{acc} += ({tv}) * ({wv});"));
                 self.lines.push("}".into());
@@ -408,7 +463,7 @@ impl Ge {
                 self.scopes
                     .last_mut()
                     .unwrap()
-                    .insert(name.clone(), expr.clone());
+                    .push((name.clone(), expr.clone()));
                 Ok(())
             }
             TStmt::Assign { .. }
@@ -428,7 +483,8 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
     let (oname, oty) = ("out".to_string(), p.ret.ty.clone());
     let mut ge = Ge {
         bufs: HashMap::new(),
-        scopes: vec![HashMap::new()],
+        scopes: vec![Vec::new()],
+        resolve_limit: Vec::new(), // (scope, pos) pairs
         lines: Vec::new(),
         tmp: 0,
     };

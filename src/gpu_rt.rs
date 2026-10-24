@@ -11,6 +11,7 @@
 use crate::gpu_emit::Arg;
 use coyote::typeck::TProgram;
 use metal::{CompileOptions, MTLResourceOptions, MTLSize};
+use objc::{msg_send, sel, sel_impl};
 use std::collections::HashMap;
 use std::ffi::c_void;
 
@@ -25,6 +26,9 @@ pub struct GpuRuntime {
     slot: HashMap<String, usize>,
     /// numel per buffer, for staging writes.
     elems: Vec<usize>,
+    /// GPU-side duration of the last dispatch (command buffer
+    /// GPUStartTime→GPUEndTime), milliseconds.
+    last_ms: f64,
 }
 
 fn buf_f32(dev: &metal::Device, data: &[f32]) -> metal::Buffer {
@@ -120,6 +124,7 @@ impl GpuRuntime {
             bufs,
             slot,
             elems,
+            last_ms: 0.0,
         })
     }
 
@@ -160,6 +165,13 @@ impl GpuRuntime {
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
+        // device-side kernel time: MTLCommandBuffer's own GPU
+        // timestamps — the profiler's ground truth, not host wall.
+        unsafe {
+            let s: f64 = msg_send![&*cb, GPUStartTime];
+            let e: f64 = msg_send![&*cb, GPUEndTime];
+            self.last_ms = (e - s) * 1000.0;
+        }
         let out = unsafe {
             std::slice::from_raw_parts(self.bufs[0].contents() as *const f32, self.out_n).to_vec()
         };
@@ -170,5 +182,8 @@ impl GpuRuntime {
 impl coyote::backend::BackendExec for GpuRuntime {
     fn run(&mut self, writes: &[(String, Vec<f32>)]) -> Result<Vec<f32>, String> {
         GpuRuntime::run(self, writes)
+    }
+    fn device_ms(&self) -> Option<f64> {
+        Some(self.last_ms)
     }
 }

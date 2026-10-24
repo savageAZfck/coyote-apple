@@ -61,6 +61,8 @@ version = "0.1.0"
 dependencies = [
  "coyote",
  "metal",
+ "mil_infer",
+ "objc",
 ]
 
 [[package]]

@@ -64,6 +64,9 @@ pub enum Dispatch {
     /// one threadgroup of N threads — kernels that need threadgroup
     /// barriers to cover the whole problem (fused softmax/rmsnorm).
     Group(usize),
+    /// N threadgroups of 64 — one group per output element (the
+    /// cooperative-load matvec path).
+    Gemv(usize),
     /// grid = ceil(n/(t·mt))×t × ceil(m/(t·mt))×t threads, t×t groups —
     /// each thread owns an mt×mt micro-tile of the output.
     Tiled {
@@ -257,6 +260,16 @@ impl Ge {
             format!("float({arg}[{idx}])")
         } else {
             format!("{arg}[{idx}]")
+        }
+    }
+
+    /// float4 vector load at `idx` (which must be 4-aligned) —
+    /// half buffers load `half4` and widen.
+    fn ld4(&self, arg: &str, idx: &str) -> String {
+        if self.half_args.contains(arg) {
+            format!("float4(*(device const half4*)({arg} + ({idx})))")
+        } else {
+            format!("*(device const float4*)({arg} + ({idx}))")
         }
     }
 
@@ -550,13 +563,162 @@ impl Ge {
     /// winner on this GPU (f32 simdgroup_matrix is ALU-emulated
     /// pre-M4); `CYO_SIMD=1` forces the simdgroup path for
     /// benchmarking on matrix-hardware silicon.
-    fn matmul_body(&self, e: &Typed, out_buf: &str) -> Option<(Vec<String>, Dispatch)> {
+    fn matmul_body(&mut self, e: &Typed, out_buf: &str) -> Option<(Vec<String>, Dispatch)> {
         if std::env::var_os("CYO_SIMD").is_some() {
             if let Some(r) = self.simd_body(e, out_buf) {
                 return Some(r);
             }
         }
+        if std::env::var_os("CYO_NOGEMV").is_none() {
+            if let Some(r) = self.gemv_body(e, out_buf) {
+                return Some(r);
+            }
+        }
         self.tiled_body(e, out_buf)
+    }
+
+    /// Vector-lhs matmul (`x @ w`, `q @ kv.k.T`, `s @ kv.v`) — the
+    /// decode-step shape. One thread per output walks a 4KB row:
+    /// fully uncoalesced, ~13 GB/s effective on the real-layer probe.
+    /// Two kernel shapes instead, both keeping eval's exact serial
+    /// accumulation so parity stays bit-exact:
+    ///
+    /// rows — one threadgroup per output element: the whole group
+    ///   coalesces the contraction row into threadgroup memory, then
+    ///   a single thread serial-dots it (reads hit SRAM, not global).
+    ///   Covers `x @ w` and `q @ kv.k.T` (contiguous-row contraction).
+    ///
+    /// cols — one threadgroup for ALL outputs: each thread owns a
+    ///   strided slice of the output and accumulates serially over
+    ///   the contraction dim; every read across the group is a
+    ///   contiguous block. Covers `s @ kv.v` (contract over dim0) and
+    ///   the strided non-square-param `.T` case.
+    fn gemv_body(&mut self, e: &Typed, out_buf: &str) -> Option<(Vec<String>, Dispatch)> {
+        const TG: usize = 64;
+        let TExpr::Bin(BinOp::MatMul, a, b) = &e.e else {
+            return None;
+        };
+        if a.ty.dims.len() != 1 || b.ty.dims.len() != 2 {
+            return None;
+        }
+        let k = a.ty.dims[0];
+        // threadgroup staging caps the row at 24KB of f32s.
+        if k > 6144 {
+            return None;
+        }
+
+        // classify the rhs: rows-style contiguous contraction vs
+        // cols-style strided contraction (and which buffer/index it
+        // reads).
+        enum Shape {
+            /// contiguous row per output: rhs[oidx*K + k]
+            Rows { buf: String, stride: i64 },
+            /// contract over rows, output over cols: rhs[t*D + oidx]
+            Cols { buf: String, dim_t: i64, dim_d: i64 },
+        }
+        let field_buf = |e: &Typed| -> Option<(String, CTy)> {
+            if let TExpr::Field(bx, f) = &e.e {
+                if let TExpr::Ident(s) = &bx.e {
+                    let key = format!("{s}.{f}");
+                    return self
+                        .bufs
+                        .get(&key)
+                        .map(|(a, t, _)| (a.clone(), t.clone()));
+                }
+            }
+            None
+        };
+        let shape = match &b.e {
+            // `q @ kv.k.T` — out[t] = Σ_d x[d]·v[t*D+d]; v rows are
+            // contiguous over the contraction dim d.
+            TExpr::Transpose(i) if field_buf(i).is_some() => {
+                let (buf, ty) = field_buf(i)?;
+                Shape::Rows {
+                    buf,
+                    stride: ty.dims[1],
+                }
+            }
+            // `s @ kv.v` — out[d] = Σ_t x[t]·v[t*D+d] — contract over
+            // the row index: strided output reads.
+            TExpr::Field(..) => {
+                let (buf, ty) = field_buf(b)?;
+                Shape::Cols {
+                    buf,
+                    dim_t: ty.dims[0],
+                    dim_d: ty.dims[1],
+                }
+            }
+            // non-square param .T keeps declared-order [K,N] storage:
+            // out[j] = Σ_k x[k]·w[k*N+j] — strided output reads.
+            TExpr::Transpose(i)
+                if matches!(&i.e, TExpr::Ident(s) if matches!(self.bufs.get(s), Some((_, t, Kind::ParamT)) if t.dims[0] != t.dims[1])) =>
+            {
+                let (buf, ty, _) = self.resolve_buf(i)?;
+                Shape::Cols {
+                    buf,
+                    dim_t: ty.dims[0],
+                    dim_d: ty.dims[1],
+                }
+            }
+            // `x @ w` (param/io/scratch) and square `.T` — the named
+            // rhs reads flat [N,K]: out[j] = Σ_k x[k]·w[j*K+k].
+            _ => {
+                let (buf, _, _) = self.resolve_buf(b)?;
+                Shape::Rows { buf, stride: k }
+            }
+        };
+
+        let mut l = Vec::new();
+        match shape {
+            Shape::Rows { buf, stride } => {
+                // one thread per output, serial-k accumulator —
+                // eval's exact order — but the row is consumed as
+                // float4s so each thread issues a quarter of the
+                // load instructions. (The fully-tiled variant with
+                // cooperative threadgroup staging measured 2.4x
+                // slower on this silicon: per-thread sequential
+                // rows prefetch well and the barriers expose
+                // latency at every slice.)
+                let n = b.ty.dims[1] as usize;
+                if stride % 4 != 0 || k % 4 != 0 {
+                    return None;
+                }
+                let x4: Option<Vec<String>> = (0..4)
+                    .map(|i| self.gen(a, &[format!("t*4+{i}")]).ok())
+                    .collect();
+                let x4 = x4?;
+                l.push("uint j = tgid*64 + lid;".into());
+                l.push("float acc = 0.0f;".into());
+                l.push(format!("for (uint t = 0; t < {}; ++t) {{", k / 4));
+                l.push(format!("float4 xv = float4({});", x4.join(", ")));
+                l.push(format!(
+                    "float4 wv = {};",
+                    self.ld4(&buf, &format!("j*{stride}+t*4"))
+                ));
+                l.push(
+                    "acc += xv.x*wv.x; acc += xv.y*wv.y; acc += xv.z*wv.z; acc += xv.w*wv.w;"
+                        .into(),
+                );
+                l.push("}".into());
+                l.push(format!("if (j < {n}) {out_buf}[j] = acc;"));
+                Some((l, Dispatch::Gemv(n)))
+            }
+            Shape::Cols { buf, dim_t, dim_d } => {
+                // contraction over the leading dim: out[d] =
+                // Σ_t x[t]·v[t*D+d]. one thread per output — for a
+                // fixed t the group's reads are already contiguous —
+                // serial t keeps eval's accumulation order.
+                l.push("uint d = tgid*64 + lid;".into());
+                l.push("float acc = 0.0f;".into());
+                l.push(format!("for (uint t = 0; t < {dim_t}; ++t) {{"));
+                let xv = self.gen(a, &["t".to_string()]).ok()?;
+                let bv = self.ld(&buf, &format!("t*{dim_d}+d"));
+                l.push(format!("acc += ({xv}) * ({bv});"));
+                l.push("}".into());
+                l.push(format!("if (d < {dim_d}) {out_buf}[d] = acc;"));
+                Some((l, Dispatch::Gemv(dim_d as usize)))
+            }
+        }
     }
 
     /// softmax / rmsnorm — one threadgroup does the whole op. The
@@ -1969,6 +2131,9 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         let thread_decl = match ek.dispatch {
             Dispatch::Linear(_) => "uint gid [[thread_position_in_grid]]",
             Dispatch::Group(_) => "uint lid [[thread_position_in_threadgroup]]",
+            Dispatch::Gemv(_) => {
+                "uint tgid [[threadgroup_position_in_grid]],\n    uint lid [[thread_position_in_threadgroup]]"
+            }
             Dispatch::Tiled { .. } => {
                 "uint2 gid2 [[thread_position_in_grid]],\n    uint2 lid2 [[thread_position_in_threadgroup]]"
             }

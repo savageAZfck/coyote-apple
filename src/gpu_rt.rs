@@ -218,6 +218,17 @@ impl GpuRuntime {
                     let t = *threads as u64;
                     enc.dispatch_threads(MTLSize::new(t, 1, 1), MTLSize::new(t, 1, 1));
                 }
+                crate::gpu_emit::Dispatch::Gemv(n) => {
+                    // each 64-thread group owns 64 consecutive
+                    // outputs — one output per thread, serial-k
+                    // accumulation per thread, cooperative tile loads.
+                    let tg = 64u64;
+                    let groups = (*n as u64).div_ceil(tg);
+                    enc.dispatch_threads(
+                        MTLSize::new(groups * tg, 1, 1),
+                        MTLSize::new(tg, 1, 1),
+                    );
+                }
                 crate::gpu_emit::Dispatch::Tiled { m, n, t, mt } => {
                     let (tt, mt) = (*t as u64, *mt as u64);
                     let gx = (*n as u64).div_ceil(tt * mt) * tt;

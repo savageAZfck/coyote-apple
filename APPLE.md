@@ -32,6 +32,7 @@ coyote-apple oracle   <file.cy> [--tol X]  semantic parity gate (silicon vs spec
 coyote-apple audit    <build_dir>          hash-chained build provenance
 coyote-apple diff     <dirA> <dirB>        build-vs-build artifact delta
 coyote-apple bench    <file.cy> [--runs N] e2e + organism-exec timing
+coyote-apple prof     <file.cy> [--runs N] per-dispatch device timing (GPU kernel ms)
 
 ## distribution
 coyote-apple package  <file.cy> [-o pkg]   single-file .cypack distributable
@@ -85,6 +86,12 @@ covers every imported file, so `audit` fingerprints the stdlib too.
   the rank-in-data adapter pattern, ready to `grad`.
 - **`std/expect`** — test assertions (`expect_eq`, `expect_true`,
   `expect_ne`, `expect_near`): return 0/1 semantics for `test_*` fns.
+- **`std/nn`** — transformer building blocks (`attn`, `attn_v`,
+  `ffn_swiglu`, `ffn_gelu`, `mlp`, `res_norm`, `embed_row`): weights
+  arrive as args, dims inline generically. Bit-exact on Metal; the
+  `ffn_*`/`mlp`/`res_norm` helpers also run on ANE — activation-rhs
+  matmul (`attn*`, `embed_row`) is gpu-only while the ane emitter
+  requires a param rhs.
 
 ## what each gives an org
 

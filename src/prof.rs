@@ -20,6 +20,8 @@ struct Stats {
     host_avg: f64,
     dev_min: Option<f64>,
     dev_avg: Option<f64>,
+    /// kernel name → best device ms (CYO_PKT per-kernel timestamps).
+    kernels: Vec<(String, f64)>,
     parity: f32,
     outs: usize,
 }
@@ -76,6 +78,12 @@ fn prof_ext(
                 Rt::Other(r) => r.device_ms(),
             }
         }
+        fn kernel_ms(&self) -> &[(String, f64)] {
+            match self {
+                Rt::Gpu(r) => r.kernel_ms(),
+                Rt::Other(_) => &[],
+            }
+        }
     }
     let mut rt = if let Some(g) = out.opaque.downcast_ref::<crate::gpu_emit::GpuOut>() {
         Rt::Gpu(crate::gpu_rt::GpuRuntime::load(prog, "main", g)?)
@@ -101,6 +109,9 @@ fn prof_ext(
     // legitimately evolve weights every dispatch, so only step 0 is
     // spec-equivalent to a single eval pass.
     let mut first = Vec::new();
+    // per-kernel mins, kept in emission order (kernel_ms returns
+    // pipe order).
+    let mut kmins: Vec<(String, f64)> = Vec::new();
     for i in 0..=runs {
         let t = Instant::now();
         let r = rt.run(&writes)?;
@@ -108,14 +119,20 @@ fn prof_ext(
             first = r;
         }
         host.push(t.elapsed().as_secs_f64() * 1e3);
+        if i == 0 {
+            continue; // warmup — don't time emit-side stalls
+        }
         if let Some(d) = rt.device_ms() {
             dev.push(d);
         }
+        for (j, (kn, kms)) in rt.kernel_ms().iter().enumerate() {
+            match kmins.get_mut(j) {
+                Some((_, m)) => *m = m.min(*kms),
+                None => kmins.push((kn.clone(), *kms)),
+            }
+        }
     }
     host.remove(0); // warmup
-    if !dev.is_empty() {
-        dev.remove(0);
-    }
     let (host_min, host_avg) = summarize(&mut host);
     let (dev_min, dev_avg) = if dev.is_empty() {
         (None, None)
@@ -157,6 +174,7 @@ fn prof_ext(
         host_avg,
         dev_min,
         dev_avg,
+        kernels: kmins,
         parity: eval_parity(prog, &inputs, &first),
         outs: out.output.1.numel() as usize,
     })
@@ -219,6 +237,7 @@ fn prof_ane(src: &str, prog: &TProgram, dir: &PathBuf, runs: usize) -> Result<St
         host_avg,
         dev_min: None,
         dev_avg: None,
+        kernels: Vec::new(),
         parity: eval_parity(prog, &inputs, &got),
         outs: oty.numel() as usize,
     })
@@ -282,6 +301,9 @@ pub fn run(args: &[String]) -> Result<(), i32> {
                     println!("  device    {mn:>8.3} ms min   {av:.3} avg   (GPU timestamps)")
                 }
                 _ => println!("  device    n/a — backend exposes no kernel counters"),
+            }
+            for (kn, kms) in &s.kernels {
+                println!("    {kn:<32} {kms:>8.3} ms");
             }
             println!("  parity    {:.6}   outputs {}", s.parity, s.outs);
         }

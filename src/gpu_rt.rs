@@ -20,7 +20,7 @@ pub struct GpuRuntime {
     queue: metal::CommandQueue,
     /// (pipeline, dispatch size) per kernel — update kernels first,
     /// the main out kernel last, matching eval's stmt→ret order.
-    pipes: Vec<(metal::ComputePipelineState, crate::gpu_emit::Dispatch)>,
+    pipes: Vec<(metal::ComputePipelineState, crate::gpu_emit::Dispatch, String)>,
     out_n: usize,
     /// buffer objects in arg order — index 0 is out.
     bufs: Vec<metal::Buffer>,
@@ -34,6 +34,11 @@ pub struct GpuRuntime {
     /// GPU-side duration of the last dispatch (command buffer
     /// GPUStartTime→GPUEndTime), milliseconds.
     last_ms: f64,
+    /// CYO_PKT: one command buffer per kernel, so each pipeline gets
+    /// its own GPU timestamp — per-kernel breakdown in `prof`.
+    per_kernel: bool,
+    /// kernel name → ms for the last run (per_kernel mode only).
+    last_kernels: Vec<(String, f64)>,
 }
 
 fn buf_f32(dev: &metal::Device, data: &[f32]) -> metal::Buffer {
@@ -75,7 +80,7 @@ impl GpuRuntime {
             let pipe = dev
                 .new_compute_pipeline_state_with_function(&f)
                 .map_err(|e| format!("msl pipeline ({name}:{kname}): {e:?}"))?;
-            pipes.push((pipe, *disp));
+            pipes.push((pipe, *disp, kname.clone()));
         }
         let queue = dev.new_command_queue();
 
@@ -124,12 +129,17 @@ impl GpuRuntime {
                     } else {
                         vec![t.ty.numel() as usize]
                     };
-                    let data = coyote::weights::resolve(
+                    let mut data = coyote::weights::resolve(
                         pname,
                         Some(&expect),
                         t.src.as_deref(),
                         coyote::weights::param_fallback,
                     )?;
+                    // eval quantizes q4 params at init — same values
+                    // must land in the buffer or parity diverges.
+                    if t.ty.dt == coyote::ast::DType::Q4 {
+                        data = coyote::lower::q4_quantize(&data);
+                    }
                     if matches!(a, Arg::ParamHalf(_)) {
                         bufs.push(buf_f16(&dev, &data));
                         half_slots.insert(i);
@@ -154,7 +164,15 @@ impl GpuRuntime {
             elems,
             half_slots,
             last_ms: 0.0,
+            per_kernel: std::env::var_os("CYO_PKT").is_some(),
+            last_kernels: Vec::new(),
         })
+    }
+
+    /// per-kernel device times from the last run — populated when
+    /// `CYO_PKT` puts each kernel in its own command buffer.
+    pub fn kernel_ms(&self) -> &[(String, f64)] {
+        &self.last_kernels
     }
 
     /// stage `writes` (port/param/state name → f32 data) into resident
@@ -180,15 +198,12 @@ impl GpuRuntime {
                 );
             }
         }
-        let cb = self.queue.new_command_buffer();
-        // one encoder per dispatch — encoders serialize, so update
-        // kernels fully complete before the out kernel reads params.
-        for (pipe, disp) in &self.pipes {
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(pipe);
-            for (i, b) in self.bufs.iter().enumerate() {
-                enc.set_buffer(i as u64, Some(b), 0);
-            }
+        // dispatch boundaries: Linear is flat threads; Tiled's grid is
+        // rounded UP to whole threadgroups — tile loads are
+        // lid-indexed and read by every member, so partial groups
+        // would leave stale threadgroup memory; kernel guards keep
+        // out-of-range threads clean.
+        fn dispatch(enc: &metal::ComputeCommandEncoderRef, pipe: &metal::ComputePipelineState, disp: &crate::gpu_emit::Dispatch) {
             match disp {
                 crate::gpu_emit::Dispatch::Linear(numel) => {
                     let n = *numel as u64;
@@ -198,12 +213,6 @@ impl GpuRuntime {
                     enc.dispatch_threads(MTLSize::new(n, 1, 1), MTLSize::new(tg, 1, 1));
                 }
                 crate::gpu_emit::Dispatch::Tiled { m, n, t, mt } => {
-                    // each thread covers an mt×mt micro-tile → the grid
-                    // is n/(t·mt) blocks × t threads. Grid is rounded
-                    // UP to whole threadgroups — tile loads are
-                    // lid-indexed and read by every member, so partial
-                    // groups would leave stale threadgroup memory;
-                    // kernel guards keep out-of-range threads clean.
                     let (tt, mt) = (*t as u64, *mt as u64);
                     let gx = (*n as u64).div_ceil(tt * mt) * tt;
                     let gy = (*m as u64).div_ceil(tt * mt) * tt;
@@ -217,16 +226,51 @@ impl GpuRuntime {
                     enc.dispatch_threads(MTLSize::new(gx, gy, 1), MTLSize::new(128, 1, 1));
                 }
             }
-            enc.end_encoding();
         }
-        cb.commit();
-        cb.wait_until_completed();
-        // device-side kernel time: MTLCommandBuffer's own GPU
-        // timestamps — the profiler's ground truth, not host wall.
-        unsafe {
-            let s: f64 = msg_send![&*cb, GPUStartTime];
-            let e: f64 = msg_send![&*cb, GPUEndTime];
-            self.last_ms = (e - s) * 1000.0;
+        let gpu_ms = |cb: &metal::CommandBufferRef| unsafe {
+            let s: f64 = msg_send![cb, GPUStartTime];
+            let e: f64 = msg_send![cb, GPUEndTime];
+            (e - s) * 1000.0
+        };
+        if self.per_kernel {
+            // CYO_PKT — one command buffer per kernel so each pipeline
+            // carries its own GPU timestamps. Costs a commit+wait per
+            // kernel; the breakdown is the point, not the total.
+            self.last_kernels.clear();
+            self.last_ms = 0.0;
+            for (pipe, disp, name) in &self.pipes {
+                let cb = self.queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                for (i, b) in self.bufs.iter().enumerate() {
+                    enc.set_buffer(i as u64, Some(b), 0);
+                }
+                dispatch(enc, pipe, disp);
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                let ms = gpu_ms(cb);
+                self.last_ms += ms;
+                self.last_kernels.push((name.clone(), ms));
+            }
+        } else {
+            let cb = self.queue.new_command_buffer();
+            // one encoder per dispatch — encoders serialize, so update
+            // kernels fully complete before the out kernel reads params.
+            for (pipe, disp, _) in &self.pipes {
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                for (i, b) in self.bufs.iter().enumerate() {
+                    enc.set_buffer(i as u64, Some(b), 0);
+                }
+                dispatch(enc, pipe, disp);
+                enc.end_encoding();
+            }
+            cb.commit();
+            cb.wait_until_completed();
+            // device-side kernel time: MTLCommandBuffer's own GPU
+            // timestamps — the profiler's ground truth, not host wall.
+            self.last_ms = gpu_ms(cb);
         }
         let out = unsafe {
             std::slice::from_raw_parts(self.bufs[0].contents() as *const f32, self.out_n).to_vec()

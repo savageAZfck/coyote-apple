@@ -23,7 +23,7 @@ seeds) — both sides compute on identical bytes.
 | workload | device ms (min) | parity vs eval | kernels emitted |
 |---|---|---|---|
 | gemm 512³ | 0.53–0.75 | 0.000003 | 1 (tiled GEMM) |
-| attn 64×64 | 0.079 | 0.000000 | 4 (matmul, fused softmax, matmul, out) |
+| attn 64×64 | 0.047 | 0.000000 | 4 (matmul, rsoftmax, matmul, out) |
 | ffn 256→1024 | 0.10–0.18 | 0.000020 | 3 (auto-materialized) |
 | sgd step | 0.050–0.065 | 0.000002 | 4 (fwd scratch, 2 updates, out) |
 
@@ -39,10 +39,11 @@ Emitter notes:
   one-thread-per-element kernel on this GPU. `CYO_SIMD=1` swaps in a
   `simdgroup_matrix` variant — measured slower on this silicon
   (emulated ops), kept for matrix-hardware machines.
-- `attn`: `softmax` is a fused single-threadgroup kernel — parallel
-  tree-max, parallel exp into scratch, serial sum in eval's exact
-  accumulation order, parallel normalize. The order-sensitive part
-  stays serial on purpose: it's what keeps parity at 0.000000.
+- `attn`: `rsoftmax` normalizes each query row — one thread per row,
+  serial within the row (eval's order) and parallel across rows.
+  Matches the CUDA port's per-row softmax exactly; the earlier
+  global `softmax` version was both slower and semantically wrong
+  for attention.
 - `sgd`: `grad` lowers reverse-mode to Metal; `w -= lr·grad` emits
   per-param update kernels in statement order. `adam` rides along
   the same path (persistent moment buffers, post-kernel apply).

@@ -18,7 +18,9 @@ use std::ffi::c_void;
 pub struct GpuRuntime {
     _dev: metal::Device,
     queue: metal::CommandQueue,
-    pipe: metal::ComputePipelineState,
+    /// (pipeline, dispatch size) per kernel — update kernels first,
+    /// the main out kernel last, matching eval's stmt→ret order.
+    pipes: Vec<(metal::ComputePipelineState, usize)>,
     out_n: usize,
     /// buffer objects in arg order — index 0 is out.
     bufs: Vec<metal::Buffer>,
@@ -53,12 +55,16 @@ impl GpuRuntime {
                     String::from_utf8_lossy(e.as_bytes())
                 )
             })?;
-        let f = lib
-            .get_function(&format!("coyote_{name}"), None)
-            .map_err(|e| format!("msl kernel ({name}): {e:?}"))?;
-        let pipe = dev
-            .new_compute_pipeline_state_with_function(&f)
-            .map_err(|e| format!("msl pipeline ({name}): {e:?}"))?;
+        let mut pipes = Vec::new();
+        for (kname, numel) in &out.kernels {
+            let f = lib
+                .get_function(kname, None)
+                .map_err(|e| format!("msl kernel ({name}:{kname}): {e:?}"))?;
+            let pipe = dev
+                .new_compute_pipeline_state_with_function(&f)
+                .map_err(|e| format!("msl pipeline ({name}:{kname}): {e:?}"))?;
+            pipes.push((pipe, *numel));
+        }
         let queue = dev.new_command_queue();
 
         let mut bufs = Vec::new();
@@ -119,7 +125,7 @@ impl GpuRuntime {
         Ok(Self {
             _dev: dev,
             queue,
-            pipe,
+            pipes,
             out_n,
             bufs,
             slot,
@@ -152,17 +158,21 @@ impl GpuRuntime {
             }
         }
         let cb = self.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&self.pipe);
-        for (i, b) in self.bufs.iter().enumerate() {
-            enc.set_buffer(i as u64, Some(b), 0);
+        // one encoder per dispatch — encoders serialize, so update
+        // kernels fully complete before the out kernel reads params.
+        for (pipe, numel) in &self.pipes {
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(pipe);
+            for (i, b) in self.bufs.iter().enumerate() {
+                enc.set_buffer(i as u64, Some(b), 0);
+            }
+            let n = *numel as u64;
+            let tg = (pipe.max_total_threads_per_threadgroup() as u64)
+                .min(n)
+                .max(1);
+            enc.dispatch_threads(MTLSize::new(n, 1, 1), MTLSize::new(tg, 1, 1));
+            enc.end_encoding();
         }
-        let n = self.out_n as u64;
-        let tg = (self.pipe.max_total_threads_per_threadgroup() as u64)
-            .min(n)
-            .max(1);
-        enc.dispatch_threads(MTLSize::new(n, 1, 1), MTLSize::new(tg, 1, 1));
-        enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
         // device-side kernel time: MTLCommandBuffer's own GPU

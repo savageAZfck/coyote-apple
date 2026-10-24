@@ -67,8 +67,11 @@ gpu fn block(x: f16[64]) -> f16[64] {
   builds. `oracle` gates them automatically.
 - Bare `coyote` parses `gpu fn` but fails at emit — "no backend
   registered". The capability is the distribution's.
-- v1 scope: forward passes only. `grad`/`adam`/param updates and state
-  writes are compile errors on this backend, not silent wrongness.
+- `grad(loss, w)` lowers reverse-mode on-device — same rule set and
+  `mse`-terminal scope as the evaluator — and `w op= s*grad` folds to
+  an update kernel dispatched before the out kernel (eval's
+  stmt→ret order). `adam`, `Assign` on params, and state writes are
+  still compile errors on this backend, not silent wrongness.
 
 Same-file mixing is the point: `fn` → ANE Mach-O nodes, `gpu fn` →
 Metal kernels, `host fn` → bytecode VM — one type system, one witness

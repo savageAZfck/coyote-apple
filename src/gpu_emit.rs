@@ -9,8 +9,12 @@
 //! evaluator see), so `x @ w` reads coalesced rows of `w`.
 //!
 //! GPU v1 computes in `float` — dtype annotations still typecheck,
-//! device storage is f32. `grad`/`adam`/state writes are not lowered
-//! on this backend yet; they emit honest errors, not silent wrongness.
+//! device storage is f32. `grad(loss, w)` lowers reverse-mode —
+//! mirroring `Evaluator::back` rule-for-rule, ending in `mse` like
+//! eval's v1 scope — and `w op= s*grad` folds to per-param update
+//! kernels dispatched before the main kernel (eval's stmt→ret
+//! order). `adam`, state writes, and `Assign` on params still emit
+//! honest errors, not silent wrongness.
 
 use coyote::ast::{BinOp, IoDir, Qual, UnOp};
 use coyote::lower::sha256_hex;
@@ -31,6 +35,10 @@ pub struct GpuOut {
     /// kernel arg order after `out`: In ports, all params, state ports.
     pub args: Vec<Arg>,
     pub output: (String, CTy),
+    /// kernels to dispatch in order — the main program kernel is
+    /// always LAST (eval runs stmts incl. updates before ret); each
+    /// entry is (msl function name, dispatch size).
+    pub kernels: Vec<(String, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +82,10 @@ struct Ge {
     /// Entries are (scope index, position) — a bound expr can open a
     /// nested Block, so the limit travels with its scope.
     resolve_limit: Vec<(usize, usize)>,
+    /// `w op= s*grad(loss, w)` steps — lowered to one update kernel
+    /// per statement, dispatched before the main kernel (eval applies
+    /// updates before materializing ret).
+    updates: Vec<(String, f64, Typed)>,
     lines: Vec<String>,
     tmp: usize,
 }
@@ -143,15 +155,17 @@ impl Ge {
     }
 
     /// decompose a flat loop index `v` into per-dim coord exprs.
+    /// `v` may be a compound expression — always parenthesize it or
+    /// `a*b+c/d` precedence bites.
     fn coords_of(v: &str, dims: &[i64]) -> Vec<String> {
         dims.iter()
             .enumerate()
             .map(|(i, d)| {
                 let stride: i64 = dims[i + 1..].iter().product();
                 if stride == 1 {
-                    format!("({v}%{d})")
+                    format!("(({v})%{d})")
                 } else {
-                    format!("(({v}/{stride})%{d})")
+                    format!("((({v})/{stride})%{d})")
                 }
             })
             .collect()
@@ -219,49 +233,7 @@ impl Ge {
                     _ => return Err(format!("gpu emit: matmul {:?} @ {:?} not lowered", ad, bd)),
                 };
                 let lv = self.gen(a, &lc)?;
-                // matmul rhs — eval reads EVERY named rhs's storage
-                // flat as `w[n*K + k]` (params are physically [N,K];
-                // io/state/let buffers get the same linear reinterpret).
-                // `p.T` non-square is the one real storage swap; a
-                // square-param `.T` is a no-op. State fields keep their
-                // own logical convention (`kv.v` column contract,
-                // `kv.k.T` swapped). A materialized rhs resolves to the
-                // element at flat index n*K+k of its declared [K,N] view.
-                let kf = if rc.len() > 1 {
-                    format!("({n})*{k}+({kk})", n = rc[1], k = k, kk = rc[0])
-                } else {
-                    rc[0].clone()
-                };
-                let rv = match &b.e {
-                    TExpr::Field(..) => self.gen(b, &rc)?,
-                    TExpr::Transpose(i) if matches!(&i.e, TExpr::Field(..)) => self.gen(b, &rc)?,
-                    TExpr::Transpose(i) if matches!(&i.e, TExpr::Ident(s) if self.bufs.contains_key(s)) =>
-                    {
-                        let (arg, ty, kind) = match &i.e {
-                            TExpr::Ident(s) => self.bufs.get(s).unwrap().clone(),
-                            _ => unreachable!(),
-                        };
-                        if matches!(kind, Kind::ParamT) && ty.dims[0] != ty.dims[1] {
-                            format!("{arg}[{}]", Self::flat(&b.ty.dims, &rc, &Kind::Row))
-                        } else {
-                            format!("{arg}[{kf}]")
-                        }
-                    }
-                    TExpr::Transpose(i) => {
-                        // `.T` on a materialized name — element at flat
-                        // n*K+k of the INNER tensor's declared layout.
-                        let cs = Self::coords_of(&kf, &i.ty.dims);
-                        self.gen(i, &cs)?
-                    }
-                    TExpr::Ident(s) if self.bufs.contains_key(s) => {
-                        let (arg, _, _) = self.bufs.get(s).unwrap().clone();
-                        format!("{arg}[{kf}]")
-                    }
-                    _ => {
-                        let cs = Self::coords_of(&kf, &b.ty.dims);
-                        self.gen(b, &cs)?
-                    }
-                };
+                let rv = self.rhs_read(b, &rc, k)?;
                 self.lines.push(format!("{acc} += ({lv}) * ({rv});"));
                 self.lines.push("}".into());
                 Ok(acc)
@@ -334,8 +306,18 @@ impl Ge {
                 v
             }
             TExpr::Call(name, args, _) => self.call(name, args, coords),
-            TExpr::Grad { .. } => {
-                Err("gpu stratum: grad/adam not lowered — train on cpu or ane".into())
+            TExpr::Grad { loss, wrt } => {
+                if !self.is_param(wrt) {
+                    return Err(format!("gpu emit: grad target {wrt} is not a param"));
+                }
+                // out flat position → grads[wrt] element. The leaf rule
+                // owns the flat-order convention ([N,K] for matmul rhs,
+                // declared order elsewhere) — same as eval's acc.
+                let f = Self::flat(&e.ty.dims, coords, &Kind::Row);
+                match self.grad_elem(loss, wrt, &f)? {
+                    Some(v) => Ok(v),
+                    None => Err(format!("gpu emit: loss does not depend on {wrt}")),
+                }
             }
         }
     }
@@ -457,6 +439,487 @@ impl Ge {
         }
     }
 
+    /// element of a matmul rhs `b` at logical coords `rc` ([contract,
+    /// out]). eval reads EVERY named rhs's storage flat as
+    /// `w[n*K + k]` — params are physically [N,K], io/state/let
+    /// buffers get the same linear reinterpret. `p.T` non-square is
+    /// the one real storage swap; square-param `.T` is a no-op.
+    /// State fields keep their own logical convention. A materialized
+    /// rhs resolves to the element at flat index n*K+k of its
+    /// declared [K,N] view.
+    fn rhs_read(&mut self, b: &Typed, rc: &[String], k: i64) -> Result<String, String> {
+        let kf = if rc.len() > 1 {
+            format!("({n})*{k}+({kk})", n = rc[1], k = k, kk = rc[0])
+        } else {
+            rc[0].clone()
+        };
+        match &b.e {
+            TExpr::Field(..) => self.gen(b, rc),
+            TExpr::Transpose(i) if matches!(&i.e, TExpr::Field(..)) => self.gen(b, rc),
+            TExpr::Transpose(i) if matches!(&i.e, TExpr::Ident(s) if self.bufs.contains_key(s)) => {
+                let (arg, ty, kind) = match &i.e {
+                    TExpr::Ident(s) => self.bufs.get(s).unwrap().clone(),
+                    _ => unreachable!(),
+                };
+                if matches!(kind, Kind::ParamT) && ty.dims[0] != ty.dims[1] {
+                    Ok(format!("{arg}[{}]", Self::flat(&b.ty.dims, rc, &Kind::Row)))
+                } else {
+                    Ok(format!("{arg}[{kf}]"))
+                }
+            }
+            TExpr::Transpose(i) => {
+                let cs = Self::coords_of(&kf, &i.ty.dims);
+                self.gen(i, &cs)
+            }
+            TExpr::Ident(s) if self.bufs.contains_key(s) => {
+                let (arg, _, _) = self.bufs.get(s).unwrap().clone();
+                Ok(format!("{arg}[{kf}]"))
+            }
+            _ => {
+                let cs = Self::coords_of(&kf, &b.ty.dims);
+                self.gen(b, &cs)
+            }
+        }
+    }
+
+    fn is_param(&self, s: &str) -> bool {
+        matches!(self.bufs.get(s), Some((_, _, Kind::ParamT)))
+    }
+
+    /// does `wrt` appear anywhere under `e` (through lets)? Mirrors
+    /// the evaluator's `needs_grad` — prunes dead branches so the
+    /// backward pass never emits code for them.
+    fn can_grad(&self, e: &Typed, wrt: &str) -> bool {
+        self.can_grad_d(e, wrt, 0)
+    }
+
+    fn can_grad_d(&self, e: &Typed, wrt: &str, depth: usize) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        match &e.e {
+            TExpr::Ident(s) => {
+                (s == wrt && self.is_param(s))
+                    || self
+                        .pos_of(s)
+                        .map(|(_, _, b)| self.can_grad_d(b, wrt, depth + 1))
+                        .unwrap_or(false)
+            }
+            TExpr::Unary(_, a) | TExpr::Transpose(a) => self.can_grad_d(a, wrt, depth + 1),
+            TExpr::Index(a, _) | TExpr::Field(a, _) => self.can_grad_d(a, wrt, depth + 1),
+            TExpr::Bin(_, a, b) => {
+                self.can_grad_d(a, wrt, depth + 1) || self.can_grad_d(b, wrt, depth + 1)
+            }
+            TExpr::Call(_, args, named) => {
+                args.iter().any(|a| self.can_grad_d(a, wrt, depth + 1))
+                    || named
+                        .iter()
+                        .any(|(_, a)| self.can_grad_d(a, wrt, depth + 1))
+            }
+            TExpr::Block(stmts, ret) => {
+                stmts.iter().any(|s| match s {
+                    TStmt::Let { expr, .. }
+                    | TStmt::Assign { expr, .. }
+                    | TStmt::StateUpdate { expr, .. }
+                    | TStmt::Expr(expr) => self.can_grad_d(expr, wrt, depth + 1),
+                    TStmt::ParamUpdate { grad, .. } | TStmt::AdamUpdate { grad, .. } => {
+                        self.can_grad_d(grad, wrt, depth + 1)
+                    }
+                }) || self.can_grad_d(ret, wrt, depth + 1)
+            }
+            _ => false,
+        }
+    }
+
+    /// `grad(loss, wrt)` — the seed: loss must terminate in `mse`
+    /// (same v1 scope as eval). Returns the MSL expression for the
+    /// grads flat position `f`, or None when `wrt` is unreachable.
+    fn grad_elem(&mut self, loss: &Typed, wrt: &str, f: &str) -> Result<Option<String>, String> {
+        self.scopes.push(Vec::new());
+        let r = (|| {
+            let terminal = match &loss.e {
+                TExpr::Block(stmts, ret) => {
+                    for s in stmts {
+                        match s {
+                            TStmt::Let { .. } => self.stmt(s)?,
+                            _ => return Err("gpu emit: non-let statement inside grad loss".into()),
+                        }
+                    }
+                    (**ret).clone()
+                }
+                _ => loss.clone(),
+            };
+            match &terminal.e {
+                TExpr::Call(name, args, _) if name == "mse" => {
+                    let n = args[0].ty.numel().max(1);
+                    let (parg, targ) = (args[0].clone(), args[1].clone());
+                    let mut seed = move |em: &mut Ge, c: &[String]| -> Result<String, String> {
+                        let p = em.gen(&parg, c)?;
+                        let t = em.gen(&targ, c)?;
+                        Ok(format!("(2.0f * (({p}) - ({t})) / float({n}))"))
+                    };
+                    self.back(&args[0], wrt, f, &mut seed)
+                }
+                _ => Err("gpu emit: grad v1 losses must end in mse".into()),
+            }
+        })();
+        self.scopes.pop();
+        r
+    }
+
+    /// reverse-mode adjoint — mirrors `Evaluator::back` rule-for-rule.
+    /// `adj` produces the downstream adjoint element at logical coords
+    /// of `e`'s value; `f` is the flat position inside grads[wrt]
+    /// (the leaf rule owns the storage-layout convention). Returns
+    /// Some(expr) for the contribution when this subtree reaches wrt.
+    fn back(
+        &mut self,
+        e: &Typed,
+        wrt: &str,
+        f: &str,
+        adj: &mut dyn FnMut(&mut Ge, &[String]) -> Result<String, String>,
+    ) -> Result<Option<String>, String> {
+        fn add(a: Option<String>, b: Option<String>) -> Option<String> {
+            match (a, b) {
+                (Some(x), Some(y)) => Some(format!("(({x}) + ({y}))")),
+                (x, None) => x,
+                (None, y) => y,
+            }
+        }
+        match &e.e {
+            TExpr::Ident(s) => {
+                if s == wrt && self.is_param(s) {
+                    // elementwise param leaf — grads flat order is the
+                    // declared-dims order here.
+                    let cs = Self::coords_of(f, &e.ty.dims);
+                    return adj(self, &cs).map(Some);
+                }
+                match self.pos_of(s) {
+                    Some((si, p, b)) => {
+                        let b = b.clone();
+                        self.resolve_limit.push((si, p));
+                        let r = self.back(&b, wrt, f, adj);
+                        self.resolve_limit.pop();
+                        r
+                    }
+                    None => Ok(None),
+                }
+            }
+            TExpr::Lit(_) | TExpr::Int(_) => Ok(None),
+            TExpr::Unary(UnOp::Neg, a) => self.back(a, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                Ok(format!("(-({}))", adj(em, c)?))
+            }),
+            TExpr::Unary(UnOp::Not, _) => Err("gpu grad: `!` is host-stratum".into()),
+            TExpr::Bin(BinOp::Add, a, b) => {
+                let ra = self.back(a, wrt, f, &mut *adj)?;
+                let rb = self.back(b, wrt, f, adj)?;
+                Ok(add(ra, rb))
+            }
+            TExpr::Bin(BinOp::Sub, a, b) => {
+                let ra = self.back(a, wrt, f, &mut *adj)?;
+                let rb = self.back(b, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                    Ok(format!("(-({}))", adj(em, c)?))
+                })?;
+                Ok(add(ra, rb))
+            }
+            TExpr::Bin(BinOp::Mul, a, b) => {
+                let ra = if self.can_grad(a, wrt) {
+                    self.back(a, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                        let d = adj(em, c)?;
+                        let bv = em.gen(b, c)?;
+                        Ok(format!("(({d}) * ({bv}))"))
+                    })?
+                } else {
+                    None
+                };
+                let rb = if self.can_grad(b, wrt) {
+                    self.back(b, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                        let d = adj(em, c)?;
+                        let av = em.gen(a, c)?;
+                        Ok(format!("(({d}) * ({av}))"))
+                    })?
+                } else {
+                    None
+                };
+                Ok(add(ra, rb))
+            }
+            TExpr::Bin(BinOp::Div, a, b) => {
+                if let TExpr::Lit(s) = b.e {
+                    self.back(a, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                        Ok(format!("(({}) / {}f)", adj(em, c)?, s))
+                    })
+                } else {
+                    let ra = if self.can_grad(a, wrt) {
+                        self.back(a, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                            let d = adj(em, c)?;
+                            let bv = em.gen(b, c)?;
+                            Ok(format!("(({d}) / ({bv}))"))
+                        })?
+                    } else {
+                        None
+                    };
+                    let rb = if self.can_grad(b, wrt) {
+                        self.back(b, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                            let d = adj(em, c)?;
+                            let av = em.gen(a, c)?;
+                            let bv = em.gen(b, c)?;
+                            Ok(format!("(-(({d}) * ({av})) / (({bv}) * ({bv})))"))
+                        })?
+                    } else {
+                        None
+                    };
+                    Ok(add(ra, rb))
+                }
+            }
+            TExpr::Bin(BinOp::MatMul, a, b) => {
+                let is_state_rhs = matches!(&b.e, TExpr::Field(..))
+                    || matches!(&b.e, TExpr::Transpose(i) if matches!(&i.e, TExpr::Field(..)));
+                if is_state_rhs {
+                    if self.can_grad(a, wrt) {
+                        return Err("gpu grad: through cache/state ops lands in M3b".into());
+                    }
+                    return Ok(None);
+                }
+                let kd = *a.ty.dims.last().ok_or("gpu grad: matmul of scalars")? as usize;
+                let nn = b.ty.dims.get(1).copied().unwrap_or(1) as usize;
+                let pname = match &b.e {
+                    TExpr::Ident(s) => Some(s.clone()),
+                    TExpr::Transpose(i) => match &i.e {
+                        TExpr::Ident(s) => Some(s.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let mut out = None;
+                if let Some(p) = &pname {
+                    if p == wrt && self.is_param(p) {
+                        // dW[n,k] = adj[n] · x[k] — [N,K] storage order.
+                        let sc = Self::coords_of(f, &[nn as i64, kd as i64]);
+                        let av = adj(self, &sc[..1])?;
+                        let xv = self.gen(a, &sc[1..])?;
+                        out = Some(format!("(({av}) * ({xv}))"));
+                    }
+                }
+                if self.can_grad(a, wrt) {
+                    if a.ty.dims.len() != 1 {
+                        return Err(
+                            "gpu grad: matmul lhs grads cover [K] @ [K,N] — same v1 scope as eval"
+                                .into(),
+                        );
+                    }
+                    let b2 = (**b).clone();
+                    let ra = self.back(a, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                        // dx[i] = Σ_j adj[j] · w[j*K + i]
+                        let acc = em.tmp();
+                        let j = em.tmp();
+                        em.lines.push(format!("float {acc} = 0.0f;"));
+                        em.lines
+                            .push(format!("for (int {j} = 0; {j} < {nn}; ++{j}) {{"));
+                        let av = adj(em, &[j.clone()])?;
+                        let wv = em.rhs_read(&b2, &[c[0].clone(), j.clone()], kd as i64)?;
+                        em.lines.push(format!("{acc} += ({av}) * ({wv});"));
+                        em.lines.push("}".into());
+                        Ok(acc)
+                    })?;
+                    out = add(out, ra);
+                }
+                Ok(out)
+            }
+            TExpr::Call(name, args, _) => {
+                let x = args[0].clone();
+                let e2 = e.clone();
+                let n = e.ty.numel().max(1) as usize;
+                match name.as_str() {
+                    "sigmoid" => self.back(&x, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                        let d = adj(em, c)?;
+                        let h = em.gen(&e2, c)?;
+                        Ok(format!("({d}) * ({h}) * (1.0f - ({h}))"))
+                    }),
+                    "tanh" => self.back(&x, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                        let d = adj(em, c)?;
+                        let t = em.gen(&e2, c)?;
+                        Ok(format!("({d}) * (1.0f - ({t}) * ({t}))"))
+                    }),
+                    "relu" => self.back(&x, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                        let d = adj(em, c)?;
+                        let xv = em.gen(&x, c)?;
+                        Ok(format!("(({xv}) > 0.0f ? ({d}) : 0.0f)"))
+                    }),
+                    "silu" => self.back(&x, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                        let d = adj(em, c)?;
+                        let xv = em.gen(&x, c)?;
+                        Ok(format!(
+                            "({d}) * (1.0f / (1.0f + exp(-({xv})))) * (1.0f + ({xv}) * (1.0f - (1.0f / (1.0f + exp(-({xv}))))))"
+                        ))
+                    }),
+                    "gelu" => self.back(&x, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                        let d = adj(em, c)?;
+                        let xv = em.gen(&x, c)?;
+                        // u = a*(v + b*v³); t = tanh(u)
+                        // dg = 0.5(1+t) + 0.5*v*(1-t²)*a*(1+3bv²)
+                        Ok(format!(
+                            "({d}) * (0.5f * (1.0f + tanh(0.7978845608028654f * (({xv}) + 0.044715f * ({xv}) * ({xv}) * ({xv})))) + 0.5f * ({xv}) * (1.0f - pow(tanh(0.7978845608028654f * (({xv}) + 0.044715f * ({xv}) * ({xv}) * ({xv}))), 2.0f)) * 0.7978845608028654f * (1.0f + 3.0f * 0.044715f * ({xv}) * ({xv})))"
+                        ))
+                    }),
+                    "softmax" => {
+                        // dx_i = s_i · (adj_i − Σ_j adj_j·s_j)
+                        let es = e2.clone();
+                        self.back(&x, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                            let dot = em.tmp();
+                            let j = em.tmp();
+                            em.lines.push(format!("float {dot} = 0.0f;"));
+                            em.lines
+                                .push(format!("for (int {j} = 0; {j} < {n}; ++{j}) {{"));
+                            let av = adj(em, &[j.clone()])?;
+                            let sv = em.gen(&es, &[j.clone()])?;
+                            em.lines.push(format!("{dot} += ({av}) * ({sv});"));
+                            em.lines.push("}".into());
+                            let d = adj(em, c)?;
+                            let s = em.gen(&es, c)?;
+                            Ok(format!("({s}) * (({d}) - {dot})"))
+                        })
+                    }
+                    "rmsnorm" => {
+                        // eval: dw = adj·xhat; dx = r·(adj·w − xhat·mean(g·xhat))
+                        let w2 = args[1].clone();
+                        let ms = self.tmp();
+                        let ix = self.tmp();
+                        self.lines.push(format!("float {ms} = 0.0f;"));
+                        self.lines
+                            .push(format!("for (int {ix} = 0; {ix} < {n}; ++{ix}) {{"));
+                        let xv = self.gen(&x, &[ix.clone()])?;
+                        self.lines.push(format!("{ms} += ({xv}) * ({xv});"));
+                        self.lines.push("}".into());
+                        let rvar = self.tmp();
+                        self.lines.push(format!(
+                            "float {rvar} = rsqrt({ms} / float({n}) + 1e-5f);"
+                        ));
+                        let mut out = None;
+                        if let TExpr::Ident(wp) = &args[1].e {
+                            if wp == wrt && self.is_param(wp) {
+                                let cs = Self::coords_of(f, &e.ty.dims);
+                                let d = adj(self, &cs)?;
+                                let xv = self.gen(&x, &cs)?;
+                                out = Some(format!("(({d}) * ({xv}) * {rvar})"));
+                            }
+                        }
+                        if self.can_grad(&x, wrt) {
+                            let (w2c, xc) = (w2.clone(), x.clone());
+                            let rv = rvar.clone();
+                            let rb = self.back(&x, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                                // mean_gx = Σ (adj·w·xhat) / n
+                                let mg = em.tmp();
+                                let j = em.tmp();
+                                em.lines.push(format!("float {mg} = 0.0f;"));
+                                em.lines.push(format!(
+                                    "for (int {j} = 0; {j} < {n}; ++{j}) {{"
+                                ));
+                                let av = adj(em, &[j.clone()])?;
+                                let wv = em.gen(&w2c, &[j.clone()])?;
+                                let xv = em.gen(&xc, &[j.clone()])?;
+                                em.lines.push(format!(
+                                    "{mg} += ({av}) * ({wv}) * ({xv}) * {rv};"
+                                ));
+                                em.lines.push("}".into());
+                                let d = adj(em, c)?;
+                                let wv = em.gen(&w2c, c)?;
+                                let xv = em.gen(&xc, c)?;
+                                Ok(format!(
+                                    "{rv} * (({d}) * ({wv}) - ({xv}) * {rv} * ({mg} / float({n})))"
+                                ))
+                            })?;
+                            out = add(out, rb);
+                        }
+                        Ok(out)
+                    }
+                    "concat" => {
+                        let k1 = args[0].ty.dims[0];
+                        let ra = if self.can_grad(&args[0], wrt) {
+                            self.back(&args[0], wrt, f, &mut *adj)?
+                        } else {
+                            None
+                        };
+                        let rb = if self.can_grad(&args[1], wrt) {
+                            self.back(&args[1], wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                                adj(em, &[format!("({}) + {k1}", c[0])])
+                            })?
+                        } else {
+                            None
+                        };
+                        Ok(add(ra, rb))
+                    }
+                    "gather" | "embed" => {
+                        // eval synthesizes `idx @ tab` and backs that.
+                        let synth = Typed {
+                            e: TExpr::Bin(
+                                BinOp::MatMul,
+                                Box::new(args[1].clone()),
+                                Box::new(args[0].clone()),
+                            ),
+                            ty: e.ty.clone(),
+                        };
+                        self.back(&synth, wrt, f, adj)
+                    }
+                    "mse" => {
+                        let (p2, t2) = (args[0].clone(), args[1].clone());
+                        self.back(&args[0], wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                            let d = adj(em, c)?;
+                            let p = em.gen(&p2, c)?;
+                            let t = em.gen(&t2, c)?;
+                            Ok(format!("(({d}) * 2.0f * (({p}) - ({t})) / float({n}))"))
+                        })
+                    }
+                    _ => Err(format!("gpu emit: no grad rule for {name}")),
+                }
+            }
+            TExpr::Transpose(inner) => {
+                if !self.can_grad(inner, wrt) {
+                    return Ok(None);
+                }
+                // adjoint of a transpose is the transpose of the adjoint
+                self.back(inner, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                    let mut sw = c.to_vec();
+                    sw.swap(0, 1);
+                    adj(em, &sw)
+                })
+            }
+            TExpr::Index(base, idxs) => {
+                if !self.can_grad(base, wrt) {
+                    return Ok(None);
+                }
+                if base.ty.dims.len() == 1 && idxs.len() == 1 {
+                    if let TIndex::Range(lo, hi) = idxs[0] {
+                        let (lo2, hi2) = (lo, hi);
+                        return self.back(base, wrt, f, &mut |em: &mut Ge, c: &[String]| {
+                            let i = c[0].clone();
+                            let d = adj(em, &[format!("({i}) - {lo2}")])?;
+                            Ok(format!(
+                                "((({i}) >= {lo2} && ({i}) < {hi2}) ? ({d}) : 0.0f)"
+                            ))
+                        });
+                    }
+                }
+                Err("gpu emit: grad through this index form not lowered".into())
+            }
+            TExpr::Block(stmts, ret) => {
+                self.scopes.push(Vec::new());
+                let r = (|| {
+                    for s in stmts {
+                        match s {
+                            TStmt::Let { .. } => self.stmt(s)?,
+                            _ => return Err("gpu emit: non-let statement inside grad path".into()),
+                        }
+                    }
+                    self.back(ret, wrt, f, adj)
+                })();
+                self.scopes.pop();
+                r
+            }
+            TExpr::Field(..) | TExpr::Grad { .. } => Err("gpu grad: unsupported node".into()),
+            _ => Ok(None),
+        }
+    }
+
     fn stmt(&mut self, s: &TStmt) -> Result<(), String> {
         match s {
             TStmt::Let { name, expr } => {
@@ -466,11 +929,15 @@ impl Ge {
                     .push((name.clone(), expr.clone()));
                 Ok(())
             }
-            TStmt::Assign { .. }
-            | TStmt::ParamUpdate { .. }
-            | TStmt::AdamUpdate { .. }
-            | TStmt::StateUpdate { .. } => {
-                Err("gpu stratum: param/state updates not lowered — forward passes only".into())
+            TStmt::ParamUpdate { param, scale, grad } => match &grad.e {
+                TExpr::Grad { loss, wrt } if wrt == param && self.is_param(param) => {
+                    self.updates.push((param.clone(), *scale, *loss.clone()));
+                    Ok(())
+                }
+                _ => Err("gpu emit: param updates expect `grad(loss, param)` on a param".into()),
+            },
+            TStmt::Assign { .. } | TStmt::AdamUpdate { .. } | TStmt::StateUpdate { .. } => {
+                Err("gpu stratum: adam/state/assign updates not lowered — SGD steps only".into())
             }
             TStmt::Expr(_) => Ok(()),
         }
@@ -485,9 +952,12 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         bufs: HashMap::new(),
         scopes: vec![Vec::new()],
         resolve_limit: Vec::new(), // (scope, pos) pairs
+        updates: Vec::new(),
         lines: Vec::new(),
         tmp: 0,
     };
+    // (buffer index, arg name, writable) — param buffers go writable
+    // in update kernels; the main kernel keeps them const.
     let mut sig = vec![format!(
         "device float* _out [[buffer({})]]",
         0 // out is always buffer 0
@@ -522,6 +992,52 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         bi += 1;
     }
 
+    // body: lets inline; param-update stmts collect into `updates`
+    for s in &p.body {
+        ge.stmt(s)?;
+    }
+
+    // one update kernel per `w op= s*grad(loss, w)` — gid over the
+    // param's [N,K] storage, `w += scale * grads(w)[gid]`. Dispatched
+    // BEFORE the main kernel to match eval's stmt-before-ret order.
+    let mut kernel_srcs = Vec::new();
+    let mut kernels = Vec::new();
+    for (param, scale, loss) in std::mem::take(&mut ge.updates) {
+        let numel = p
+            .params
+            .iter()
+            .find(|t| t.name == param)
+            .map(|t| t.ty.numel() as usize)
+            .ok_or_else(|| format!("gpu emit: update target {param} not a param"))?;
+        ge.lines.clear();
+        let g = ge
+            .grad_elem(&loss, &param, "gid")?
+            .ok_or_else(|| format!("gpu emit: loss does not depend on {param}"))?;
+        ge.lines
+            .push(format!("b_{param}[gid] += float({scale}) * ({g});"));
+        let up_sig: Vec<String> = sig
+            .iter()
+            .map(|s| {
+                s.replace(
+                    &format!("device const float* b_{param}"),
+                    &format!("device float* b_{param}"),
+                )
+            })
+            .collect();
+        let kname = format!("coyote_{name}_upd_{param}");
+        kernel_srcs.push(format!(
+            "kernel void {kname}(\n    {},\n    uint gid [[thread_position_in_grid]])\n{{\n{}\n}}\n",
+            up_sig.join(",\n    "),
+            ge.lines
+                .iter()
+                .map(|l| format!("    {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        kernels.push((kname, numel));
+    }
+
+    ge.lines.clear();
     // gid → out coords (row-major over the output's dims)
     let mut coords = Vec::new();
     let r = oty.dims.len();
@@ -539,22 +1055,23 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         }
         coords.push(cname);
     }
-
-    // body: lets inline, everything else rejected up-front
-    for s in &p.body {
-        ge.stmt(s)?;
-    }
     let v = ge.gen(&p.ret, &coords)?;
     ge.lines.push(format!("_out[gid] = ({v});"));
 
-    let msl = format!(
-        "// coyote gpu emit — {name}\n#include <metal_stdlib>\nusing namespace metal;\n\nkernel void coyote_{name}(\n    {},\n    uint gid [[thread_position_in_grid]])\n{{\n{}\n}}\n",
+    kernel_srcs.push(format!(
+        "kernel void coyote_{name}(\n    {},\n    uint gid [[thread_position_in_grid]])\n{{\n{}\n}}\n",
         sig.join(",\n    "),
         ge.lines
             .iter()
             .map(|l| format!("    {l}"))
             .collect::<Vec<_>>()
             .join("\n"),
+    ));
+    kernels.push((format!("coyote_{name}"), oty.numel() as usize));
+
+    let msl = format!(
+        "// coyote gpu emit — {name}\n#include <metal_stdlib>\nusing namespace metal;\n\n{}",
+        kernel_srcs.join("\n")
     );
     let msl_sha = sha256_hex(msl.as_bytes());
     let manifest = format!(
@@ -586,5 +1103,6 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         states,
         args,
         output: (oname.clone(), oty.clone()),
+        kernels,
     })
 }

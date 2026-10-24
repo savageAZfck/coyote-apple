@@ -14,3 +14,4 @@ coyote = { path = "../coyote" }
 mil_infer = { git = "https://github.com/savageAZfck/mil_spec" }
 metal = "0.33.0"
 objc = "0.2"
+serde_json = "1"

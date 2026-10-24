@@ -36,6 +36,7 @@ mod genmask;
 mod gold;
 mod gpu_emit;
 mod gpu_rt;
+mod lsp;
 mod new;
 mod oracle;
 mod package;
@@ -110,6 +111,7 @@ fn main() {
         "gold" => gold::run(&args[2..]),
         "watch" => watch::run(&args[2..]),
         "emit" => emit::run(&args[2..]),
+        "lsp" => lsp::run().map_err(|_| 1i32),
         _ => coyote::cli::run(&args),
     };
     if let Err(code) = r {

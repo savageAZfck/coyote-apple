@@ -89,13 +89,34 @@ gpu fn block(x: f16[64]) -> f16[64] {
 - Matmuls emit cooperative-tile kernels (32×32 blocks, 8×8 groups,
   4×4 register micro-tile, padded threadgroup staging); `CYO_SIMD=1`
   swaps in the `simdgroup_matrix` path — correct but slower on this
-  silicon, gated for newer hardware.
+  silicon, gated for newer hardware. `CYO_TILE`/`CYO_TM`/`CYO_BK`
+  override tile geometry for autotuning sweeps — 32/4/16 is the
+  measured sweet spot on dev silicon.
+- `softmax`/`rmsnorm` emit fused single-threadgroup kernels — the
+  order-free half (max) tree-reduces in parallel, the
+  order-sensitive sum stays serial in eval's exact accumulation
+  order, so parity holds at 0.000000 while work stays linear.
+- `rsoftmax(x[R,C])` — per-row softmax, one thread per row (serial
+  within the row = eval's order, parallel across rows). This is what
+  attention actually means: attn at L=256 went 1.8ms → 0.22ms
+  device. Global `softmax` remains for 1-D distributions.
+- `grad` through a batched `[M,K]` lhs accumulates `dW` over batch
+  rows and `dx` per row — matching the eval fix for what used to be
+  a panic on any 2-D matmul in a loss.
 - `CYO_HALF=1` stages `f16` params as real `half` buffers — compute
   stays fp32, reads promote, writes round (eval's f16 param-init is
   bit-identical; SGD-update programs see ~1e-3 rounding drift, adam
   stays exact). Measured ~2× on the param-heavy FFN bench.
-- `prof --dump` reads trained weights back vs deterministic init —
-  the on-device checkpoint export (`GpuRuntime::read_buf`).
+- `CYO_PKT=1` makes `prof` report per-kernel GPU timestamps — one
+  command buffer per kernel — the breakdown that caught both the
+  O(n²) softmax and the staging overhead. `prof --dump` reads
+  trained weights back vs deterministic init.
+- The VM skips param/state staging when the host tensor handle is
+  unchanged (`staged_ext` in public `vm.rs`) — after `read`-back the
+  mirror holds device values, so a re-dispatch doesn't round-trip
+  identical bytes or redo the [K,N]→[N,K] transpose.
+- `tests/run_probes.sh` — the gpu regression suite: 11 probes gated
+  on parity, one shell command, no framework.
 
 Same-file mixing is the point: `fn` → ANE Mach-O nodes, `gpu fn` →
 Metal kernels, `host fn` → bytecode VM — one type system, one witness

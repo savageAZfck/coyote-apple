@@ -179,6 +179,28 @@ const TILE: usize = 32;
 const TT: usize = 8;
 const TM: usize = 4;
 const BK: usize = 16;
+
+/// tile geometry for autotuning sweeps — `CYO_TILE`/`CYO_TM` let a
+/// run try other blockings without recompiling; defaults are the
+/// measured best on dev silicon.
+fn tile_geom() -> (usize, usize, usize) {
+    let p = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    (p("CYO_TILE", TILE), p("CYO_TM", TM), bk_depth())
+}
+
+/// k-slice depth for the tiled matmul — `CYO_BK` overrides for
+/// autotuning sweeps; 16 is the measured sweet spot on dev silicon.
+fn bk_depth() -> usize {
+    std::env::var("CYO_BK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(BK)
+}
 /// simdgroup path: SGTHREADS threads (4 simdgroups) per SGBLK×SGBLK
 /// block — each simdgroup owns a 32×32 quadrant of 8×8 fragments.
 const SGBLK: usize = 64;
@@ -663,7 +685,7 @@ impl Ge {
     /// still sequential-k, so parity vs eval is unchanged.
     fn tiled_body(&self, e: &Typed, out_buf: &str) -> Option<(Vec<String>, Dispatch)> {
         let (a_e, b_e, m_dim, k_dim, n_dim) = self.matmul_operands(e)?;
-        let (t, tt, tm, bk) = (TILE, TT, TM, BK);
+        let (tt, tm, t, bk) = { let (t2, m2, b2) = tile_geom(); (TT, m2, t2, b2) };
         let mut l = Vec::new();
         // Register-blocked tile: TT×TT threads cover a TILE×TILE block,
         // each thread owns a TM×TM micro-tile. Cooperative loads fill

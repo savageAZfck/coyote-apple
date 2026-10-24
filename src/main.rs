@@ -30,6 +30,7 @@ mod audit;
 mod bench;
 mod diff;
 mod doc;
+mod emit;
 mod genmask;
 mod gold;
 mod new;
@@ -58,6 +59,7 @@ fn usage() {
     eprintln!("  doc      <file.cy> [-o doc.md]   generated API markdown");
     eprintln!("  gold     record|check <file.cy>  golden-output regression");
     eprintln!("  watch    <file.cy> [--run]       rebuild on save");
+    eprintln!("  emit     <file.cy> --swift       generate the Swift bridge class");
     eprintln!("  + all coyote verbs (check/build/run/repl) pass through unchanged");
 }
 
@@ -95,6 +97,7 @@ fn main() {
         "doc" => doc::run(&args[2..]),
         "gold" => gold::run(&args[2..]),
         "watch" => watch::run(&args[2..]),
+        "emit" => emit::run(&args[2..]),
         _ => coyote::cli::run(&args),
     };
     if let Err(code) = r {

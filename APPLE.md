@@ -19,6 +19,8 @@ coyote-apple new      <name> [--program]   scaffold a project (organism or graph
 coyote-apple doc      <file.cy> [-o md]    generated API markdown
 coyote-apple test     <file.cy> [--cpu]    host fn test_*() runner
 coyote-apple spec     <file.cy>            capability + structure matrix
+coyote-apple watch    <file.cy> [--run]    rebuild on save (import-aware)
+coyote-apple gold     record|check <f.cy>  golden-output regression snapshots
 
 ## checkpoint tooling
 coyote-apple weights  inspect <file.st>    tensor inventory (dtype/shape/bytes)
@@ -38,6 +40,19 @@ coyote-apple unpack   <pkg.cypack> -o dir  extract a package
 
 coyote-apple <any coyote verb>             passthrough — check/build/run/repl
 ```
+
+## the stdlib — `lib/std/`
+
+The distribution ships a standard library. `import "std/lora"` (or
+`std/expect`) resolves through `CYO_PATH`, which coyote-apple extends
+with its own `lib/` automatically — user paths win, distribution
+paths are the floor. Modules splice at parse time; the manifest hash
+covers every imported file, so `audit` fingerprints the stdlib too.
+
+- **`std/lora`** — masked-LoRA helpers (`lora_adapt`, `lora_loss`):
+  the rank-in-data adapter pattern, ready to `grad`.
+- **`std/expect`** — test assertions (`expect_eq`, `expect_true`,
+  `expect_ne`, `expect_near`): return 0/1 semantics for `test_*` fns.
 
 ## what each gives an org
 

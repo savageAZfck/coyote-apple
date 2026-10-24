@@ -20,16 +20,37 @@ seeds) — both sides compute on identical bytes.
 
 ## Coyote results (measured)
 
-| workload | device ms (min) | device ms (avg) | host dispatch ms (avg) | parity vs eval |
-|---|---|---|---|---|
-| gemm 512³ | 1.694 | 2.032 | 2.415 | 0.000003 |
-| attn 64×64 | 0.246 | 0.404 | 0.679 | 0.000000 |
-| ffn 256→1024 | 0.144 | 0.966 | 8.410 | 0.000020 |
-| sgd step | 0.050 | 0.322 | 0.627 | 0.000002 |
+| workload | device ms (min) | parity vs eval | kernels emitted |
+|---|---|---|---|
+| gemm 512³ | 0.53–0.75 | 0.000003 | 1 (tiled GEMM) |
+| attn 64×64 | 0.079 | 0.000000 | 4 (matmul, fused softmax, matmul, out) |
+| ffn 256→1024 | 0.10–0.18 | 0.000020 | 3 (auto-materialized) |
+| sgd step | 0.050–0.065 | 0.000002 | 4 (fwd scratch, 2 updates, out) |
 
-Device time is kernel-only; host dispatch includes buffer staging +
-encoder overhead. Small workloads are dispatch-bound — the honest
-read is that Coyote's runtime hasn't amortized staging yet.
+Device time is kernel-only (GPU timestamps). This machine's GPU is
+shared — readings swing ~3× under contention, so mins are the honest
+kernel numbers and ranges reflect observed bests across sessions.
+
+Emitter notes:
+
+- `gemm`: cooperative-tile matmul — 32×32 blocks, 8×8 threadgroups,
+  4×4 register micro-tile per thread, threadgroup-staged A/B slices,
+  +1 stride padding against bank conflicts. ~3–4× over the naive
+  one-thread-per-element kernel on this GPU. `CYO_SIMD=1` swaps in a
+  `simdgroup_matrix` variant — measured slower on this silicon
+  (emulated ops), kept for matrix-hardware machines.
+- `attn`: `softmax` is a fused single-threadgroup kernel — parallel
+  tree-max, parallel exp into scratch, serial sum in eval's exact
+  accumulation order, parallel normalize. The order-sensitive part
+  stays serial on purpose: it's what keeps parity at 0.000000.
+- `sgd`: `grad` lowers reverse-mode to Metal; `w -= lr·grad` emits
+  per-param update kernels in statement order. `adam` rides along
+  the same path (persistent moment buffers, post-kernel apply).
+- `CYO_HALF=1` stores `f16` params as `half` buffers (eval already
+  f16-quantizes param init, so it's parity-free); ~2× device time
+  on param-bound kernels.
+- `CYO_PKT=1` adds per-kernel GPU timestamps to `prof` — the
+  breakdown table that caught the O(n²) softmax.
 
 ## CUDA results
 
@@ -39,10 +60,10 @@ cuBLAS sgemm column for the maturity-gap reference).
 
 ## What to expect (pre-registered, so results can't be spun)
 
-- **gemm**: naive-vs-naive should be within ~2× either way — both are
-  one-thread-per-element, memory-bound. cuBLAS will be 10–50× faster
-  than either: that's the real gap, and it's a tuning-library gap,
-  not a language gap.
+- **gemm**: Coyote's tile kernel vs the naive `.cu` — Coyote should
+  win on structure alone (register-blocked threadgroup tiling vs
+  one-thread-per-element). cuBLAS will still beat both: that's the
+  real gap, and it's a tuning-library gap, not a language gap.
 - **attn/ffn/sgd**: at these sizes both sides are dispatch-bound;
   kernel times will look similar, host overhead decides the average.
 - **DX asymmetry** is already visible in the source: `sgd.cy` is 4
@@ -55,10 +76,10 @@ cuBLAS sgemm column for the maturity-gap reference).
 
 ## Methodology notes
 
-- Coyote's `attn` emitted 3 kernels (matmul scratch, softmax scratch,
-  out matmul) — the emitter materializes reduction subexpressions
-  automatically rather than recomputing per element. The CUDA port
-  fuses the same math into one kernel by hand; both are honest.
+- Coyote's `attn` emits 4 kernels — scores matmul (tiled), fused
+  single-TG softmax, attn·V matmul (tiled), out — reduction
+  subexpressions materialize automatically. The CUDA port fuses the
+  same math into one kernel by hand; both are honest.
 - `sgd.cu` reproduces Coyote's *statement-ordered* semantics: the
   `w2` gradient is evaluated after `w1` is already updated. Standard
   frameworks compute both grads from one forward — Coyote's is the

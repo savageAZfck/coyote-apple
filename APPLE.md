@@ -40,7 +40,9 @@ coyote-apple verify   <pkg.cypack>         integrity check a package
 coyote-apple unpack   <pkg.cypack> -o dir  extract a package
 coyote-apple emit     <file.cy> --swift    typed Swift bridge over libcoyote
 
-coyote-apple <any coyote verb>             passthrough — check/build/run/repl
+coyote-apple <any coyote verb>             passthrough — check/build (run/repl
+                                           are intercepted: the mind externs
+                                           bind on every VM this binary builds)
 ```
 
 ## the gpu stratum — first-party compute
@@ -145,14 +147,29 @@ rest of the platform uses, reached through its SLICKS socket:
   `prefix_cache`, `speculative`, `draft_accept_pct` — the
   cross-silicon draft/verify surface, observable from a `.cy` program.
 - Language-side verbs in `lib/mind.cy`: `think`, `ask`, `gen`,
-  `timed` (telemetry), `models`, `remember`, `delegate` — every call
-  is `stoch` + `cap mind`, checked by the same constitution as every
-  other capability.
-- `run` is intercepted in the distribution so every Vm it builds gets
-  `mind::bind_all`; `bench`, `test`, and `oracle` bind on their Vm
-  paths too (`repl` doesn't — its Vm is built inside the public cli).
-- Verified live: `tests/probes/mind_probe.cy` — status → models → a
-  real generation → a ledger witness, all through the socket.
+  `timed` (telemetry), `models`, `remember`, `delegate`, `cortex`
+  (the working live-mind query — the language's builtin `cortex_ask`
+  attests deterministically when no socket is wired; `mind_cortex`
+  always reaches the daemon), `embed`/`cosine`/`recall_key` —
+  every mind call is `stoch` + `cap mind`, checked by the same
+  constitution as every other capability.
+- `mind_embed` is deterministic and offline: 64-dim FNV-seeded
+  token rows, mean-pooled, L2-normalized — no `stoch` marker, so
+  `det` contexts can embed too. Same {ok, vec} shape the daemon's
+  internal semantic_embedding returns; when the daemon exposes an
+  embedding RPC this extern can switch to it without touching the
+  library surface.
+- Binding is per-Vm in this distribution's own code — `run`,
+  `bench`, `test`, `oracle` (both parity VMs), `watch --run`, and
+  the apple `repl` each call `mind::bind_all` before executing.
+  `src/repl.rs` is the distribution's shell: same two-machine model
+  (live + scratch VMs) but every Vm is bound and scratch eval
+  resolves `import` through `parse_src_at`, so `mind_status()` and
+  `models()` answer live at the `cy>` prompt.
+- Verified live: `tests/probes/mind_probe.cy` — status → models →
+  a real generation → telemetry → cortex → embed determinism → a
+  ledger witness, all through the socket. `test` runs
+  `test_embed_det` against the offline embedder.
 - The VM skips param/state staging when the host tensor handle is
   unchanged (`staged_ext` in public `vm.rs`) — after `read`-back the
   mirror holds device values, so a re-dispatch doesn't round-trip

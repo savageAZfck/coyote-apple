@@ -95,7 +95,20 @@ pub fn run(args: &[String]) -> Result<(), i32> {
                 argv.push(s.clone());
             }
             let t = std::time::Instant::now();
-            match coyote::cli::run(&argv) {
+            // `check` builds no VM — straight through. `run` needs this
+            // distribution's pipeline so mind externs are bound before
+            // `main` executes — the public run can't bind them.
+            let r = if do_run {
+                let mut a = vec![file.to_string(), "-o".into(), dir.clone()];
+                if let Some(s) = &steps {
+                    a.push("--steps".into());
+                    a.push(s.clone());
+                }
+                crate::run::run(&a)
+            } else {
+                coyote::cli::run(&argv)
+            };
+            match r {
                 Ok(()) => println!(
                     "  ✓ {} ({:.1}s, {} deps)\n",
                     if do_run { "run" } else { "check" },

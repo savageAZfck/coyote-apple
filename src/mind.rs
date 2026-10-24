@@ -132,7 +132,7 @@ fn json_en_val(v: &Val) -> Value {
 fn arg_str(args: &[Val], i: usize) -> Result<String, String> {
     match args.get(i) {
         Some(Val::S(s)) => Ok(s.to_string()),
-        other => Err(format!("arg {i}: expected str, got wrong type")),
+        _ => Err(format!("arg {i}: expected str, got wrong type")),
     }
 }
 
@@ -140,7 +140,7 @@ fn arg_i64(args: &[Val], i: usize) -> Result<i64, String> {
     match args.get(i) {
         Some(Val::I(v)) => Ok(*v),
         Some(Val::F(v)) => Ok(*v as i64),
-        other => Err(format!("arg {i}: expected i64, got wrong type")),
+        _ => Err(format!("arg {i}: expected i64, got wrong type")),
     }
 }
 
@@ -148,12 +148,62 @@ fn arg_f64(args: &[Val], i: usize) -> Result<f64, String> {
     match args.get(i) {
         Some(Val::F(v)) => Ok(*v),
         Some(Val::I(v)) => Ok(*v as f64),
-        other => Err(format!("arg {i}: expected f64, got wrong type")),
+        _ => Err(format!("arg {i}: expected f64, got wrong type")),
     }
 }
 
 fn err_json(j: &JsonIdx, e: impl std::fmt::Display) -> Val {
     json_to_val(&json!({"status": "err", "err": e.to_string()}), j)
+}
+
+// ── deterministic embedding ─────────────────────────────────────────────
+// Same shape as the reference semantic_embedding: token → deterministic
+// 64-dim row → mean-pool → L2-normalize. Ours keys rows by FNV-1a hash
+// (seeded SplitMix64 stream) instead of a trained BPE vocab, so it runs
+// fully offline and — being deterministic — stays `det`-safe: organisms
+// can embed inside deterministic contexts.
+
+fn fnv1a64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
+fn splitmix64(x: &mut u64) -> u64 {
+    *x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// text → deterministic 64-dim unit vector.
+pub fn embed(text: &str) -> Vec<f64> {
+    let mut out = [0.0f64; 64];
+    let mut n = 0usize;
+    for tok in text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+        let mut seed = fnv1a64(tok);
+        for v in out.iter_mut() {
+            // [-1, 1) per component — same range as the reference table.
+            *v += (splitmix64(&mut seed) >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0;
+        }
+        n += 1;
+    }
+    if n > 0 {
+        for v in out.iter_mut() {
+            *v /= n as f64;
+        }
+        let mag = out.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if mag > 0.0 {
+            for v in out.iter_mut() {
+                *v /= mag;
+            }
+        }
+    }
+    out.to_vec()
 }
 
 // ── the bindings ────────────────────────────────────────────────────────
@@ -300,6 +350,36 @@ pub fn bind_all(vm: &mut Vm) {
             }
         });
     }
+
+    // mind_embed(text) -> Json {ok, vec:[f64×64]} — deterministic,
+    // offline, `det`-safe (registered stoch-free so det callers can use
+    // it; the extern itself is pure).
+    {
+        let j = JsonIdx {
+            en: j.en,
+            null: j.null,
+            boolv: j.boolv,
+            num: j.num,
+            strv: j.strv,
+            arr: j.arr,
+            obj: j.obj,
+        };
+        vm.bind_extern("mind_embed", move |args| {
+            let text = arg_str(args, 0)?;
+            let vec = embed(&text);
+            Ok(json_to_val(&json!({"ok": !vec.is_empty(), "vec": vec}), &j))
+        });
+    }
+
+    // mind_cortex(prompt) -> str — the live-mind query. The language's
+    // builtin `cortex_ask` attests locally when no mind is wired; this
+    // extern is this distribution's working socket path — "" on failure.
+    vm.bind_extern("mind_cortex", move |args| {
+        let prompt = arg_str(args, 0)?;
+        Ok(Val::S(Rc::from(
+            substrate::cortex_ask(&prompt).as_str(),
+        )))
+    });
 
     // mind_witness(event) -> bool — drop an audit_event onto the
     // organism's hash-chained ledger through the daemon.

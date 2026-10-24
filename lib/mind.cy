@@ -48,6 +48,17 @@ extern stoch fn mind_tasks() -> Json cap mind;
 // invoke_tool on the daemon's registry → Json {tool, result}
 extern stoch fn mind_tool(name: str, params: Json) -> Json cap mind;
 
+// Deterministic 64-dim embedding — token → FNV-hashed seeded row →
+// mean-pool → L2-normalize. Pure + offline, so it carries no `stoch`
+// and det contexts can embed too. Same shape as the brain's
+// semantic_embedding ({ok, vec}) — different table, same semantics.
+extern det fn mind_embed(text: str) -> Json cap mind;
+
+// The live-mind query — same primitive shape as the language's
+// builtin `cortex_ask`, but bound to this distribution's working
+// SLICKS path. Returns the reply text, "" when the mind is away.
+extern stoch fn mind_cortex(prompt: str) -> str cap mind;
+
 // ── reading Json results ─────────────────────────────────────────────
 
 host det fn jstr(o: {str: Json}, k: str) -> str {
@@ -136,4 +147,77 @@ host fn delegate(goal: str, max_steps: i64) -> Json cap mind {
 // performance surface (draft-on-ANE verify-on-GPU shows up here).
 host fn timed(prompt: str, max_tokens: i64) -> Json cap mind {
     return mind_gen(prompt, max_tokens);
+}
+
+// cortex — the working bridge: prompt → reply text over the
+// substrate socket. The builtin `cortex_ask` still attests
+// deterministically when nothing is wired; this one thinks.
+host fn cortex(prompt: str) -> str cap mind {
+    return mind_cortex(prompt);
+}
+
+// embed — text → 64-dim unit vector, deterministic and offline.
+// Returns [] when the embedding fails (never today — total function).
+host det fn embed(text: str) -> [f64] cap mind {
+    var empty: [f64] = [];
+    match mind_embed(text) {
+        Json::Obj(r) => {
+            if jbool(r, "ok") {
+                match r["vec"] {
+                    Json::Arr(v) => {
+                        var vec: [f64] = [];
+                        for i in 0..len(v) {
+                            match v[i] {
+                                Json::Num(n) => { push(vec, n); }
+                                _ => { }
+                            }
+                        }
+                        return vec;
+                    }
+                    _ => { return empty; }
+                }
+            }
+            return empty;
+        }
+        _ => { return empty; }
+    }
+}
+
+// isqrt — Newton iteration; 32 rounds is past f64 convergence for
+// the norm ranges embeddings produce.
+host det fn isqrt(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0; }
+    var g = x;
+    if g < 1.0 { g = 1.0; }
+    for _i in 0..32 { g = 0.5 * (g + x / g); }
+    return g;
+}
+
+// cosine similarity between two same-dim embeddings — pure math, det.
+host det fn cosine(a: [f64], b: [f64]) -> f64 {
+    var dot = 0.0;
+    var na = 0.0;
+    var nb = 0.0;
+    let n = len(a);
+    var i = 0;
+    while i < n {
+        if i >= len(b) { break; }
+        dot = dot + a[i] * b[i];
+        na = na + a[i] * a[i];
+        nb = nb + b[i] * b[i];
+        i = i + 1;
+    }
+    let d = na * nb;
+    if d <= 0.0 { return 0.0; }
+    return dot / isqrt(d);
+}
+
+// remember_vec — embed then witness a recall key, the organism's
+// semantic-memory write path.
+host det fn recall_key(text: str) -> str cap mind {
+    let v = embed(text);
+    // a stable fingerprint of the embedding for keyed recall.
+    var h = 0.0;
+    for i in 0..len(v) { h = h + v[i] * 7919.0; }
+    return "k" + str(i64(h * 1000000.0));
 }

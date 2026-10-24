@@ -594,7 +594,6 @@ impl Ge {
     ///   contiguous block. Covers `s @ kv.v` (contract over dim0) and
     ///   the strided non-square-param `.T` case.
     fn gemv_body(&mut self, e: &Typed, out_buf: &str) -> Option<(Vec<String>, Dispatch)> {
-        const TG: usize = 64;
         let TExpr::Bin(BinOp::MatMul, a, b) = &e.e else {
             return None;
         };

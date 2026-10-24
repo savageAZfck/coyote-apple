@@ -42,6 +42,7 @@ mod new;
 mod oracle;
 mod package;
 mod prof;
+mod repl;
 mod run;
 mod spec;
 mod stfile;
@@ -79,6 +80,9 @@ fn main() {
         coyote::ast::Target::Gpu,
         std::sync::Arc::new(backend_metal::MetalBackend),
     );
+    // every Vm-building verb binds the mind externs on the Vm it
+    // constructs — run.rs / bench.rs / test.rs / oracle.rs / prof.rs
+    // / repl.rs each call mind::bind_all before executing.
     // the distribution's stdlib rides on CYO_PATH — user's own entries
     // come first, our lib/ last, so project modules always win.
     if let Ok(exe) = std::env::current_exe() {
@@ -116,6 +120,10 @@ fn main() {
         // internally, so organisms that declare `mind_*` externs need
         // this distribution to build (and bind) it instead.
         "run" => run::run(&args[2..]),
+        // `repl` is intercepted for the same reason — the public shell
+        // builds its VMs internally; this distribution's copy binds
+        // the mind externs on live, bare, and scratch VMs alike.
+        "repl" => repl::run(&args[2..]),
         "watch" => watch::run(&args[2..]),
         "emit" => emit::run(&args[2..]),
         "lsp" => lsp::run().map_err(|_| 1i32),

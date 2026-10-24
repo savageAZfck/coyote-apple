@@ -346,6 +346,14 @@ pub fn query(prompt: &str, max_new_tokens: usize) -> Result<(String, Option<Valu
             sha256_hex(prompt.as_bytes())
         ))?,
     };
+    // the server enforces timestamp freshness — the v2 path can stall
+    // in the identity agent (Secure Enclave signing may wait on user
+    // interaction); if the handshake has already run past the skew
+    // bound, fail fast instead of sending a proof the gatekeeper
+    // will reject as stale.
+    if now_ms().saturating_sub(ts) > HANDSHAKE_MAX_SKEW_MS {
+        return Err("SLICKS handshake exceeded the 30s skew bound — retry".into());
+    }
     let mut exec = json!({
         "type": "execute",
         "version": version,
@@ -439,4 +447,20 @@ pub fn infer(
 /// Is the substrate socket reachable right now?
 pub fn available() -> bool {
     socket_path().exists() && UnixStream::connect(socket_path()).is_ok()
+}
+
+/// `cortex_ask` — the live-mind query behind `mind_cortex`/`ask`.
+/// Returns "" on failure so callers can fall back deterministically.
+pub fn cortex_ask(prompt: &str) -> String {
+    if !available() {
+        return String::new();
+    }
+    match infer(prompt, "", 512, 0.0, "auto") {
+        Ok(v) => v
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        Err(_) => String::new(),
+    }
 }

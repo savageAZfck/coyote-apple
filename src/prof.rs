@@ -22,6 +22,10 @@ struct Stats {
     dev_avg: Option<f64>,
     /// kernel name → best device ms (CYO_PKT per-kernel timestamps).
     kernels: Vec<(String, f64)>,
+    /// same program through the reference CPU evaluator — the third
+    /// backend in the same-source comparison.
+    cpu_min: f64,
+    cpu_avg: f64,
     parity: f32,
     outs: usize,
 }
@@ -44,6 +48,24 @@ fn eval_parity(prog: &TProgram, inputs: &[(String, Vec<f32>)], got: &[f32]) -> f
             .fold(0f32, f32::max),
         Err(_) => f32::NAN,
     }
+}
+
+/// CPU column: the same typed program through the reference evaluator,
+/// state persistent across dispatches like the silicon runtimes.
+fn prof_cpu(prog: &TProgram, inputs: &[(String, Vec<f32>)], runs: usize) -> (f64, f64) {
+    let map: std::collections::HashMap<String, Vec<f32>> = inputs.iter().cloned().collect();
+    let mut ev = Evaluator::new(prog);
+    let mut times = Vec::new();
+    for i in 0..=runs {
+        let t = Instant::now();
+        if ev.run(&map).is_err() {
+            break;
+        }
+        if i > 0 {
+            times.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+    summarize(&mut times)
 }
 
 /// Registered-backend program (gpu today): host wall + device kernel
@@ -168,6 +190,7 @@ fn prof_ext(
             println!("  dump    n/a — backend exposes no buffer readback");
         }
     }
+    let (cpu_min, cpu_avg) = prof_cpu(prog, &inputs, runs);
     Ok(Stats {
         emit_ms,
         host_min,
@@ -175,6 +198,8 @@ fn prof_ext(
         dev_min,
         dev_avg,
         kernels: kmins,
+        cpu_min,
+        cpu_avg,
         parity: eval_parity(prog, &inputs, &first),
         outs: out.output.1.numel() as usize,
     })
@@ -231,6 +256,7 @@ fn prof_ane(src: &str, prog: &TProgram, dir: &PathBuf, runs: usize) -> Result<St
     }
     host.remove(0);
     let (host_min, host_avg) = summarize(&mut host);
+    let (cpu_min, cpu_avg) = prof_cpu(prog, &inputs, runs);
     Ok(Stats {
         emit_ms,
         host_min,
@@ -238,6 +264,8 @@ fn prof_ane(src: &str, prog: &TProgram, dir: &PathBuf, runs: usize) -> Result<St
         dev_min: None,
         dev_avg: None,
         kernels: Vec::new(),
+        cpu_min,
+        cpu_avg,
         parity: eval_parity(prog, &inputs, &got),
         outs: oty.numel() as usize,
     })
@@ -263,49 +291,61 @@ pub fn run(args: &[String]) -> Result<(), i32> {
         let (src, ast) =
             coyote::parser::parse_file(std::path::Path::new(file)).map_err(|d| d.to_string())?;
         let checked = coyote::typeck::check_all(&ast).map_err(|d| d.to_string())?;
-        if checked.organism {
-            return Err("prof profiles tensor programs — use `bench` for organisms".into());
+        // organisms are welcome: their tensor programs are still
+        // first-class emit units, and a file carrying `fn` + `gpu fn`
+        // for the same math is the same-source cross-backend story.
+        if checked.ane.is_empty() {
+            return Err("no tensor program in file".into());
         }
-        let (name, prog) = checked
-            .ane
-            .first()
-            .ok_or("no tensor program in file")?
-            .clone();
-        let s = match prog.target {
-            coyote::ast::Target::Ane => prof_ane(&src, &prog, &dir, runs),
-            _ => prof_ext(&src, &prog, &dir, runs, dump),
-        }?;
-        if json {
-            println!(
-                "{{\"file\":{file:?},\"program\":{name:?},\"backend\":{:?},\"emit_ms\":{:.3},\"host_min_ms\":{:.3},\"host_avg_ms\":{:.3},\"device_min_ms\":{},\"device_avg_ms\":{},\"parity\":{:.6},\"outputs\":{}}}",
-                prog.target.name(),
-                s.emit_ms,
-                s.host_min,
-                s.host_avg,
-                s.dev_min.map(|v| format!("{v:.3}")).unwrap_or("null".into()),
-                s.dev_avg.map(|v| format!("{v:.3}")).unwrap_or("null".into()),
-                s.parity,
-                s.outs
-            );
-        } else {
-            println!("prof — {name}  [{} backend]", prog.target.name());
-            println!("  emit      {emit:>8.3} ms", emit = s.emit_ms);
-            println!(
-                "  dispatch  {min:>8.3} ms min   {avg:.3} avg   ({runs} runs)",
-                min = s.host_min,
-                avg = s.host_avg,
-                runs = runs
-            );
-            match (s.dev_min, s.dev_avg) {
-                (Some(mn), Some(av)) => {
-                    println!("  device    {mn:>8.3} ms min   {av:.3} avg   (GPU timestamps)")
+        // every tensor program in the file gets its own row — a file
+        // that carries `fn` + `gpu fn` for the same math prints the
+        // same-source comparison across ane, gpu and the cpu evaluator.
+        for (name, prog) in checked.ane.iter() {
+            let pdir = dir.join(name);
+            std::fs::create_dir_all(&pdir).ok();
+            let s = match prog.target {
+                coyote::ast::Target::Ane => prof_ane(&src, prog, &pdir, runs),
+                _ => prof_ext(&src, prog, &pdir, runs, dump),
+            }?;
+            if json {
+                println!(
+                    "{{\"file\":{file:?},\"program\":{name:?},\"backend\":{:?},\"emit_ms\":{:.3},\"host_min_ms\":{:.3},\"host_avg_ms\":{:.3},\"device_min_ms\":{},\"device_avg_ms\":{},\"cpu_min_ms\":{:.3},\"cpu_avg_ms\":{:.3},\"parity\":{:.6},\"outputs\":{}}}",
+                    prog.target.name(),
+                    s.emit_ms,
+                    s.host_min,
+                    s.host_avg,
+                    s.dev_min.map(|v| format!("{v:.3}")).unwrap_or("null".into()),
+                    s.dev_avg.map(|v| format!("{v:.3}")).unwrap_or("null".into()),
+                    s.cpu_min,
+                    s.cpu_avg,
+                    s.parity,
+                    s.outs
+                );
+            } else {
+                println!("prof — {name}  [{} backend]", prog.target.name());
+                println!("  emit      {emit:>8.3} ms", emit = s.emit_ms);
+                println!(
+                    "  dispatch  {min:>8.3} ms min   {avg:.3} avg   ({runs} runs)",
+                    min = s.host_min,
+                    avg = s.host_avg,
+                    runs = runs
+                );
+                match (s.dev_min, s.dev_avg) {
+                    (Some(mn), Some(av)) => {
+                        println!("  device    {mn:>8.3} ms min   {av:.3} avg   (GPU timestamps)")
+                    }
+                    _ => println!("  device    n/a — backend exposes no kernel counters"),
                 }
-                _ => println!("  device    n/a — backend exposes no kernel counters"),
+                for (kn, kms) in &s.kernels {
+                    println!("    {kn:<32} {kms:>8.3} ms");
+                }
+                println!(
+                    "  cpu eval  {min:>8.3} ms min   {avg:.3} avg   (same program, reference evaluator)",
+                    min = s.cpu_min,
+                    avg = s.cpu_avg
+                );
+                println!("  parity    {:.6}   outputs {}", s.parity, s.outs);
             }
-            for (kn, kms) in &s.kernels {
-                println!("    {kn:<32} {kms:>8.3} ms");
-            }
-            println!("  parity    {:.6}   outputs {}", s.parity, s.outs);
         }
         Ok(())
     })();

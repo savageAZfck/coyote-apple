@@ -44,6 +44,7 @@ mod package;
 mod prof;
 mod repl;
 mod run;
+mod shardize;
 mod spec;
 mod stfile;
 mod substrate;
@@ -126,6 +127,7 @@ fn main() {
         "repl" => repl::run(&args[2..]),
         "watch" => watch::run(&args[2..]),
         "emit" => emit::run(&args[2..]),
+        "shardize" => shardize::run(&args[2..]),
         "lsp" => lsp::run().map_err(|_| 1i32),
         _ => coyote::cli::run(&args),
     };

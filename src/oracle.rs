@@ -92,9 +92,67 @@ fn diffs(text: &str) -> (f64, f64, &'static str) {
     (pred, w, label)
 }
 
+/// `diffprobe` sibling binary — the resident-pipeline differential.
+/// Lives next to this exe in cargo builds.
+fn probe_bin() -> Result<PathBuf, String> {
+    Ok(self_bin()?
+        .parent()
+        .ok_or("oracle: no exe dir")?
+        .join("diffprobe"))
+}
+
+/// first index of a `top5 [(I, v), ...]` line — the argmax token.
+fn top1(line: &str) -> Option<u32> {
+    line.split("[(")
+        .nth(1)?
+        .split(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// worst `max|d|=` per stat category diffprobe prints —
+/// (hidden, kv-state, logits) — plus whether the argmax agreed at
+/// every step. Absolute error scales with tensor magnitude: logits
+/// stay ~17, residual hidden ~400 at depth, KV ~30 — the gate reads
+/// them separately.
+fn probe_diffs(text: &str) -> (f64, f64, f64, bool) {
+    let (mut hid, mut kv, mut lg) = (0f64, 0f64, 0f64);
+    let mut agree = true;
+    let mut cpu_top: Option<u32> = None;
+    for l in text.lines() {
+        if l.contains("cpu top5") {
+            cpu_top = top1(l);
+        } else if l.contains("ane top5") {
+            if cpu_top.is_some() && top1(l) != cpu_top {
+                agree = false;
+            }
+            cpu_top = None;
+        }
+        let Some(v) = l
+            .split("max|d|=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse::<f64>().ok())
+        else {
+            continue;
+        };
+        if l.contains("hidden") {
+            hid = hid.max(v);
+        } else if l.contains("logits") {
+            lg = lg.max(v);
+        } else if l.contains("kv_") {
+            kv = kv.max(v);
+        }
+    }
+    (hid, kv, lg, agree)
+}
+
 pub fn run(args: &[String]) -> Result<(), i32> {
     let Some(file) = args.iter().find(|a| !a.starts_with('-')) else {
         eprintln!("usage: coyote-apple oracle <file.cy> [--steps N] [--tol X] [--json]");
+        eprintln!("       coyote-apple oracle <file.cy> --resident <shard_dir> [--steps N] [--tol X] [--json]");
         return Err(2);
     };
     let json = args.iter().any(|a| a == "--json");
@@ -107,17 +165,73 @@ pub fn run(args: &[String]) -> Result<(), i32> {
         .find(|w| w[0] == "--steps")
         .and_then(|w| w[1].parse().ok())
         .unwrap_or(2);
+    let resident = args
+        .windows(2)
+        .find(|w| w[0] == "--resident")
+        .map(|w| PathBuf::from(&w[1]));
+    // logits tol: resident mode defaults to 0.75 — fp16-vs-f32 drift
+    // across a 28-layer stack runs ~0.2-0.5 and keeps growing with
+    // steps; the hard gate is argmax agreement anyway. Per-op 0.05.
     let tol: f64 = args
         .windows(2)
         .find(|w| w[0] == "--tol")
         .and_then(|w| w[1].parse().ok())
-        .unwrap_or(0.05);
+        .unwrap_or(if resident.is_some() { 0.75 } else { 0.05 });
     let tmp = std::env::temp_dir().join(format!("cyoracle-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let dir_ane = tmp.join("ane");
     let dir_cpu = tmp.join("cpu");
 
     let r = (|| -> Result<(), String> {
+        if let Some(shard) = &resident {
+            // resident-pipeline parity: CPU evaluator vs the ANE
+            // resident decode, tensor-level. Three categories gate on
+            // different scales — logits drive argmax (strict, --tol),
+            // hidden/state ride residual magnitudes ~30× logits at
+            // depth (fp16 accumulation, so tol·32).
+            let probe = probe_bin()?;
+            let out = Command::new(&probe)
+                .arg(file)
+                .arg(shard)
+                .arg(steps.to_string())
+                .output()
+                .map_err(|e| format!("spawn diffprobe: {e}"))?;
+            let text = String::from_utf8_lossy(&out.stdout).to_string()
+                + &String::from_utf8_lossy(&out.stderr);
+            if !out.status.success() {
+                return Err(format!("diffprobe exited {:?}:\n{text}", out.status.code()));
+            }
+            let (hid, kv, lg, agree) = probe_diffs(&text);
+            let pass = agree && lg <= tol && hid <= tol * 32.0 && kv <= tol * 32.0;
+            if json {
+                println!(
+                    "{{\"file\":{file:?},\"mode\":\"resident-parity\",\"shards\":{:?},\"steps\":{steps},\"argmax_agree\":{agree},\"logits_diff\":{lg:.6},\"hidden_diff\":{hid:.6},\"state_diff\":{kv:.6},\"tol\":{tol},\"verdict\":\"{}\"}}",
+                    shard.display().to_string(),
+                    if pass { "pass" } else { "fail" }
+                );
+            } else {
+                println!("oracle — resident pipeline parity ({file}, {steps} steps)");
+                println!(
+                    "  argmax {}   logits {lg:.6} (tol {tol})   hidden {hid:.6}   state {kv:.6} (tol {})",
+                    if agree { "agrees" } else { "DIVERGES" },
+                    tol * 32.0
+                );
+                println!(
+                    "{}",
+                    if pass {
+                        "✓ pass — resident silicon agrees with spec"
+                    } else {
+                        "✗ fail — resident divergence exceeds tolerance"
+                    }
+                );
+            }
+            if !pass {
+                return Err(format!(
+                    "resident parity: argmax_agree={agree} logits {lg:.6} hidden {hid:.6} state {kv:.6}"
+                ));
+            }
+            return Ok(());
+        }
         let organism = {
             let (_s, ast) = coyote::parser::parse_file(std::path::Path::new(file))
                 .map_err(|d| d.to_string())?;

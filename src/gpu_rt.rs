@@ -18,9 +18,16 @@ use std::ffi::c_void;
 pub struct GpuRuntime {
     _dev: metal::Device,
     queue: metal::CommandQueue,
-    /// (pipeline, dispatch size) per kernel — update kernels first,
-    /// the main out kernel last, matching eval's stmt→ret order.
-    pipes: Vec<(metal::ComputePipelineState, crate::gpu_emit::Dispatch, String)>,
+    /// (pipeline, dispatch, name, buffer binds) per kernel — update
+    /// kernels first, the main out kernel last, matching eval's
+    /// stmt→ret order. Each kernel declares only the buffers it
+    /// references; `uses` maps signature slots → `bufs` indices.
+    pipes: Vec<(
+        metal::ComputePipelineState,
+        crate::gpu_emit::Dispatch,
+        String,
+        Vec<u32>,
+    )>,
     out_n: usize,
     /// buffer objects in arg order — index 0 is out.
     bufs: Vec<metal::Buffer>,
@@ -73,14 +80,19 @@ impl GpuRuntime {
                 )
             })?;
         let mut pipes = Vec::new();
-        for (kname, disp) in &out.kernels {
+        for (k_i, (kname, disp)) in out.kernels.iter().enumerate() {
             let f = lib
                 .get_function(kname, None)
                 .map_err(|e| format!("msl kernel ({name}:{kname}): {e:?}"))?;
             let pipe = dev
                 .new_compute_pipeline_state_with_function(&f)
                 .map_err(|e| format!("msl pipeline ({name}:{kname}): {e:?}"))?;
-            pipes.push((pipe, *disp, kname.clone()));
+            let uses = out
+                .kernel_uses
+                .get(k_i)
+                .cloned()
+                .unwrap_or_else(|| (0..out.args.len() as u32 + 1).collect());
+            pipes.push((pipe, *disp, kname.clone(), uses));
         }
         let queue = dev.new_command_queue();
 
@@ -255,12 +267,12 @@ impl GpuRuntime {
             // kernel; the breakdown is the point, not the total.
             self.last_kernels.clear();
             self.last_ms = 0.0;
-            for (pipe, disp, name) in &self.pipes {
+            for (pipe, disp, name, uses) in &self.pipes {
                 let cb = self.queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(pipe);
-                for (i, b) in self.bufs.iter().enumerate() {
-                    enc.set_buffer(i as u64, Some(b), 0);
+                for (li, &gi) in uses.iter().enumerate() {
+                    enc.set_buffer(li as u64, Some(&self.bufs[gi as usize]), 0);
                 }
                 dispatch(enc, pipe, disp);
                 enc.end_encoding();
@@ -274,11 +286,11 @@ impl GpuRuntime {
             let cb = self.queue.new_command_buffer();
             // one encoder per dispatch — encoders serialize, so update
             // kernels fully complete before the out kernel reads params.
-            for (pipe, disp, _) in &self.pipes {
+            for (pipe, disp, _, uses) in &self.pipes {
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(pipe);
-                for (i, b) in self.bufs.iter().enumerate() {
-                    enc.set_buffer(i as u64, Some(b), 0);
+                for (li, &gi) in uses.iter().enumerate() {
+                    enc.set_buffer(li as u64, Some(&self.bufs[gi as usize]), 0);
                 }
                 dispatch(enc, pipe, disp);
                 enc.end_encoding();

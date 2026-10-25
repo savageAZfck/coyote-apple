@@ -53,6 +53,12 @@ pub struct GpuOut {
     /// always LAST (eval runs stmts incl. updates before ret); each
     /// entry is (msl function name, dispatch shape).
     pub kernels: Vec<(String, Dispatch)>,
+    /// per-kernel buffer binding — global buffer indices (0 = out,
+    /// then `args` order) in the order that kernel's signature
+    /// declares them. Each kernel only declares the buffers its
+    /// body references, so programs with more than 31 total buffers
+    /// fit inside Metal's per-kernel buffer limit.
+    pub kernel_uses: Vec<Vec<u32>>,
 }
 
 /// how a kernel maps threads: flat elementwise (`Linear`) or a
@@ -2083,9 +2089,12 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
     // within the call.
     ge.emit_q.extend(ge.post_q.drain(..));
 
-    // signature: out + declared args + scratch buffers, in order.
-    let mut sig = vec!["device float* _out [[buffer(0)]]".to_string()];
-    let mut bi = 1usize;
+    // signature entries WITHOUT buffer indices: each kernel declares
+    // only the buffers its body references (local indices), so total
+    // buffer count is unbounded — Metal's 31-slot limit applies per
+    // kernel, and real layers have hundreds of scratch intermediates.
+    let mut entries: Vec<(String, String)> =
+        vec![("_out".into(), "device float* _out".into())];
     for (arg, _port, writable) in &base_args {
         let elem_ty = if ge.half_args.contains(arg) {
             "half"
@@ -2097,34 +2106,65 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         } else {
             format!("device const {elem_ty}*")
         };
-        sig.push(format!("{qual} {arg} [[buffer({bi})]]"));
-        bi += 1;
+        entries.push((arg.clone(), format!("{qual} {arg}")));
     }
     for (buf, n) in &ge.scratch_args {
-        sig.push(format!("device float* {buf} [[buffer({bi})]]"));
+        entries.push((buf.clone(), format!("device float* {buf}")));
         args.push(Arg::Scratch(buf.clone(), *n));
-        bi += 1;
     }
 
-    // format every queued kernel; update kernels re-declare their
-    // param arg writable.
+    // identifiers referenced by a kernel body — buffer usage is the
+    // intersection with the entry names (tokenized, so `b_k` never
+    // matches `b_k0lo`).
+    fn body_idents(body: &[String]) -> std::collections::HashSet<String> {
+        let mut set = std::collections::HashSet::new();
+        for line in body {
+            let mut cur = String::new();
+            for ch in line.chars() {
+                if ch.is_alphanumeric() || ch == '_' {
+                    cur.push(ch);
+                } else if !cur.is_empty() {
+                    set.insert(std::mem::take(&mut cur));
+                }
+            }
+            if !cur.is_empty() {
+                set.insert(std::mem::take(&mut cur));
+            }
+        }
+        set
+    }
+
+    // format every queued kernel with its own minimal signature;
+    // update kernels re-declare their param arg writable.
     let mut kernel_srcs = Vec::new();
     let mut kernels = Vec::new();
+    let mut kernel_uses = Vec::new();
     for ek in &ge.emit_q {
         let kname = format!("coyote_{name}_{}", ek.name);
-        let ksig: Vec<String> = sig
+        let idents = body_idents(&ek.body);
+        let uses: Vec<u32> = entries
             .iter()
-            .map(|s| match &ek.writable {
-                Some(param) => s
-                    .replace(
-                        &format!("device const float* b_{param}"),
-                        &format!("device float* b_{param}"),
-                    )
-                    .replace(
-                        &format!("device const half* b_{param}"),
-                        &format!("device half* b_{param}"),
-                    ),
-                None => s.clone(),
+            .enumerate()
+            .filter(|(_, (n, _))| idents.contains(n))
+            .map(|(i, _)| i as u32)
+            .collect();
+        let ksig: Vec<String> = uses
+            .iter()
+            .enumerate()
+            .map(|(li, &gi)| {
+                let s = format!("{} [[buffer({li})]]", entries[gi as usize].1);
+                match &ek.writable {
+                    Some(param) => s
+                        .replace(
+                            &format!("device const float* b_{param}"),
+                            &format!("device float* b_{param}"),
+                        )
+                        .replace(
+                            &format!("device const half* b_{param}"),
+                            &format!("device half* b_{param}"),
+                        ),
+                    None => s,
+                }
             })
             .collect();
         let thread_decl = match ek.dispatch {
@@ -2150,6 +2190,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
                 .join("\n"),
         ));
         kernels.push((kname, ek.dispatch));
+        kernel_uses.push(uses);
     }
 
     let msl = format!(
@@ -2187,5 +2228,6 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         args,
         output: (oname.clone(), oty.clone()),
         kernels,
+        kernel_uses,
     })
 }

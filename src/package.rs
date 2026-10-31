@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8] = b"CYPK1\n";
 
-struct Member {
-    name: String,
-    sha: String,
-    offset: u64,
-    len: u64,
+pub struct Member {
+    pub name: String,
+    pub sha: String,
+    pub offset: u64,
+    pub len: u64,
 }
 
 fn write_pack(out: &Path, name: &str, files: &[(String, Vec<u8>)]) -> Result<(), String> {
@@ -68,7 +68,7 @@ fn write_pack(out: &Path, name: &str, files: &[(String, Vec<u8>)]) -> Result<(),
     Ok(())
 }
 
-fn read_pack(path: &Path) -> Result<(String, Vec<Member>, Vec<u8>), String> {
+pub fn read_pack(path: &Path) -> Result<(String, Vec<Member>, Vec<u8>), String> {
     let raw = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !raw.starts_with(MAGIC) {
         return Err(format!("{}: not a .cypack (bad magic)", path.display()));
@@ -137,19 +137,30 @@ pub fn run(args: &[String]) -> Result<(), i32> {
         .collect();
         coyote::cli::run(&argv).map_err(|c| format!("build failed (exit {c})"))?;
 
-        let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&build_dir)
-            .map_err(|e| format!("{}: {e}", build_dir.display()))?
-            .filter_map(|e| {
-                let p = e.ok()?.path();
-                p.is_file().then(|| {
-                    Some((
-                        p.file_name()?.to_str()?.to_string(),
-                        std::fs::read(&p).ok()?,
-                    ))
-                })
-            })
-            .flatten()
-            .collect();
+        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+        fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(&p, base, out);
+                    } else if let Ok(rel) = p.strip_prefix(base) {
+                        if let Some(name) = rel.to_str() {
+                            if let Ok(bytes) = std::fs::read(&p) {
+                                out.push((name.to_string(), bytes));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk(&build_dir, &build_dir, &mut files);
+        // ship the program's source too — `import "name"` resolves
+        // `name/mod.cy`, so the pack carries everything needed to
+        // rebuild or re-namespace it downstream.
+        let (combined, _prog) =
+            coyote::parser::parse_file(&path).map_err(|d| d.to_string())?;
+        files.push(("mod.cy".to_string(), combined.into_bytes()));
         files.sort_by(|a, b| a.0.cmp(&b.0));
         if files.is_empty() {
             return Err("build dir empty — nothing to package".into());

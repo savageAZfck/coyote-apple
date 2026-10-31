@@ -1,14 +1,16 @@
 # coyote-apple
 
-**One language, three silicons.** The same `.cy` source compiles to CPU,
-Metal/GPU, and the Apple Neural Engine — no CoreMLTools, no Apple code
-generation — and the compiler can prove all three compute the same math.
+**One language, four substrates.** The same `.cy` source compiles to CPU,
+Metal/GPU, the Apple Neural Engine — and **ciphertext** (`enc fn` —
+homomorphic eval against plaintext weights) — no CoreMLTools, no Apple
+code generation — and the compiler can prove all of them compute the
+same math.
 
 This is the private Apple edition of
 [Coyote](https://github.com/savageAZfck/coyote): the public language stays
 MIT and clean-room, this distribution carries the first-party engines
-(`gpu fn` → Metal, `fn` → MIL/Espresso) and the org surface (oracle,
-audit, witness chains, package signing).
+(`gpu fn` → Metal, `fn` → MIL/Espresso, `enc fn` → LWE ciphertext) and
+the org surface (oracle, audit, witness chains, package signing).
 
 ## the headline: resident ANE decode
 
@@ -57,9 +59,56 @@ diffprobe <file.cy> <shard_dir> [steps]        tensor-level CPU-vs-ANE diff
 anepush <shard_dir> <tok,ids> [n]              resident decode smoke
 ```
 
+the verification layer — the refereed-delegation stack as toolchain
+verbs:
+
+```
+coyote-apple referee <f.cy> [--replay]         RDoC bisection over the
+                                               committed witness chain
+coyote-apple certify <f.cy> [-o cert.json]     proof-carrying certificate:
+                                               compiles/parity/replay
+coyote-apple certify --check cert.json         re-verify a certificate
+coyote-apple conform <f.cy> --spec s.cyproto   session conformance over
+                                               the witness chain
+coyote-apple caps <f.cy> [--deny/--allow/--pure]  capability policy gate
+```
+
+the product surface — the parts that make it a language people use:
+
+```
+coyote-apple fmt <f.cy> [--check]              canonical formatter
+coyote-apple pkg install|list|remove|search    the package registry
+                                               (~/.coyote/pkg on CYO_PATH)
+coyote-apple lsp                               full language server:
+                                               diagnostics, completion,
+                                               hover, go-to-def, semtoks
+```
+
 plus the full distribution surface — `new doc test spec watch gold
 weights genmask oracle audit diff bench prof package verify unpack emit`
-— documented in [APPLE.md](APPLE.md).
+— documented in [APPLE.md](APPLE.md). Language guide: [LANGUAGE.md](LANGUAGE.md).
+
+## language
+
+```cy
+import "math.cy" as m            // namespaced modules — m::name()
+
+fn act<D>(x: D[64]) -> D[64] {   // dtype generics — D binds per callsite
+    x @ w * 0.125
+}
+
+enum R { Ok(i64), Err(str) }
+host fn chain() -> R {
+    let a = fallible()?;          // ? — Ok binds, Err propagates
+    return R::Ok(a);
+}
+```
+
+Four strata — `fn` → ANE, `gpu fn` → Metal, `enc fn` → ciphertext,
+`host fn` → CPU — with `reflex`, `det`/`stoch`, `param`/`state`/`io`,
+`cap`/`invariant`/`provenance` constitutions, and `witness` committed
+journals. `?`, `import as`, and dtype generics are the semantics that
+make organs composable.
 
 ## how a shard directory works
 

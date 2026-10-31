@@ -29,9 +29,14 @@
 mod audit;
 mod backend_metal;
 mod bench;
+mod caps;
+mod certify;
+mod conform;
 mod diff;
 mod doc;
 mod emit;
+mod enc_ckks;
+mod fmt;
 mod genmask;
 mod gold;
 mod gpu_emit;
@@ -42,6 +47,8 @@ mod new;
 mod oracle;
 mod package;
 mod prof;
+mod referee;
+mod registry;
 mod repl;
 mod run;
 mod shardize;
@@ -70,6 +77,9 @@ fn usage() {
     eprintln!("  doc      <file.cy> [-o doc.md]   generated API markdown");
     eprintln!("  gold     record|check <file.cy>  golden-output regression");
     eprintln!("  watch    <file.cy> [--run]       rebuild on save");
+    eprintln!("  referee  <file.cy> [--lie seq:N] [--json]   refereed verification");
+    eprintln!("  certify  <file.cy> [-o cert.json]         proof-carrying certificate");
+    eprintln!("  conform  <file.cy> <spec.cyproto>         session conformance");
     eprintln!("  emit     <file.cy> --swift       generate the Swift bridge class");
     eprintln!("  + all coyote verbs (check/build/run/repl) pass through unchanged");
 }
@@ -80,6 +90,12 @@ fn main() {
     coyote::backend::register_backend(
         coyote::ast::Target::Gpu,
         std::sync::Arc::new(backend_metal::MetalBackend),
+    );
+    // the `enc` stratum's engine — encrypted circuits, private to
+    // this distribution the same way Metal is.
+    coyote::backend::register_backend(
+        coyote::ast::Target::Enc,
+        std::sync::Arc::new(enc_ckks::EncBackend),
     );
     // every Vm-building verb binds the mind externs on the Vm it
     // constructs — run.rs / bench.rs / test.rs / oracle.rs / prof.rs
@@ -94,6 +110,16 @@ fn main() {
                 let sep = if cur.is_empty() { "" } else { ":" };
                 std::env::set_var("CYO_PATH", format!("{cur}{sep}{}", lib.display()));
             }
+        }
+    }
+    // the package registry rides on CYO_PATH too — `import "name"`
+    // resolves anything `pkg install` dropped in ~/.coyote/pkg/.
+    {
+        let reg = registry::registry_dir();
+        if reg.is_dir() {
+            let cur = std::env::var("CYO_PATH").unwrap_or_default();
+            let sep = if cur.is_empty() { "" } else { ":" };
+            std::env::set_var("CYO_PATH", format!("{cur}{sep}{}", reg.display()));
         }
     }
     let args: Vec<String> = std::env::args().collect();
@@ -127,6 +153,12 @@ fn main() {
         "repl" => repl::run(&args[2..]),
         "watch" => watch::run(&args[2..]),
         "emit" => emit::run(&args[2..]),
+        "referee" => referee::run(&args[2..]),
+        "certify" => certify::run(&args[2..]),
+        "conform" => conform::run(&args[2..]),
+        "caps" => caps::run(&args[2..]),
+        "fmt" => fmt::run(&args[2..]),
+        "pkg" => registry::run(&args[2..]),
         "shardize" => shardize::run(&args[2..]),
         "lsp" => lsp::run().map_err(|_| 1i32),
         _ => coyote::cli::run(&args),

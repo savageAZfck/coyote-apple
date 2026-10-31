@@ -40,6 +40,23 @@ coyote-apple verify   <pkg.cypack>         integrity check a package
 coyote-apple unpack   <pkg.cypack> -o dir  extract a package
 coyote-apple emit     <file.cy> --swift    typed Swift bridge over libcoyote
 
+# verification layer — refereed delegation as toolchain verbs
+coyote-apple referee  <file.cy> [--replay] RDoC bisection over the committed
+                                           witness chain — catches a lying
+                                           backend in log(n) challenge rounds
+coyote-apple certify  <file.cy> [-o cert]  proof-carrying certificate:
+                                           compiles/parity/replay determinism
+coyote-apple certify  --check <cert>       re-verify a certificate
+coyote-apple conform  <f> --spec s.cyproto session conformance over the chain
+coyote-apple caps     <f> [--deny/--allow/--pure]  capability policy gate
+
+# product surface — language tooling people live in
+coyote-apple fmt      <file.cy> [--check]  canonical formatter (idempotent)
+coyote-apple pkg      install|list|remove|search   package registry —
+                                           ~/.coyote/pkg rides CYO_PATH
+coyote-apple lsp                           full language server: diagnostics,
+                                           completion, hover, def, semtoks
+
 coyote-apple <any coyote verb>             passthrough — check/build (run/repl
                                            are intercepted: the mind externs
                                            bind on every VM this binary builds)

@@ -3,8 +3,11 @@
 Coyote is the language: `.cy` source → typed HIR → MIL → HWX → resident
 VM → wasm. `coyote-apple` is the language *as a distribution* — one
 binary that owns the whole lifecycle: scaffold, write, check, test,
-verify, train, package, audit, ship. Every public verb passes through
-to `coyote::cli` unchanged (no forked logic); the apple verbs add the
+verify, train, package, audit, ship. Shared verbs still pass through
+to `coyote::cli`, but the language itself now carries private grammar
+in the local `~/coyote` fork — `enc fn`, namespaced imports (`import
+"x" as m`), dtype generics (`fn f<D>(x: D[64])`), and `?` propagation —
+that upstream public coyote doesn't have. The apple verbs add the
 surface a language needs to be *used*, not just compiled.
 
 This is a separate repo by design: the public language stays MIT and
@@ -62,12 +65,15 @@ coyote-apple <any coyote verb>             passthrough — check/build (run/repl
                                            bind on every VM this binary builds)
 ```
 
-## the gpu stratum — first-party compute
+## the gpu/enc strata — first-party compute
 
-`gpu fn` is parsed and typechecked by the public language, but its
-*engine* lives only here. The public crate exposes a backend seam —
+`gpu fn` parses through the local grammar and its *engine* lives only
+here. The crate exposes a backend seam —
 `coyote::backend::register_backend(target, impl Backend)` — and this
-distribution registers `MetalBackend` at startup:
+distribution registers `MetalBackend` (and `EncBackend` for `enc fn`)
+at startup. Strata are grammar; engines are this repo's private
+property — `enc`, `?`, `import as`, and dtype generics all live in the
+local `~/coyote` fork, never pushed.
 
 ```
 gpu fn block(x: f16[64]) -> f16[64] {

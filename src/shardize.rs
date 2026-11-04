@@ -45,7 +45,10 @@ fn strict4(dims: &[i64]) -> String {
         2 => format!("[1, 1, {}, {}]", dims[0], dims[1]),
         _ => format!(
             "[{}]",
-            dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")
+            dims.iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     }
 }
@@ -77,9 +80,9 @@ fn unshape(shape: &str) -> Vec<i64> {
 }
 
 struct Op {
-    out_ty: String,     // "tensor<fp16, [1, 64, 1, 1]>" or "bool" etc
+    out_ty: String, // "tensor<fp16, [1, 64, 1, 1]>" or "bool" etc
     out: String,
-    name: String,       // matmul, add, const, ...
+    name: String, // matmul, add, const, ...
     args: Vec<(String, String)>,
     line: String,
 }
@@ -225,7 +228,10 @@ fn shard_mil(
 ) -> Result<(String, Vec<u8>), String> {
     // ---- locate sig / body / ret ----
     let fpos = mil.find("func main<ios").ok_or("emit: no func main")?;
-    let apos = mil[fpos..].find('(').map(|i| fpos + i).ok_or("emit: no args")?;
+    let apos = mil[fpos..]
+        .find('(')
+        .map(|i| fpos + i)
+        .ok_or("emit: no args")?;
     let mut depth = 0i32;
     let mut aend = 0usize;
     for (i, ch) in mil[apos..].char_indices() {
@@ -242,7 +248,10 @@ fn shard_mil(
         }
     }
     let args = &mil[apos + 1..aend];
-    let body_beg = mil[aend..].find('{').map(|i| aend + i).ok_or("emit: no body")?;
+    let body_beg = mil[aend..]
+        .find('{')
+        .map(|i| aend + i)
+        .ok_or("emit: no body")?;
     let ret_pos = mil.rfind("-> (").ok_or("emit: no ret")?;
     let body_raw = &mil[body_beg + 1..ret_pos];
     let close = body_raw.rfind('}').ok_or("emit: no body close")?;
@@ -263,8 +272,10 @@ fn shard_mil(
 
     // ---- role scan: which (T,) args are used as scatter columns ----
     // kv_write_mask / pos → column form; every other 1-D arg → row.
-    let col_args: std::collections::HashSet<String> =
-        ["pos", "kv_write_mask"].iter().map(|s| s.to_string()).collect();
+    let col_args: std::collections::HashSet<String> = ["pos", "kv_write_mask"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
     // operand renames: live inputs take pipeline port names, state
     // ports are read through aliases — `__s_` for the pre-update read,
@@ -326,8 +337,10 @@ fn shard_mil(
     let mut sig_sub: HashMap<String, String> = HashMap::new(); // σ out → ORIG
     let mut poly_dead: HashSet<String> = HashSet::new();
     {
-        let blob_of: HashMap<&str, &[u8]> =
-            blobs.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
+        let blob_of: HashMap<&str, &[u8]> = blobs
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.as_slice()))
+            .collect();
         let mut cval: HashMap<String, f64> = HashMap::new();
         for op in &ops {
             if op.name != "const" {
@@ -361,7 +374,9 @@ fn shard_mil(
             }
         }
         let is_c = |n: &str, want: f64| {
-            cval.get(n).map(|v| (*v - want).abs() < 1e-3).unwrap_or(false)
+            cval.get(n)
+                .map(|v| (*v - want).abs() < 1e-3)
+                .unwrap_or(false)
         };
         for i in 0..ops.len() {
             let op = &ops[i];
@@ -369,10 +384,9 @@ fn shard_mil(
                 continue;
             }
             let min_name = arg_of(op, "x");
-            let Some(min_i) = ops
-                .iter()
-                .position(|o| o.name == "minimum" && o.out == min_name && is_c(&arg_of(o, "y"), 6.0))
-            else {
+            let Some(min_i) = ops.iter().position(|o| {
+                o.name == "minimum" && o.out == min_name && is_c(&arg_of(o, "y"), 6.0)
+            }) else {
                 continue;
             };
             // scan forward for σ = add(mul(max, h), 0.5)
@@ -405,8 +419,10 @@ fn shard_mil(
     }
 
     // ---- rewrite ----
-    let blob_of: HashMap<&str, &[u8]> =
-        blobs.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
+    let blob_of: HashMap<&str, &[u8]> = blobs
+        .iter()
+        .map(|(n, b)| (n.as_str(), b.as_slice()))
+        .collect();
     let mut wb = WeightBin::new();
     let mut sig_out = Vec::new();
     for arg in split_args(args) {
@@ -430,7 +446,7 @@ fn shard_mil(
     }
 
     let mut rms_eps: HashMap<String, String> = HashMap::new(); // literal → const name
-    // pre-collect eps literals so their consts declare up front.
+                                                               // pre-collect eps literals so their consts declare up front.
     for op in &ops {
         if op.name == "rms_norm" {
             let eps = arg_of(op, "eps");
@@ -445,9 +461,8 @@ fn shard_mil(
     out_lines.push("        bool __bf = const()[val = bool(false)];".into());
     out_lines.push("        int32 __axm1 = const()[val = int32(-1)];".into());
     out_lines.push("        fp16 __zro = const()[val = fp16(0x0p+0)];".into());
-    out_lines.push(
-        "        tensor<int32, [1]> __axv = const()[val = tensor<int32, [1]>([-1])];".into(),
-    );
+    out_lines
+        .push("        tensor<int32, [1]> __axv = const()[val = tensor<int32, [1]>([-1])];".into());
     for (lit, name) in &rms_eps {
         let v = lit
             .trim_start_matches("fp16(")
@@ -509,9 +524,7 @@ fn shard_mil(
                         .and_then(|s| s.split('"').next())
                         .unwrap_or("");
                     let uni = blob_of.get(fname).and_then(|b| {
-                        if b.len() >= 2
-                            && b.chunks_exact(2).all(|c| c == &b[0..2])
-                        {
+                        if b.len() >= 2 && b.chunks_exact(2).all(|c| c == &b[0..2]) {
                             Some(u16::from_le_bytes([b[0], b[1]]))
                         } else {
                             None
@@ -574,8 +587,8 @@ fn shard_mil(
                 //   (D,)·(T,D) scores   → row@matᵀ
                 //   (D,)·(N,K) matvec   → row@wᵀ
                 let (fx, fy) = match (xl.len(), yl.len(), tx, ty) {
-                    (1, 1, true, _) => ("__bf", "__bf"), // outer: col@row
-                    (1, 2, true, _) => ("__bf", "__bf"), // s@v: row@mat
+                    (1, 1, true, _) => ("__bf", "__bf"),     // outer: col@row
+                    (1, 2, true, _) => ("__bf", "__bf"),     // s@v: row@mat
                     (1, 2, false, true) => ("__bf", "__bt"), // scores / matvec
                     _ => {
                         if ty {
@@ -677,7 +690,6 @@ fn shard_mil(
             ren.insert(port.clone(), format!("__u_{port}"));
         }
     }
-
 
     // ret: the program's return value only — state updates live in
     // write_state now. The pipeline binds outputs positionally so the
@@ -800,7 +812,11 @@ fn write_head_shards(
         .max_by_key(|(_, (_, _, b))| b.len())
         .map(|(i, _)| i)
         .unwrap();
-    let hidden = mil_out.inputs.first().map(|(_, t, _)| t.dims[0] as usize).unwrap_or(0);
+    let hidden = mil_out
+        .inputs
+        .first()
+        .map(|(_, t, _)| t.dims[0] as usize)
+        .unwrap_or(0);
     let v0 = if hidden > 0 {
         recs[big].2.len() / 2 / hidden
     } else {
@@ -824,8 +840,14 @@ fn write_head_shards(
         let end = (start + SHARD_W).min(vocab);
         let w = end - start;
         let mut text = mil
-            .replace(&format!("tensor<fp16, {old_wshape}>"), &format!("tensor<fp16, [{w}, {hidden}]>"))
-            .replace(&format!("tensor<fp16, {old_oshape}>"), &format!("tensor<fp16, [1, 1, 1, {w}]>"));
+            .replace(
+                &format!("tensor<fp16, {old_wshape}>"),
+                &format!("tensor<fp16, [{w}, {hidden}]>"),
+            )
+            .replace(
+                &format!("tensor<fp16, {old_oshape}>"),
+                &format!("tensor<fp16, [1, 1, 1, {w}]>"),
+            );
 
         let mut wb2 = WeightBin::new();
         for (idx, (old_off, dtype, bytes)) in recs.iter().enumerate() {
@@ -853,7 +875,9 @@ fn write_head_shards(
                 std::fs::copy(&src, sd.join(extra)).map_err(|e| e.to_string())?;
             }
         }
-        entries.push(format!("{{\"vocab_start\":{start},\"compiled_path\":\"{rel}\"}}"));
+        entries.push(format!(
+            "{{\"vocab_start\":{start},\"compiled_path\":\"{rel}\"}}"
+        ));
         eprintln!("  shard {rel} ← head vocab {start}..{end}");
     }
     Ok(entries)
@@ -861,12 +885,7 @@ fn write_head_shards(
 
 /// `model.mil` + weight blobs → `<dir>/<name>.mlmodelc/` with the
 /// bundle files the e5 compiler expects.
-fn write_shard(
-    dir: &Path,
-    name: &str,
-    mil_out: &MilOut,
-    tmpl: &Path,
-) -> Result<PathBuf, String> {
+fn write_shard(dir: &Path, name: &str, mil_out: &MilOut, tmpl: &Path) -> Result<PathBuf, String> {
     let sd = dir.join(format!("{name}.mlmodelc"));
     let wdir = sd.join("weights");
     std::fs::create_dir_all(&wdir).map_err(|e| e.to_string())?;
@@ -920,18 +939,17 @@ pub fn run(args: &[String]) -> Result<(), i32> {
         let path = PathBuf::from(file);
         let (src, ast) = coyote::parser::parse_file(&path).map_err(|d| d.to_string())?;
         let checked = coyote::typeck::check_all(&ast).map_err(|d| d.to_string())?;
-        let by_name: HashMap<&str, &TProgram> = checked
-            .ane
-            .iter()
-            .map(|(n, p)| (n.as_str(), p))
-            .collect();
+        let by_name: HashMap<&str, &TProgram> =
+            checked.ane.iter().map(|(n, p)| (n.as_str(), p)).collect();
 
         let mut layers: Vec<&str> = Vec::new();
         let mut heads: Vec<&str> = Vec::new();
         let mut emb_src: Option<String> = None;
         for d in &ast.decls {
             match d {
-                Decl::Fn(f) if f.v.target == Target::Ane && by_name.contains_key(f.v.name.as_str()) => {
+                Decl::Fn(f)
+                    if f.v.target == Target::Ane && by_name.contains_key(f.v.name.as_str()) =>
+                {
                     if f.v.name == "head" {
                         heads.push(f.v.name.as_str());
                     } else {
@@ -955,67 +973,217 @@ pub fn run(args: &[String]) -> Result<(), i32> {
             return Err("no `head` program — the pipeline needs a logits shard".into());
         }
 
-        std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
-        let stage = out_dir.join(".emit");
-        let mut shard_entries = Vec::new();
-        for (i, name) in layers.iter().enumerate() {
-            let prog = by_name[*name];
-            let edir = stage.join(name);
-            let out = coyote::emit_program(&src, prog, &edir, true)?;
-            let rel = format!("layer_{i:02}.mlmodelc");
-            write_shard(&out_dir, rel.trim_end_matches(".mlmodelc"), &out, &tmpl)?;
-            shard_entries.push(format!(
-                "{{\"name\":\"layer_{i:02}\",\"layer_start\":{i},\"layer_end\":{},\"status\":\"compiled\",\"compiled_path\":\"{rel}\"}}",
-                i + 1
+        // --world N — pipeline ranks: contiguous layer split, each rank
+        // dir carries the bad_apple ShardSpec schema (shard.json) and
+        // its own compiled shards; world.json tops the plan off.
+        let world: usize = args
+            .windows(2)
+            .find(|w| w[0] == "--world")
+            .and_then(|w| w[1].parse().ok())
+            .unwrap_or(1);
+        let hosts: Vec<String> = args
+            .windows(2)
+            .find(|w| w[0] == "--hosts")
+            .map(|w| {
+                w[1].split(',')
+                    .map(|h| h.trim().to_string())
+                    .filter(|h| !h.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if world > layers.len() {
+            return Err(format!("--world {world} exceeds {} layers", layers.len()));
+        }
+        if !hosts.is_empty() && hosts.len() != world {
+            return Err(format!(
+                "--hosts lists {} entries but --world is {world}",
+                hosts.len()
             ));
-            eprintln!("  shard {rel} ← fn {name}");
-        }
-        let vocab = match &emb_src {
-            Some(s) => s
-                .split_once("::")
-                .map(|(_, tn)| tn)
-                .and_then(|tn| {
-                    let f = s.split_once("::").map(|(f, _)| f)?;
-                    let st = coyote::weights::SafeTensors::load(
-                        &path
-                            .parent()
-                            .unwrap_or(Path::new("."))
-                            .join(f)
-                            .to_string_lossy(),
-                    )
-                    .ok()?;
-                    st.shape(tn).map(|d| d[0])
-                })
-                .unwrap_or(151936),
-            None => 151936,
-        } as usize;
-
-        let mut head_entries = Vec::new();
-        for name in heads.iter() {
-            let prog = by_name[*name];
-            let edir = stage.join(name);
-            let out = coyote::emit_program(&src, prog, &edir, true)?;
-            head_entries.extend(write_head_shards(&out_dir, &out, vocab, &tmpl)?);
         }
 
-        let l0 = by_name[layers[0]];
-        let hidden = l0.ret.ty.numel() as usize;
-        let seq = l0
-            .states
-            .first()
-            .map(|(_, _, t)| t.dims[0] as usize)
-            .unwrap_or(64);
-        let rope_dim = l0
-            .ios
-            .iter()
-            .find(|(n, _, _)| n.contains("cos"))
-            .map(|(_, _, t)| t.numel() as usize * 2)
-            .unwrap_or(128);
+        std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+        // per-rank layer slices — contiguous, even split (the same
+        // assignment rule bad_apple's MeshBrainPlan uses before
+        // memory-weighting refines it).
+        let per = layers.len().div_ceil(world);
+        let rank_slices: Vec<(usize, usize, usize)> = (0..world)
+            .map(|r| {
+                let s = r * per;
+                (r, s, (s + per).min(layers.len()))
+            })
+            .collect();
 
-        if only.is_none() {
-            let Some(esrc) = &emb_src else {
-                return Err("no `table emb` — decoder needs embedding.f16".into());
+        let mut world_ranks = Vec::new();
+        for (rank, lstart, lend) in &rank_slices {
+            let rank_dir = if world == 1 {
+                out_dir.clone()
+            } else {
+                out_dir.join(format!("rank{rank}"))
             };
+            let layer_names: Vec<&str> = layers[*lstart..*lend].to_vec();
+            let rank_heads: Vec<&str> = if *rank == world - 1 {
+                heads.clone()
+            } else {
+                Vec::new()
+            };
+            let owns_embed = *rank == 0;
+            emit_rank(
+                &src,
+                &path,
+                &rank_dir,
+                &by_name,
+                &layer_names,
+                &rank_heads,
+                if owns_embed { emb_src.as_deref() } else { None },
+                only.as_deref(),
+                &tmpl,
+                rope_base,
+                vocab_of(&emb_src, &path),
+            )?;
+
+            let host = hosts
+                .get(*rank)
+                .cloned()
+                .unwrap_or_else(|| format!("127.0.0.1:{}", 9700 + rank));
+            let next_host = hosts.get(*rank + 1).cloned().unwrap_or_else(|| {
+                if *rank + 1 < world {
+                    format!("127.0.0.1:{}", 9700 + rank + 1)
+                } else {
+                    String::new()
+                }
+            });
+            let shard_json = serde_json::to_string_pretty(&serde_json::json!({
+                "rank": rank,
+                "world": world,
+                "host": host,
+                "next_host": next_host,
+                "layer_start": lstart,
+                "layer_end": lend,
+                "owns_embed": owns_embed,
+                "owns_head": *rank == world - 1,
+                "tied_embeddings": true,
+                "wire": "badapple-mesh/1",
+            }))
+            .map_err(|e| e.to_string())?;
+            std::fs::write(rank_dir.join("shard.json"), shard_json).map_err(|e| e.to_string())?;
+            world_ranks.push(serde_json::json!({
+                "rank": rank, "host": host, "dir": rank_dir.display().to_string(),
+                "layer_start": lstart, "layer_end": lend,
+            }));
+            eprintln!(
+                "  rank {rank}/{world} — layers {lstart}..{lend} head={} embed={} → {}",
+                *rank == world - 1,
+                owns_embed,
+                rank_dir.display()
+            );
+        }
+        if world > 1 {
+            std::fs::write(
+                out_dir.join("world.json"),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "world": world,
+                    "ranks": world_ranks,
+                    "wire": "badapple-mesh/1",
+                    "auth": "hmac-sha256 mb-c/mb-s",
+                    "enc": "aes-256-gcm sha256-keyed",
+                }))
+                .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        eprintln!(
+            "✓ {} layer shards across {world} rank(s) + head → {}",
+            layers.len(),
+            out_dir.display()
+        );
+        return Ok(());
+    })();
+    r.map_err(|e| {
+        eprintln!("✗ {e}");
+        1
+    })
+}
+
+/// vocab from the `emb` table source — same derivation the single-rank
+/// path used.
+fn vocab_of(emb_src: &Option<String>, path: &Path) -> usize {
+    (match emb_src {
+        Some(s) => s
+            .split_once("::")
+            .map(|(_, tn)| tn)
+            .and_then(|tn| {
+                let f = s.split_once("::").map(|(f, _)| f)?;
+                let st = coyote::weights::SafeTensors::load(
+                    &path
+                        .parent()
+                        .unwrap_or(Path::new("."))
+                        .join(f)
+                        .to_string_lossy(),
+                )
+                .ok()?;
+                st.shape(tn).map(|d| d[0])
+            })
+            .unwrap_or(151936),
+        None => 151936,
+    }) as usize
+}
+
+/// Emit one rank's shard directory — the loop the single-rank path ran,
+/// parameterized over the layer slice + ownership flags.
+#[allow(clippy::too_many_arguments)]
+fn emit_rank(
+    src: &str,
+    path: &Path,
+    out_dir: &Path,
+    by_name: &HashMap<&str, &TProgram>,
+    layers: &[&str],
+    heads: &[&str],
+    emb_src: Option<&str>,
+    only: Option<&str>,
+    tmpl: &Path,
+    rope_base: f64,
+    vocab: usize,
+) -> Result<(), String> {
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let stage = out_dir.join(".emit");
+    let mut shard_entries = Vec::new();
+    for (i, name) in layers.iter().enumerate() {
+        let prog = by_name[*name];
+        let edir = stage.join(name);
+        let out = coyote::emit_program(src, prog, &edir, true)?;
+        let rel = format!("layer_{i:02}.mlmodelc");
+        write_shard(out_dir, rel.trim_end_matches(".mlmodelc"), &out, tmpl)?;
+        shard_entries.push(format!(
+            "{{\"name\":\"layer_{i:02}\",\"layer_start\":{i},\"layer_end\":{},\"status\":\"compiled\",\"compiled_path\":\"{rel}\"}}",
+            i + 1
+        ));
+        eprintln!("  shard {rel} ← fn {name}");
+    }
+
+    let mut head_entries = Vec::new();
+    for name in heads.iter() {
+        let prog = by_name[*name];
+        let edir = stage.join(name);
+        let out = coyote::emit_program(src, prog, &edir, true)?;
+        head_entries.extend(write_head_shards(out_dir, &out, vocab, tmpl)?);
+    }
+
+    let l0 = by_name[layers[0]];
+    let hidden = l0.ret.ty.numel() as usize;
+    let seq = l0
+        .states
+        .first()
+        .map(|(_, _, t)| t.dims[0] as usize)
+        .unwrap_or(64);
+    let rope_dim = l0
+        .ios
+        .iter()
+        .find(|(n, _, _)| n.contains("cos"))
+        .map(|(_, _, t)| t.numel() as usize * 2)
+        .unwrap_or(128);
+
+    if only.is_none() {
+        if let Some(esrc) = emb_src {
             let (file_part, tensor_name) = esrc
                 .split_once("::")
                 .ok_or("table emb src needs file::tensor")?;
@@ -1035,25 +1203,15 @@ pub fn run(args: &[String]) -> Result<(), i32> {
             std::fs::write(out_dir.join("embedding.f16"), &bytes).map_err(|e| e.to_string())?;
             eprintln!("  embedding.f16 — {vocab}×{hidden} fp16");
         }
+    }
 
-        let manifest = format!(
-            "{{\n \"model\": {{\"architecture\":\"coyote\",\"hidden_size\":{hidden},\"vocab_size\":{vocab},\"seq_len\":{seq},\"rope_dim\":{rope_dim},\"rope_freq_base\":{rope_base},\"stateful\":true,\"native\":true}},\n \"shards\": [{}],\n \"shared\": {{\"embedding\": {{\"path\":\"embedding.f16\"}}, \"lm_head_shards\": [{}]}}\n}}\n",
-            shard_entries.join(","),
-            head_entries.join(",")
-        );
-        std::fs::write(out_dir.join("conversion_manifest.json"), &manifest)
-            .map_err(|e| e.to_string())?;
-        let _ = std::fs::remove_dir_all(&stage);
-        eprintln!(
-            "✓ {} layer shards + {} head shard(s) → {}",
-            layers.len(),
-            heads.len(),
-            out_dir.display()
-        );
-        Ok(())
-    })();
-    r.map_err(|e| {
-        eprintln!("✗ {e}");
-        1
-    })
+    let manifest = format!(
+        "{{\n \"model\": {{\"architecture\":\"coyote\",\"hidden_size\":{hidden},\"vocab_size\":{vocab},\"seq_len\":{seq},\"rope_dim\":{rope_dim},\"rope_freq_base\":{rope_base},\"stateful\":true,\"native\":true}},\n \"shards\": [{}],\n \"shared\": {{\"embedding\": {{\"path\":\"embedding.f16\"}}, \"lm_head_shards\": [{}]}}\n}}\n",
+        shard_entries.join(","),
+        head_entries.join(",")
+    );
+    std::fs::write(out_dir.join("conversion_manifest.json"), &manifest)
+        .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_dir_all(&stage);
+    Ok(())
 }

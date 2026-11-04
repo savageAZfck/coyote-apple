@@ -107,11 +107,9 @@ pub enum Arg {
 impl Arg {
     pub fn port(&self) -> &str {
         match self {
-            Arg::In(p)
-            | Arg::Param(p)
-            | Arg::State(p)
-            | Arg::Scratch(p, _)
-            | Arg::ParamHalf(p) => p,
+            Arg::In(p) | Arg::Param(p) | Arg::State(p) | Arg::Scratch(p, _) | Arg::ParamHalf(p) => {
+                p
+            }
         }
     }
 }
@@ -405,24 +403,24 @@ impl Ge {
                 Some(r) => r,
                 None => {
                     let mut coords = Vec::new();
-                for (i, &d) in dims.iter().enumerate() {
-                    let cname = format!("s_c{i}");
-                    let stride: i64 = dims[i + 1..].iter().product();
-                    if dims.len() == 1 {
-                        self.lines.push(format!("uint {cname} = gid;"));
-                    } else if stride == 1 {
-                        self.lines.push(format!("uint {cname} = gid % {d};"));
-                    } else {
-                        self.lines
-                            .push(format!("uint {cname} = (gid / {stride}) % {d};"));
+                    for (i, &d) in dims.iter().enumerate() {
+                        let cname = format!("s_c{i}");
+                        let stride: i64 = dims[i + 1..].iter().product();
+                        if dims.len() == 1 {
+                            self.lines.push(format!("uint {cname} = gid;"));
+                        } else if stride == 1 {
+                            self.lines.push(format!("uint {cname} = gid % {d};"));
+                        } else {
+                            self.lines
+                                .push(format!("uint {cname} = (gid / {stride}) % {d};"));
+                        }
+                        coords.push(cname);
                     }
-                    coords.push(cname);
+                    let v = self.gen_raw(e, &coords)?;
+                    self.lines.push(format!("{buf}[gid] = ({v});"));
+                    (std::mem::take(&mut self.lines), Dispatch::Linear(numel))
                 }
-                let v = self.gen_raw(e, &coords)?;
-                self.lines.push(format!("{buf}[gid] = ({v});"));
-                (std::mem::take(&mut self.lines), Dispatch::Linear(numel))
-                }
-            }
+            },
         };
         self.lines = saved;
         self.scratch.push(EK {
@@ -625,10 +623,7 @@ impl Ge {
             if let TExpr::Field(bx, f) = &e.e {
                 if let TExpr::Ident(s) = &bx.e {
                     let key = format!("{s}.{f}");
-                    return self
-                        .bufs
-                        .get(&key)
-                        .map(|(a, t, _)| (a.clone(), t.clone()));
+                    return self.bufs.get(&key).map(|(a, t, _)| (a.clone(), t.clone()));
                 }
             }
             None
@@ -655,8 +650,7 @@ impl Ge {
             }
             // non-square param .T keeps declared-order [K,N] storage:
             // out[j] = Σ_k x[k]·w[k*N+j] — strided output reads.
-            TExpr::Transpose(i)
-                if matches!(&i.e, TExpr::Ident(s) if matches!(self.bufs.get(s), Some((_, t, Kind::ParamT)) if t.dims[0] != t.dims[1])) =>
+            TExpr::Transpose(i) if matches!(&i.e, TExpr::Ident(s) if matches!(self.bufs.get(s), Some((_, t, Kind::ParamT)) if t.dims[0] != t.dims[1])) =>
             {
                 let (buf, ty, _) = self.resolve_buf(i)?;
                 Shape::Cols {
@@ -792,29 +786,37 @@ impl Ge {
                 self.lines.push("threadgroup float ts;".into());
                 // max is order-free — tree-reduce it.
                 self.lines.push("float part = -3.402823e38f;".into());
-                self.lines.push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
+                self.lines
+                    .push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
                 let v = self.gen(x, &cs)?;
                 self.lines.push(format!("part = fmax(part, {v});"));
                 self.lines.push("}".into());
                 self.lines.push("tr[lid] = part;".into());
-                self.lines.push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
-                self.lines.push(format!("for (uint s = {}; s > 0; s >>= 1) {{", T / 2));
-                self.lines.push("if (lid < s) tr[lid] = fmax(tr[lid], tr[lid + s]);".into());
-                self.lines.push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+                self.lines
+                    .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+                self.lines
+                    .push(format!("for (uint s = {}; s > 0; s >>= 1) {{", T / 2));
+                self.lines
+                    .push("if (lid < s) tr[lid] = fmax(tr[lid], tr[lid + s]);".into());
+                self.lines
+                    .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
                 self.lines.push("}".into());
                 // exp is elementwise — parallel, then the
                 // device-memory barrier makes every thread's writes
                 // visible to the serial sum.
-                self.lines.push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
+                self.lines
+                    .push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
                 let v = self.gen(x, &cs)?;
                 self.lines.push(format!("{eb}[i] = exp({v} - tr[0]);"));
                 self.lines.push("}".into());
-                self.lines.push("threadgroup_barrier(mem_flags::mem_device);".into());
+                self.lines
+                    .push("threadgroup_barrier(mem_flags::mem_device);".into());
                 // the sum is order-sensitive — serial, eval order.
                 self.lines.push(format!(
                     "if (lid == 0) {{ float s = 0.0f; for (uint i = 0; i < {n}; ++i) s += {eb}[i]; ts = s; }}"
                 ));
-                self.lines.push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+                self.lines
+                    .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
                 self.lines.push(format!(
                     "for (uint i = lid; i < {n}; i += {T}) {out_buf}[i] = {eb}[i] / ts;"
                 ));
@@ -823,17 +825,22 @@ impl Ge {
                 self.lines.push("threadgroup float tv;".into());
                 self.lines.push("if (lid == 0) {".into());
                 self.lines.push("float acc = 0.0f;".into());
-                self.lines.push(format!("for (uint i = 0; i < {n}; ++i) {{"));
+                self.lines
+                    .push(format!("for (uint i = 0; i < {n}; ++i) {{"));
                 let v = self.gen(x, &cs)?;
                 self.lines.push(format!("acc += ({v}) * ({v});"));
                 self.lines.push("}".into());
-                self.lines.push(format!("tv = rsqrt(acc / float({n}) + 1e-5f);"));
+                self.lines
+                    .push(format!("tv = rsqrt(acc / float({n}) + 1e-5f);"));
                 self.lines.push("}".into());
-                self.lines.push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+                self.lines
+                    .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
                 let wv = self.gen(&args[1], &cs)?;
-                self.lines.push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
+                self.lines
+                    .push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
                 let v = self.gen(x, &cs)?;
-                self.lines.push(format!("{out_buf}[i] = ({v}) * tv * ({wv});"));
+                self.lines
+                    .push(format!("{out_buf}[i] = ({v}) * tv * ({wv});"));
                 self.lines.push("}".into());
             }
         }
@@ -852,7 +859,10 @@ impl Ge {
     /// still sequential-k, so parity vs eval is unchanged.
     fn tiled_body(&self, e: &Typed, out_buf: &str) -> Option<(Vec<String>, Dispatch)> {
         let (a_e, b_e, m_dim, k_dim, n_dim) = self.matmul_operands(e)?;
-        let (tt, tm, t, bk) = { let (t2, m2, b2) = tile_geom(); (TT, m2, t2, b2) };
+        let (tt, tm, t, bk) = {
+            let (t2, m2, b2) = tile_geom();
+            (TT, m2, t2, b2)
+        };
         let mut l = Vec::new();
         // Register-blocked tile: TT×TT threads cover a TILE×TILE block,
         // each thread owns a TM×TM micro-tile. Cooperative loads fill
@@ -1467,9 +1477,8 @@ impl Ge {
                             let acc = self.tmp();
                             let br = self.tmp();
                             self.lines.push(format!("float {acc} = 0.0f;"));
-                            self.lines.push(format!(
-                                "for (int {br} = 0; {br} < {m_batch}; ++{br}) {{"
-                            ));
+                            self.lines
+                                .push(format!("for (int {br} = 0; {br} < {m_batch}; ++{br}) {{"));
                             let av = adj(self, &[br.clone(), sc[0].clone()])?;
                             let xv = self.gen(a, &[br.clone(), sc[1].clone()])?;
                             self.lines.push(format!("{acc} += ({av}) * ({xv});"));
@@ -1963,10 +1972,7 @@ impl Ge {
                         ),
                     },
                 };
-                self.scopes
-                    .last_mut()
-                    .unwrap()
-                    .push((name.clone(), new_e));
+                self.scopes.last_mut().unwrap().push((name.clone(), new_e));
                 Ok(())
             }
             TStmt::Expr(_) => Ok(()),
@@ -2053,30 +2059,30 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
             Some(r) => r,
             None => {
                 ge.lines.clear();
-            let mut coords = Vec::new();
-            let r = oty.dims.len();
-            for i in 0..r {
-                let cname = format!("c{i}");
-                let stride: i64 = oty.dims[i + 1..].iter().product();
-                let d = oty.dims[i];
-                if r == 1 {
-                    ge.lines.push(format!("uint {cname} = gid;"));
-                } else if stride == 1 {
-                    ge.lines.push(format!("uint {cname} = gid % {d};"));
-                } else {
-                    ge.lines
-                        .push(format!("uint {cname} = (gid / {stride}) % {d};"));
+                let mut coords = Vec::new();
+                let r = oty.dims.len();
+                for i in 0..r {
+                    let cname = format!("c{i}");
+                    let stride: i64 = oty.dims[i + 1..].iter().product();
+                    let d = oty.dims[i];
+                    if r == 1 {
+                        ge.lines.push(format!("uint {cname} = gid;"));
+                    } else if stride == 1 {
+                        ge.lines.push(format!("uint {cname} = gid % {d};"));
+                    } else {
+                        ge.lines
+                            .push(format!("uint {cname} = (gid / {stride}) % {d};"));
+                    }
+                    coords.push(cname);
                 }
-                coords.push(cname);
+                let v = ge.gen_raw(&p.ret, &coords)?;
+                ge.lines.push(format!("_out[gid] = ({v});"));
+                (
+                    std::mem::take(&mut ge.lines),
+                    Dispatch::Linear(oty.numel() as usize),
+                )
             }
-            let v = ge.gen_raw(&p.ret, &coords)?;
-            ge.lines.push(format!("_out[gid] = ({v});"));
-            (
-                std::mem::take(&mut ge.lines),
-                Dispatch::Linear(oty.numel() as usize),
-            )
-            }
-        }
+        },
     };
     ge.emit_q.extend(ge.scratch.drain(mark..));
     ge.emit_q.push(EK {
@@ -2093,8 +2099,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
     // only the buffers its body references (local indices), so total
     // buffer count is unbounded — Metal's 31-slot limit applies per
     // kernel, and real layers have hundreds of scratch intermediates.
-    let mut entries: Vec<(String, String)> =
-        vec![("_out".into(), "device float* _out".into())];
+    let mut entries: Vec<(String, String)> = vec![("_out".into(), "device float* _out".into())];
     for (arg, _port, writable) in &base_args {
         let elem_ty = if ge.half_args.contains(arg) {
             "half"

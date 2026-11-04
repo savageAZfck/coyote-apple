@@ -244,8 +244,10 @@ pub fn run(args: &[String]) -> Result<(), i32> {
             // stratum, compare observable behavior: return + witness
             let mut va = coyote::load_vm(std::path::Path::new(file), &dir_ane, false, false, true)?;
             crate::mind::bind_all(&mut va);
+            crate::peer::bind_all(&mut va);
             let mut vc = coyote::load_vm(std::path::Path::new(file), &dir_cpu, true, false, true)?;
             crate::mind::bind_all(&mut vc);
+            crate::peer::bind_all(&mut vc);
             let ra = va.run_main()?;
             let rc = vc.run_main()?;
             let ar = va.stringify(&ra);

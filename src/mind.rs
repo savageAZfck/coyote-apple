@@ -106,13 +106,7 @@ fn json_en_val(v: &Val) -> Value {
         (2, [Val::F(f)]) => json!(f),
         (2, [Val::I(i)]) => json!(i),
         (3, [Val::S(s)]) => Value::String(s.to_string()),
-        (4, [Val::V(items)]) => Value::Array(
-            items
-                .borrow()
-                .iter()
-                .map(json_en_val)
-                .collect(),
-        ),
+        (4, [Val::V(items)]) => Value::Array(items.borrow().iter().map(json_en_val).collect()),
         (5, [Val::M(pairs)]) => {
             let mut m = serde_json::Map::new();
             for (k, val) in pairs.borrow().iter() {
@@ -184,7 +178,11 @@ fn splitmix64(x: &mut u64) -> u64 {
 pub fn embed(text: &str) -> Vec<f64> {
     let mut out = [0.0f64; 64];
     let mut n = 0usize;
-    for tok in text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+    for tok in text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+    {
         let mut seed = fnv1a64(tok);
         for v in out.iter_mut() {
             // [-1, 1) per component — same range as the reference table.
@@ -298,7 +296,10 @@ pub fn bind_all(vm: &mut Vm) {
             let method = arg_str(args, 0)?;
             let params = args.get(1).and_then(json_val);
             if !substrate::available() {
-                return Ok(json_to_val(&json!({"ok": false, "err": "substrate unavailable"}), &j));
+                return Ok(json_to_val(
+                    &json!({"ok": false, "err": "substrate unavailable"}),
+                    &j,
+                ));
             }
             match substrate::call_agent(&method, params, 4096) {
                 Ok(v) => Ok(json_to_val(&v, &j)),
@@ -336,9 +337,15 @@ pub fn bind_all(vm: &mut Vm) {
                     o.insert("status".into(), json!("ok"));
                     o.insert("text".into(), json!(text));
                     if let Some(m) = metrics {
-                        for k in ["tokens", "decode_tps", "total_tps",
-                                  "draft_accept_pct", "tier", "prefix_cache", "speculative"]
-                        {
+                        for k in [
+                            "tokens",
+                            "decode_tps",
+                            "total_tps",
+                            "draft_accept_pct",
+                            "tier",
+                            "prefix_cache",
+                            "speculative",
+                        ] {
                             if let Some(v) = m.get(k) {
                                 o.insert(k.into(), v.clone());
                             }
@@ -376,9 +383,7 @@ pub fn bind_all(vm: &mut Vm) {
     // extern is this distribution's working socket path — "" on failure.
     vm.bind_extern("mind_cortex", move |args| {
         let prompt = arg_str(args, 0)?;
-        Ok(Val::S(Rc::from(
-            substrate::cortex_ask(&prompt).as_str(),
-        )))
+        Ok(Val::S(Rc::from(substrate::cortex_ask(&prompt).as_str())))
     });
 
     // mind_witness(event) -> bool — drop an audit_event onto the
@@ -484,4 +489,114 @@ pub fn bind_all(vm: &mut Vm) {
             }
         });
     }
+}
+
+// ── live-mind mobility ─────────────────────────────────────────────────
+// The OTHER sense of `mind`: a lane's KV state is a pure function of
+// its token stream, so the id history IS the checkpoint. `snapshot`
+// pulls the stream; `resume` replays it — on the same rank (a fork:
+// one thought, two continuations) or another host (a migration: the
+// mind physically moves machines). Downstream ranks rebuild KV as the
+// replayed frames flow.
+
+use crate::wire::{self, Frame};
+use std::path::PathBuf;
+
+fn mget(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+}
+
+fn mind_snapshot(host: &str, lane: i64, secret: &[u8], enc: bool) -> Result<Vec<u8>, String> {
+    let (mut s, c) = wire::connect(host, secret, enc, 600)?;
+    let mut f = Frame::new("snapshot");
+    f.lane = Some(lane as usize);
+    wire::write_packet(&mut s, &f, &[], c.as_ref())?;
+    let (r, payload) = wire::read_packet(&mut s, c.as_ref())?;
+    if let Some(e) = r.error {
+        return Err(e);
+    }
+    eprintln!(
+        "  snapshot {host} lane {lane}: {} ids (pos {:?})",
+        payload.len() / 4,
+        r.token
+    );
+    Ok(payload)
+}
+
+fn mind_resume(host: &str, lane: i64, ids: &[u8], secret: &[u8], enc: bool) -> Result<(), String> {
+    let (mut s, c) = wire::connect(host, secret, enc, 600)?;
+    let mut f = Frame::new("resume");
+    f.lane = Some(lane as usize);
+    wire::write_packet(&mut s, &f, ids, c.as_ref())?;
+    let (r, _) = wire::read_packet(&mut s, c.as_ref())?;
+    if let Some(e) = r.error {
+        return Err(e);
+    }
+    eprintln!("  resume {host} lane {lane}: pos {:?}", r.token);
+    if let Some(w) = &r.witness {
+        for (tag, val) in w {
+            eprintln!("    witness {tag}: {val}");
+        }
+    }
+    Ok(())
+}
+
+/// `coyote-apple mind snapshot|resume|fork|migrate` — the live mind as
+/// a movable value: fork is resume-on-another-lane, migrate is
+/// resume-on-another-host. Replay is the checkpoint.
+pub fn mind(args: &[String]) -> Result<(), String> {
+    let op = args.first().map(String::as_str).unwrap_or("");
+    let secret = wire::resolve_secret()?;
+    let enc = std::env::var("COYOTE_MESH_ENC").ok().as_deref() != Some("0");
+    let lane =
+        |name: &str, d: i64| -> i64 { mget(args, name).and_then(|s| s.parse().ok()).unwrap_or(d) };
+    match op {
+        "snapshot" => {
+            let to = mget(args, "--to").ok_or("mind snapshot --to h:p --lane N -o file")?;
+            let ids = mind_snapshot(&to, lane("--lane", 0), &secret, enc)?;
+            let out = mget(args, "-o")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| "mind.bin".into());
+            std::fs::write(&out, &ids).map_err(|e| e.to_string())?;
+            println!("{} ids → {}", ids.len() / 4, out.display());
+        }
+        "resume" => {
+            let to = mget(args, "--to").ok_or("mind resume --to h:p --lane N -i file")?;
+            let inp = mget(args, "-i")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| "mind.bin".into());
+            let ids = std::fs::read(&inp).map_err(|e| format!("{e}"))?;
+            mind_resume(&to, lane("--lane", 0), &ids, &secret, enc)?;
+        }
+        "fork" => {
+            let to = mget(args, "--to").ok_or("mind fork --to h:p --from-lane A --to-lane B")?;
+            let ids = mind_snapshot(&to, lane("--from-lane", 0), &secret, enc)?;
+            mind_resume(&to, lane("--to-lane", 1), &ids, &secret, enc)?;
+            println!(
+                "forked lane {} → lane {}",
+                lane("--from-lane", 0),
+                lane("--to-lane", 1)
+            );
+        }
+        "migrate" => {
+            let from = mget(args, "--from")
+                .ok_or("mind migrate --from h:p --lane A --to h:p2 --lane B")?;
+            let to =
+                mget(args, "--to").ok_or("mind migrate --from h:p --lane A --to h:p2 --lane B")?;
+            let ids = mind_snapshot(&from, lane("--lane", 0), &secret, enc)?;
+            mind_resume(&to, lane("--to-lane", 0), &ids, &secret, enc)?;
+            println!(
+                "migrated {from} lane {} → {to} lane {}",
+                lane("--lane", 0),
+                lane("--to-lane", 0)
+            );
+        }
+        _ => {
+            return Err(
+                "usage: mind snapshot|resume|fork|migrate — the live mind as a movable value"
+                    .into(),
+            )
+        }
+    }
+    Ok(())
 }

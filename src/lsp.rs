@@ -83,46 +83,160 @@ fn symbols_of(text: &str, path: &PathBuf) -> Vec<Sym> {
                 format!(
                     "import \"{}\"{}",
                     s.v,
-                    alias.as_ref().map(|a| format!(" as {}", a.v)).unwrap_or_default()
+                    alias
+                        .as_ref()
+                        .map(|a| format!(" as {}", a.v))
+                        .unwrap_or_default()
                 ),
             ),
             Decl::Invariant(s) => (s.v.clone(), s.line, s.col, 7, format!("invariant {}", s.v)),
             Decl::Cap(v) => match v.first() {
-                Some(s) => (s.v.clone(), s.line, s.col, 7, format!("cap {}", v.iter().map(|c| c.v.as_str()).collect::<Vec<_>>().join(", "))),
+                Some(s) => (
+                    s.v.clone(),
+                    s.line,
+                    s.col,
+                    7,
+                    format!(
+                        "cap {}",
+                        v.iter()
+                            .map(|c| c.v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ),
                 None => continue,
             },
             Decl::Provenance(v) => match v.first() {
-                Some((s, t)) => (format!("{}", s.v), s.line, s.col, 7, format!("provenance {} = {}", s.v, t.v)),
+                Some((s, t)) => (
+                    format!("{}", s.v),
+                    s.line,
+                    s.col,
+                    7,
+                    format!("provenance {} = {}", s.v, t.v),
+                ),
                 None => continue,
             },
-            Decl::Param { name, ty, qual, .. } => {
-                (name.v.clone(), name.line, name.col, 13, format!("param {}: {} ({:?})", name.v, fmt_ty(&ty.v), qual))
-            }
-            Decl::Io { name, ty, dir, .. } => {
-                (name.v.clone(), name.line, name.col, 13, format!("io {}: {} ({:?})", name.v, fmt_ty(&ty.v), dir))
-            }
-            Decl::State { name, fields } => {
-                (name.v.clone(), name.line, name.col, 5, format!("state {} ({} fields)", name.v, fields.len()))
-            }
-            Decl::Table { name, .. } => (name.v.clone(), name.line, name.col, 13, format!("table {}", name.v)),
-            Decl::Struct { name, .. } => (name.v.clone(), name.line, name.col, 23, format!("struct {}", name.v)),
-            Decl::Enum { name, .. } => (name.v.clone(), name.line, name.col, 10, format!("enum {}", name.v)),
+            Decl::Param { name, ty, qual, .. } => (
+                name.v.clone(),
+                name.line,
+                name.col,
+                13,
+                format!("param {}: {} ({:?})", name.v, fmt_ty(&ty.v), qual),
+            ),
+            Decl::Io { name, ty, dir, .. } => (
+                name.v.clone(),
+                name.line,
+                name.col,
+                13,
+                format!("io {}: {} ({:?})", name.v, fmt_ty(&ty.v), dir),
+            ),
+            Decl::State { name, fields } => (
+                name.v.clone(),
+                name.line,
+                name.col,
+                5,
+                format!("state {} ({} fields)", name.v, fields.len()),
+            ),
+            Decl::Table { name, .. } => (
+                name.v.clone(),
+                name.line,
+                name.col,
+                13,
+                format!("table {}", name.v),
+            ),
+            Decl::Struct { name, .. } => (
+                name.v.clone(),
+                name.line,
+                name.col,
+                23,
+                format!("struct {}", name.v),
+            ),
+            Decl::Enum { name, .. } => (
+                name.v.clone(),
+                name.line,
+                name.col,
+                10,
+                format!("enum {}", name.v),
+            ),
             Decl::ExternFn(f) => {
-                let args: Vec<String> = f.v.args.iter().map(|(n, t)| format!("{}: {:?}", n.v, t.v)).collect();
-                let caps = if f.v.caps.is_empty() { String::new() } else { format!(" cap {}", f.v.caps.iter().map(|c| c.v.as_str()).collect::<Vec<_>>().join(", ")) };
-                (f.v.name.clone(), f.line, f.col, 12, format!("extern fn {}({}){}", f.v.name, args.join(", "), caps))
+                let args: Vec<String> =
+                    f.v.args
+                        .iter()
+                        .map(|(n, t)| format!("{}: {:?}", n.v, t.v))
+                        .collect();
+                let caps = if f.v.caps.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " cap {}",
+                        f.v.caps
+                            .iter()
+                            .map(|c| c.v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                (
+                    f.v.name.clone(),
+                    f.line,
+                    f.col,
+                    12,
+                    format!("extern fn {}({}){}", f.v.name, args.join(", "), caps),
+                )
             }
             Decl::Fn(f) => {
                 let t = f.v.target.name();
-                let args: Vec<String> = f.v.args.iter().map(|(n, ty)| format!("{}: {}", n.v, fmt_ty(&ty.v))).collect();
-                let ret = f.v.ret.as_ref().map(|r| format!(" -> {}", fmt_ty(&r.v))).unwrap_or_default();
-                (f.v.name.clone(), f.line, f.col, 12, format!("{}fn {}({}){}", if t == "ane" { "" } else { "gpu/enc " }, f.v.name, args.join(", "), ret))
+                let args: Vec<String> =
+                    f.v.args
+                        .iter()
+                        .map(|(n, ty)| format!("{}: {}", n.v, fmt_ty(&ty.v)))
+                        .collect();
+                let ret =
+                    f.v.ret
+                        .as_ref()
+                        .map(|r| format!(" -> {}", fmt_ty(&r.v)))
+                        .unwrap_or_default();
+                (
+                    f.v.name.clone(),
+                    f.line,
+                    f.col,
+                    12,
+                    format!(
+                        "{}fn {}({}){}",
+                        if t == "ane" { "" } else { "gpu/enc " },
+                        f.v.name,
+                        args.join(", "),
+                        ret
+                    ),
+                )
             }
-            Decl::HostFn(f) => {
-                (f.v.name.clone(), f.line, f.col, 12, format!("host fn {}", f.v.name))
-            }
+            Decl::HostFn(f) => (
+                f.v.name.clone(),
+                f.line,
+                f.col,
+                12,
+                format!("host fn {}", f.v.name),
+            ),
+            Decl::Treaty { name, allow, deny } => (
+                name.v.clone(),
+                name.line,
+                name.col,
+                7,
+                format!(
+                    "treaty {} (allow {}, deny {})",
+                    name.v,
+                    allow.len(),
+                    deny.len()
+                ),
+            ),
         };
-        out.push(Sym { name, line, col, kind, detail });
+        out.push(Sym {
+            name,
+            line,
+            col,
+            kind,
+            detail,
+        });
     }
     out
 }
@@ -143,29 +257,85 @@ fn symbols(doc: &Doc) -> Vec<Value> {
 // --- cursor helpers ----------------------------------------------------------
 
 fn word_at(doc: &Doc, line0: usize, col0: usize) -> String {
-    let Some(line) = doc.text.lines().nth(line0) else { return String::new() };
+    let Some(line) = doc.text.lines().nth(line0) else {
+        return String::new();
+    };
     let chars: Vec<char> = line.chars().collect();
     let is_id = |c: char| c.is_alphanumeric() || c == '_' || c == '.';
     let mut lo = col0.min(chars.len());
     let mut hi = lo;
-    while lo > 0 && is_id(chars[lo - 1]) { lo -= 1; }
-    while hi < chars.len() && is_id(chars[hi]) { hi += 1; }
+    while lo > 0 && is_id(chars[lo - 1]) {
+        lo -= 1;
+    }
+    while hi < chars.len() && is_id(chars[hi]) {
+        hi += 1;
+    }
     chars[lo..hi].iter().collect()
 }
 
 // --- completion ----------------------------------------------------------------
 
 const KEYWORDS: &[&str] = &[
-    "fn", "gpu fn", "enc fn", "host fn", "det", "param", "state", "io",
-    "cap", "invariant", "provenance", "reflex", "struct", "enum", "match",
-    "let", "var", "if", "else", "while", "for", "return", "import",
-    "extern", "witness", "table", "break", "continue", "in", "true", "false",
+    "fn",
+    "gpu fn",
+    "enc fn",
+    "mesh fn",
+    "pcc fn",
+    "host fn",
+    "det",
+    "treaty",
+    "peer",
+    "param",
+    "state",
+    "io",
+    "cap",
+    "invariant",
+    "provenance",
+    "reflex",
+    "struct",
+    "enum",
+    "match",
+    "let",
+    "var",
+    "if",
+    "else",
+    "while",
+    "for",
+    "return",
+    "import",
+    "extern",
+    "witness",
+    "table",
+    "break",
+    "continue",
+    "in",
+    "true",
+    "false",
 ];
 
 const BUILTINS: &[&str] = &[
-    "print", "witness", "argmax", "softmax", "zeros", "onehot", "randn",
-    "len", "sum", "exp", "log", "tanh", "relu", "silu", "sigmoid",
-    "matmul", "transpose", "slice", "concat", "max", "min", "abs",
+    "print",
+    "witness",
+    "argmax",
+    "softmax",
+    "zeros",
+    "onehot",
+    "randn",
+    "len",
+    "sum",
+    "exp",
+    "log",
+    "tanh",
+    "relu",
+    "silu",
+    "sigmoid",
+    "matmul",
+    "transpose",
+    "slice",
+    "concat",
+    "max",
+    "min",
+    "abs",
 ];
 
 fn completions(doc: &Doc) -> Vec<Value> {
@@ -181,12 +351,27 @@ fn completions(doc: &Doc) -> Vec<Value> {
     }
     // snippets
     for (label, snip) in [
-        ("fn (tensor program)", "fn ${1:name}(${2:x: f16[64]}) -> f16[64] {\n    $0\n}"),
-        ("gpu fn", "gpu fn ${1:name}(${2:x: f16[64]}) -> f16[64] {\n    $0\n}"),
-        ("enc fn", "enc fn ${1:name}(${2:x: f16[64]}) -> f16[64] {\n    $0\n}"),
-        ("host fn main", "host fn main() -> i64 {\n    $0\n    return 0;\n}"),
+        (
+            "fn (tensor program)",
+            "fn ${1:name}(${2:x: f16[64]}) -> f16[64] {\n    $0\n}",
+        ),
+        (
+            "gpu fn",
+            "gpu fn ${1:name}(${2:x: f16[64]}) -> f16[64] {\n    $0\n}",
+        ),
+        (
+            "enc fn",
+            "enc fn ${1:name}(${2:x: f16[64]}) -> f16[64] {\n    $0\n}",
+        ),
+        (
+            "host fn main",
+            "host fn main() -> i64 {\n    $0\n    return 0;\n}",
+        ),
         ("param", "param ${1:w}: f16[${2:64}, ${3:64}]"),
-        ("state", "state ${1:kv} {\n    ${2:k}: f16[${3:256}, ${4:64}]\n}"),
+        (
+            "state",
+            "state ${1:kv} {\n    ${2:k}: f16[${3:256}, ${4:64}]\n}",
+        ),
         ("witness", "witness(\"${1:tag}\", ${2:val});"),
     ] {
         out.push(json!({
@@ -201,8 +386,16 @@ fn completions(doc: &Doc) -> Vec<Value> {
 
 /// token type legend index → LSP token type
 const SEM_TYPES: &[&str] = &[
-    "keyword", "type", "function", "variable", "parameter",
-    "string", "number", "comment", "operator", "property",
+    "keyword",
+    "type",
+    "function",
+    "variable",
+    "parameter",
+    "string",
+    "number",
+    "comment",
+    "operator",
+    "property",
 ];
 
 /// Scan source into (line0, col0, len, type_idx) — self-contained
@@ -210,16 +403,50 @@ const SEM_TYPES: &[&str] = &[
 /// set drives the keyword class; everything else is structural.
 fn sem_tokens(text: &str) -> Vec<Value> {
     let kw: std::collections::HashSet<&str> = [
-        "fn", "gpu", "enc", "host", "det", "param", "state", "io", "cap",
-        "invariant", "provenance", "reflex", "struct", "enum", "match", "let",
-        "var", "if", "else", "while", "for", "return", "import", "extern",
-        "witness", "table", "break", "continue", "in", "true", "false",
-        "f16", "f32", "i32", "i64", "u8", "bool", "str",
+        "fn",
+        "gpu",
+        "enc",
+        "host",
+        "det",
+        "param",
+        "state",
+        "io",
+        "cap",
+        "invariant",
+        "provenance",
+        "reflex",
+        "struct",
+        "enum",
+        "match",
+        "let",
+        "var",
+        "if",
+        "else",
+        "while",
+        "for",
+        "return",
+        "import",
+        "extern",
+        "witness",
+        "table",
+        "break",
+        "continue",
+        "in",
+        "true",
+        "false",
+        "f16",
+        "f32",
+        "i32",
+        "i64",
+        "u8",
+        "bool",
+        "str",
     ]
     .into_iter()
     .collect();
-    let ty_kw: std::collections::HashSet<&str> =
-        ["f16", "f32", "i32", "i64", "u8", "bool", "str"].into_iter().collect();
+    let ty_kw: std::collections::HashSet<&str> = ["f16", "f32", "i32", "i64", "u8", "bool", "str"]
+        .into_iter()
+        .collect();
     let mut raw: Vec<(usize, usize, usize, usize)> = Vec::new();
     for (li, line) in text.lines().enumerate() {
         let chars: Vec<char> = line.chars().collect();
@@ -356,33 +583,39 @@ pub fn run() -> Result<(), String> {
         match method {
             "initialize" => {
                 if let Some(id) = id {
-                    send(&mut out, &json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "result": {
-                            "capabilities": {
-                                "textDocumentSync": {"openClose": true, "change": 1},
-                                "documentSymbolProvider": true,
-                                "completionProvider": {"triggerCharacters": [" ", ":", "<"]},
-                                "hoverProvider": true,
-                                "definitionProvider": true,
-                                "semanticTokensProvider": {
-                                    "legend": {
-                                        "tokenTypes": SEM_TYPES,
-                                        "tokenModifiers": [],
+                    send(
+                        &mut out,
+                        &json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {
+                                "capabilities": {
+                                    "textDocumentSync": {"openClose": true, "change": 1},
+                                    "documentSymbolProvider": true,
+                                    "completionProvider": {"triggerCharacters": [" ", ":", "<"]},
+                                    "hoverProvider": true,
+                                    "definitionProvider": true,
+                                    "semanticTokensProvider": {
+                                        "legend": {
+                                            "tokenTypes": SEM_TYPES,
+                                            "tokenModifiers": [],
+                                        },
+                                        "full": true,
                                     },
-                                    "full": true,
                                 },
-                            },
-                            "serverInfo": {"name": "coyote-apple-lsp", "version": env!("CARGO_PKG_VERSION")},
-                        }
-                    }));
+                                "serverInfo": {"name": "coyote-apple-lsp", "version": env!("CARGO_PKG_VERSION")},
+                            }
+                        }),
+                    );
                 }
             }
             "initialized" => {}
             "shutdown" => {
                 shutdown = true;
                 if let Some(id) = id {
-                    send(&mut out, &json!({"jsonrpc": "2.0", "id": id, "result": null}));
+                    send(
+                        &mut out,
+                        &json!({"jsonrpc": "2.0", "id": id, "result": null}),
+                    );
                 }
             }
             "exit" => std::process::exit(if shutdown { 0 } else { 1 }),
@@ -392,38 +625,59 @@ pub fn run() -> Result<(), String> {
                 let text = if method.ends_with("didOpen") {
                     td["text"].as_str().unwrap_or("").to_string()
                 } else {
-                    params["contentChanges"][0]["text"].as_str().unwrap_or("").to_string()
+                    params["contentChanges"][0]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string()
                 };
-                let doc = Doc { path: uri_to_path(&uri), text };
+                let doc = Doc {
+                    path: uri_to_path(&uri),
+                    text,
+                };
                 let diags = diagnostics(&doc);
                 docs.insert(uri.clone(), doc);
-                send(&mut out, &json!({
-                    "jsonrpc": "2.0",
-                    "method": "textDocument/publishDiagnostics",
-                    "params": {"uri": uri, "diagnostics": diags},
-                }));
+                send(
+                    &mut out,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "textDocument/publishDiagnostics",
+                        "params": {"uri": uri, "diagnostics": diags},
+                    }),
+                );
             }
             "textDocument/didClose" => {
-                let uri = params["textDocument"]["uri"].as_str().unwrap_or("").to_string();
+                let uri = params["textDocument"]["uri"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
                 docs.remove(&uri);
-                send(&mut out, &json!({
-                    "jsonrpc": "2.0",
-                    "method": "textDocument/publishDiagnostics",
-                    "params": {"uri": uri, "diagnostics": []},
-                }));
+                send(
+                    &mut out,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "textDocument/publishDiagnostics",
+                        "params": {"uri": uri, "diagnostics": []},
+                    }),
+                );
             }
             "textDocument/documentSymbol" => {
                 let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
                 let syms = get_doc(&mut docs, uri).map(symbols).unwrap_or_default();
                 if let Some(id) = id {
-                    send(&mut out, &json!({"jsonrpc": "2.0", "id": id, "result": syms}));
+                    send(
+                        &mut out,
+                        &json!({"jsonrpc": "2.0", "id": id, "result": syms}),
+                    );
                 }
             }
             "textDocument/completion" => {
                 let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
                 let items = get_doc(&mut docs, uri).map(completions).unwrap_or_default();
                 if let Some(id) = id {
-                    send(&mut out, &json!({"jsonrpc": "2.0", "id": id, "result": items}));
+                    send(
+                        &mut out,
+                        &json!({"jsonrpc": "2.0", "id": id, "result": items}),
+                    );
                 }
             }
             "textDocument/hover" => {
@@ -449,7 +703,10 @@ pub fn run() -> Result<(), String> {
                         })
                 });
                 if let Some(id) = id {
-                    send(&mut out, &json!({"jsonrpc": "2.0", "id": id, "result": result}));
+                    send(
+                        &mut out,
+                        &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                    );
                 }
             }
             "textDocument/definition" => {
@@ -472,7 +729,10 @@ pub fn run() -> Result<(), String> {
                         })
                 });
                 if let Some(id) = id {
-                    send(&mut out, &json!({"jsonrpc": "2.0", "id": id, "result": result}));
+                    send(
+                        &mut out,
+                        &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                    );
                 }
             }
             "textDocument/semanticTokens/full" => {
@@ -481,12 +741,18 @@ pub fn run() -> Result<(), String> {
                     .map(|d| sem_tokens(&d.text))
                     .unwrap_or_default();
                 if let Some(id) = id {
-                    send(&mut out, &json!({"jsonrpc": "2.0", "id": id, "result": {"data": data}}));
+                    send(
+                        &mut out,
+                        &json!({"jsonrpc": "2.0", "id": id, "result": {"data": data}}),
+                    );
                 }
             }
             _ => {
                 if let Some(id) = id {
-                    send(&mut out, &json!({"jsonrpc": "2.0", "id": id, "result": null}));
+                    send(
+                        &mut out,
+                        &json!({"jsonrpc": "2.0", "id": id, "result": null}),
+                    );
                 }
             }
         }

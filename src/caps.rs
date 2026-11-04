@@ -22,14 +22,24 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 pub fn run(args: &[String]) -> Result<(), i32> {
-    let Some(file) = args.iter().find(|a| !a.starts_with('-') && !a.contains('=')) else {
-        eprintln!("usage: coyote-apple caps <file.cy> [--deny a,b] [--allow a,b] [--pure] [--json]");
+    let Some(file) = args
+        .iter()
+        .find(|a| !a.starts_with('-') && !a.contains('='))
+    else {
+        eprintln!(
+            "usage: coyote-apple caps <file.cy> [--deny a,b] [--allow a,b] [--pure] [--json]"
+        );
         return Err(2);
     };
     let list = |flag: &str| -> Vec<String> {
         args.iter()
             .find(|a| a.starts_with(&format!("{flag}=")))
-            .map(|a| a[flag.len() + 1..].split(',').map(|s| s.trim().to_string()).collect())
+            .map(|a| {
+                a[flag.len() + 1..]
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let deny = list("--deny");
@@ -94,7 +104,11 @@ pub fn run(args: &[String]) -> Result<(), i32> {
                     "  {} stratum {:<10} caps: {}",
                     p.target.name(),
                     name,
-                    if p.caps.is_empty() { "<none>".into() } else { p.caps.join(", ") }
+                    if p.caps.is_empty() {
+                        "<none>".into()
+                    } else {
+                        p.caps.join(", ")
+                    }
                 );
             }
             for cap in &c.caps {

@@ -4,3 +4,4 @@ coyote_bench/
 
 # model checkpoints — fetched separately, never committed
 models/
+out/

@@ -14,7 +14,11 @@ fn out_dir(args: &[String]) -> PathBuf {
 }
 
 pub fn run(args: &[String]) -> Result<(), i32> {
-    let Some(file) = args.first().filter(|a| !a.starts_with('-')).map(PathBuf::from) else {
+    let Some(file) = args
+        .first()
+        .filter(|a| !a.starts_with('-'))
+        .map(PathBuf::from)
+    else {
         eprintln!("coyote-apple run <file.cy> [-o dir] [--cpu] [--rebuild] [--resume snap]");
         return Err(2);
     };
@@ -29,6 +33,7 @@ pub fn run(args: &[String]) -> Result<(), i32> {
     let r = (|| -> Result<(), String> {
         let mut vm = coyote::load_vm(&file, &dir, use_cpu, rebuild, false)?;
         mind::bind_all(&mut vm);
+        crate::peer::bind_all(&mut vm);
         let ret = if let Some(snap) = resume {
             vm.resume(snap.to_str().unwrap_or(""))?;
             vm.run_resumed()?

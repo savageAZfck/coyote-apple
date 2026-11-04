@@ -7,7 +7,9 @@ use mil_infer::e5rt::DeviceMask;
 use std::path::Path;
 
 fn main() {
-    let dir = std::env::args().nth(1).expect("usage: anepush <dir> <ids> [n]");
+    let dir = std::env::args()
+        .nth(1)
+        .expect("usage: anepush <dir> <ids> [n]");
     let ids: Vec<u32> = std::env::args()
         .nth(2)
         .expect("token ids")
@@ -32,5 +34,11 @@ fn main() {
         el.as_secs_f64() * 1000.0 / (out.len() + 1).max(1) as f64,
         (out.len() + 1) as f64 / el.as_secs_f64()
     );
-    println!("{}", out.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
+    println!(
+        "{}",
+        out.iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
 }

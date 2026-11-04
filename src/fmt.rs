@@ -74,6 +74,9 @@ fn tok_text(t: &Tok) -> String {
         Host => "host".into(),
         Gpu => "gpu".into(),
         Enc => "enc".into(),
+        Mesh => "mesh".into(),
+        Pcc => "pcc".into(),
+        Treaty => "treaty".into(),
         Reflex => "reflex".into(),
         Struct => "struct".into(),
         Enum => "enum".into(),
@@ -153,12 +156,13 @@ fn space_before(prev: Option<&Tok>, cur: &Tok) -> bool {
         // tight before these
         RParen | RBracket | Comma | Semi | Dot | T | DotDot | Colon => false,
         // call/index parens attach to their head, group-parens get a space
-        LParen | LBracket => !matches!(p, Ident(_) | RParen | RBracket | Int(_) | Float(_) | Str(_)),
+        LParen | LBracket => {
+            !matches!(p, Ident(_) | RParen | RBracket | Int(_) | Float(_) | Str(_))
+        }
         LBrace => true,
         // binary/assign operators space on both sides
-        Arrow | FatArrow | Plus | Minus | Star | Slash | Percent | At | And
-        | Or | Eq | PlusEq | MinusEq | StarEq | SlashEq | EqEq | Ne | Lt | Gt
-        | Le | Ge | LtAngle | GtAngle => true,
+        Arrow | FatArrow | Plus | Minus | Star | Slash | Percent | At | And | Or | Eq | PlusEq
+        | MinusEq | StarEq | SlashEq | EqEq | Ne | Lt | Gt | Le | Ge | LtAngle | GtAngle => true,
         _ => match p {
             // tight after openers/member access/unary
             LParen | LBracket | Dot | T | DotDot | Not => false,
@@ -174,8 +178,24 @@ fn is_decl_start(t: &Tok) -> bool {
     use Tok::*;
     matches!(
         t,
-        Import | Extern | Fn | Gpu | Enc | Host | Reflex | Struct | Enum | Param
-            | Table | State | Io | Cap | Invariant | Provenance | Det | Stoch
+        Import
+            | Extern
+            | Fn
+            | Gpu
+            | Enc
+            | Host
+            | Reflex
+            | Struct
+            | Enum
+            | Param
+            | Table
+            | State
+            | Io
+            | Cap
+            | Invariant
+            | Provenance
+            | Det
+            | Stoch
     )
 }
 
@@ -205,22 +225,23 @@ fn fmt_source(src: &str) -> Result<String, String> {
 
     // comments that fall between tokens (or before them) land on their
     // own lines at the current indent.
-    let drain_comments_before = |cur_line: usize,
-                                     line: &mut String,
-                                     out: &mut String,
-                                     indent: usize,
-                                     ci: &mut usize,
-                                     coms: &Vec<(usize, usize, String)>| {
-        while *ci < coms.len() && coms[*ci].0 < cur_line {
-            flush(line, out, indent);
-            if !out.is_empty() {
-                out.push('\n');
+    let drain_comments_before =
+        |cur_line: usize,
+         line: &mut String,
+         out: &mut String,
+         indent: usize,
+         ci: &mut usize,
+         coms: &Vec<(usize, usize, String)>| {
+            while *ci < coms.len() && coms[*ci].0 < cur_line {
+                flush(line, out, indent);
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&"    ".repeat(indent));
+                out.push_str(coms[*ci].2.trim());
+                *ci += 1;
             }
-            out.push_str(&"    ".repeat(indent));
-            out.push_str(coms[*ci].2.trim());
-            *ci += 1;
-        }
-    };
+        };
 
     for (i, Lexed { tok, line: tl, .. }) in toks.iter().enumerate() {
         if matches!(tok, Tok::Eof) {
@@ -308,9 +329,8 @@ pub fn run(args: &[String]) -> Result<(), i32> {
         let out = fmt_source(&src)?;
         // losslessness: formatted output must re-parse identically
         let (_s1, a1) = coyote::parser::parse_src_at(&path, &src).map_err(|d| d.to_string())?;
-        let (_s2, a2) = coyote::parser::parse_src_at(&path, &out).map_err(|d| {
-            format!("fmt produced unparseable output: {}", d.msg)
-        })?;
+        let (_s2, a2) = coyote::parser::parse_src_at(&path, &out)
+            .map_err(|d| format!("fmt produced unparseable output: {}", d.msg))?;
         let _ = (a1, a2);
         if to_stdout {
             print!("{out}");
@@ -320,7 +340,10 @@ pub fn run(args: &[String]) -> Result<(), i32> {
             if out == src {
                 return Ok(());
             }
-            return Err(format!("{} is not canonical (run coyote-apple fmt)", path.display()));
+            return Err(format!(
+                "{} is not canonical (run coyote-apple fmt)",
+                path.display()
+            ));
         }
         if out != src {
             std::fs::write(&path, &out).map_err(|e| e.to_string())?;

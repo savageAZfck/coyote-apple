@@ -8,7 +8,9 @@ fn main() {
         if n == &name {
             let out = coyote::emit_program(&src, p, std::path::Path::new(&dir), true).unwrap();
             std::fs::write(format!("{dir}/net.mil"), &out.mil).unwrap();
-            for (f, b) in &out.blobs { std::fs::write(format!("{dir}/{f}"), b).unwrap(); }
+            for (f, b) in &out.blobs {
+                std::fs::write(format!("{dir}/{f}"), b).unwrap();
+            }
             println!("emitted {name} -> {dir}");
         }
     }

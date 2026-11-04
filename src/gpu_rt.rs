@@ -215,7 +215,11 @@ impl GpuRuntime {
         // lid-indexed and read by every member, so partial groups
         // would leave stale threadgroup memory; kernel guards keep
         // out-of-range threads clean.
-        fn dispatch(enc: &metal::ComputeCommandEncoderRef, pipe: &metal::ComputePipelineState, disp: &crate::gpu_emit::Dispatch) {
+        fn dispatch(
+            enc: &metal::ComputeCommandEncoderRef,
+            pipe: &metal::ComputePipelineState,
+            disp: &crate::gpu_emit::Dispatch,
+        ) {
             match disp {
                 crate::gpu_emit::Dispatch::Linear(numel) => {
                     let n = *numel as u64;
@@ -236,10 +240,7 @@ impl GpuRuntime {
                     // accumulation per thread, cooperative tile loads.
                     let tg = 64u64;
                     let groups = (*n as u64).div_ceil(tg);
-                    enc.dispatch_threads(
-                        MTLSize::new(groups * tg, 1, 1),
-                        MTLSize::new(tg, 1, 1),
-                    );
+                    enc.dispatch_threads(MTLSize::new(groups * tg, 1, 1), MTLSize::new(tg, 1, 1));
                 }
                 crate::gpu_emit::Dispatch::Tiled { m, n, t, mt } => {
                     let (tt, mt) = (*t as u64, *mt as u64);

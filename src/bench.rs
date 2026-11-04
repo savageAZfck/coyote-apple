@@ -85,6 +85,7 @@ pub fn run(args: &[String]) -> Result<(), i32> {
         if checked.organism {
             let mut vm = coyote::load_vm(&path, &dir, use_cpu, false, true)?;
             crate::mind::bind_all(&mut vm);
+            crate::peer::bind_all(&mut vm);
             let mut exec_times = Vec::new();
             for _ in 0..runs.max(3) {
                 let t0 = Instant::now();

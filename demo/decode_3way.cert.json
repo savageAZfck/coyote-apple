@@ -1,0 +1,32 @@
+{
+  "built": 1793621299,
+  "claims": {
+    "cert_sha256": "84a408d4138123b67aa128334ba6f517e7a4d3ab6cd9b230be1e896b633e8614",
+    "commitments": {
+      "cpu_reference": "e2af41522849585f0559311f1954ed784af1109c5f585d2f7f126edd1d75c70c",
+      "silicon": "e2af41522849585f0559311f1954ed784af1109c5f585d2f7f126edd1d75c70c",
+      "silicon_replay": "e2af41522849585f0559311f1954ed784af1109c5f585d2f7f126edd1d75c70c"
+    },
+    "compiles": {
+      "held": true
+    },
+    "parity": {
+      "cpu_return": "0",
+      "cpu_witness": 1,
+      "held": true,
+      "silicon_return": "0",
+      "silicon_witness": 1
+    },
+    "replay_determinism": {
+      "held": true
+    }
+  },
+  "program": "examples/decode_3way.cy",
+  "program_sha256": "7c30892ead2c468a7a6f139e35add3b7e44c2408c9f18f19304ab341d7a898b9",
+  "spec": "cycert/0.1",
+  "toolchain": {
+    "crate": "coyote-apple",
+    "version": "0.1.0"
+  },
+  "verdict": "CERTIFIED"
+}

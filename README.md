@@ -1,10 +1,13 @@
 # coyote-apple
 
-**One language, four substrates.** The same `.cy` source compiles to CPU,
-Metal/GPU, the Apple Neural Engine — and **ciphertext** (`enc fn` —
-homomorphic eval against plaintext weights) — no CoreMLTools, no Apple
-code generation — and the compiler can prove all of them compute the
-same math.
+**One language, four substrates — and every site they can run.**
+The same `.cy` source compiles to CPU, Metal/GPU, the Apple Neural
+Engine, and **ciphertext** (`enc fn`) — and now executes across **sites**:
+`mesh fn` dispatches to a treaty'd peer, `pcc fn` to an attested remote
+node, `pcc enc fn` is ciphertext evaluation on that node — over the Bad
+Apple mesh wire (HMAC mutual auth, AES-256-GCM sealed packets),
+verify-before-secrets, signed results, and one hash-chained witness
+log that spans every machine a computation touches.
 
 This is the private Apple edition of
 [Coyote](https://github.com/savageAZfck/coyote): the public language stays
@@ -84,6 +87,71 @@ coyote-apple lsp                               full language server:
                                                hover, go-to-def, semtoks
 ```
 
+the federation surface — the five strata made literal:
+
+```
+coyote-apple meshnode --listen h:p          serve bound programs (mesh site)
+coyote-apple pccnode --listen h:p           attested node (attest → bind →
+                                            signed exec; enc×pcc Ct-quad eval)
+coyote-apple peernode --listen h:p --treaty t.json [--programs dir]
+                                            treaty exchange ∩, then `call
+                                            <verb> <arg>` executes the bound
+                                            .cy program of that name — host
+                                            fns run in a staged Vm, program
+                                            fns through the evaluator —
+                                            every call re-checked against
+                                            the intersection
+coyote-apple shardize <f.cy> -o d --world N [--hosts a,b,...]
+                                            per-rank dirs + shard.json
+                                            (bad_apple ShardSpec) + world.json
+coyote-apple fleet up --world world.json --serve h:p [--lanes N]
+                                            the fleet as a unit: spawn every
+                                            ranknode (deepest first, waiting
+                                            for listeners) + the serving
+                                            tier; pids in <dir>/fleet.pid
+coyote-apple fleet down|status --world <dir>
+                                            lifecycle on the pidfile
+coyote-apple fleetcheck --world world.json
+                                            conformance over the fleet:
+                                            coverage contiguity, rank
+                                            indices, auth — busy ranks
+                                            report up (conn held), not down
+coyote-apple serve --ranks h1[,h2...] --listen h:p [--lanes N]
+                                            the serving tier: multi-client
+                                            sessions pinned to KV lanes,
+                                            lane-pool admission + LRU reap,
+                                            rank-0 failover, hash-chained
+                                            journal; waits for cold ranks
+coyote-apple ranknode --shard <dir> --listen h:p [--lanes N] [--device ane]
+                                            [--temp T] [--top-p P]
+                                            a weight-carrying rank: the
+                                            shardize rank dir resident on the
+                                            ANE (layers+heads+KV), serving
+                                            step/vstep/reset/rewind/generate
+                                            (ids or text — tokenizer auto-
+                                            discovered or --tokenizer)
+                                            on the byte-exact mesh wire.
+                                            generate streams token frames;
+                                            prefix cache rewinds shared
+                                            context; all lanes share one
+                                            downstream conn (frame.lane
+                                            selects the remote lane)
+coyote-apple ask "prompt" --to h:p [--session s] [--max-tokens n]
+                                            [--temp T] [--top-p P] | --ids "1,2,3"
+                                            serving-tier client — text or ids,
+                                            per-token streaming, per-request
+                                            sampling carried on the frame
+```
+
+`demo/five_strata.sh` runs the whole stack live: three nodes, one
+organism, five substrate×site strata, one witness chain.
+
+`lib/badapple/` carries the Bad Apple organ layer — 29 `.cy` ports
+(mesh wire, p2p, cert, ledger, protocol, config, scavenger, the
+five-organ fusion `badapple_organs.cy`) — importable as
+`import "badapple/x.cy"`, check-clean under the fork. The organism's
+organs are library code now.
+
 plus the full distribution surface — `new doc test spec watch gold
 weights genmask oracle audit diff bench prof package verify unpack emit`
 — documented in [APPLE.md](APPLE.md). Language guide: [LANGUAGE.md](LANGUAGE.md).
@@ -105,10 +173,13 @@ host fn chain() -> R {
 ```
 
 Four strata — `fn` → ANE, `gpu fn` → Metal, `enc fn` → ciphertext,
-`host fn` → CPU — with `reflex`, `det`/`stoch`, `param`/`state`/`io`,
-`cap`/`invariant`/`provenance` constitutions, and `witness` committed
-journals. `?`, `import as`, and dtype generics are the semantics that
-make organs composable.
+`host fn` → CPU — **× three sites** — `fn` local, `mesh fn` treaty'd
+peer, `pcc fn` attested remote — with `reflex`, `det`/`stoch`,
+`param`/`state`/`io`, `cap`/`invariant`/`provenance` constitutions,
+`treaty` decls + `peer` handles (`cap treaty`-gated), and `witness`
+committed journals that follow the computation across machines. `?`,
+`import as`, and dtype generics are the semantics that make organs
+composable.
 
 ## how a shard directory works
 
@@ -127,10 +198,31 @@ make organs composable.
 ## status
 
 Working end-to-end on Qwen3-0.6B (28 layers, GQA, RoPE, SwiGLU, 64-token
-resident context): coherent decode, CPU parity, 32 tok/s. Known edges:
-fp16 only, single-stream, per-op path fragile at this scale (that's the
-point of the resident path), GPU resident decode exceeds 8GB on this
-machine (~18 programs).
+resident context): coherent decode, CPU parity, 32 tok/s.
+
+**The fleet is live-verified:** a real 28-layer model `shardize`d across
+two ANE-resident ranknodes (layers 0–14 embed-side, 14–28 head-side),
+fronted by `serve`, driven by `fleet up`/`fleetcheck`/`fleet down`, asked
+through `ask` — streamed text in, streamed text out, per-request
+`--temp`/`--top-p` reaching the head rank over forwarded `vstep` frames,
+sessions on isolated lanes with prefix-cache rewinds, every request and
+rank execution hash-chained into one witness journal. Peer verbs dispatch
+into real `.cy` programs under treaty (`double(21) = 42.0` over the wire,
+denied verbs refused before eval).
+
+**Context is a ring, not a wall.** Lanes run sliding-window attention:
+`pos` is the absolute stream position (unbounded — verified: `pos90`
+witness entries past a 64-slot window), `slot = pos % seq_len`, RoPE on
+the slot. Streams never die to "context full"; the attention span stays
+`seq_len` wide (Mistral-style SWA). The resident span itself is a
+compile-time property of the shard's `state<>` dims — bigger windows
+re-emit through the model generator; the 128k–1M+ tier is the
+paged/sequence-parallel path (context sharded across lanes the way
+weights shard across ranks — the same law twice). Known edges: fp16
+only, single-stream, argmax-grade output under base weights without a
+chat template, per-op path fragile at this scale (that's the point of
+the resident path), GPU resident decode exceeds 8GB on this machine
+(~18 programs).
 
 The grammar lives in the local `~/coyote` checkout — a private fork that
 carries `enc fn`, `import "x" as m`, dtype generics (`fn f<D>`), and the

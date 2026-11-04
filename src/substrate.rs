@@ -27,18 +27,24 @@ const HANDSHAKE_MAX_SKEW_MS: u64 = 30_000;
 type HmacSha256 = Hmac<Sha256>;
 
 fn socket_path() -> PathBuf {
-    std::env::var_os("BADAPPLE_SOCKET_PATH")
-        .map_or_else(|| PathBuf::from("/var/run/badapple/substrate.sock"), PathBuf::from)
+    std::env::var_os("BADAPPLE_SOCKET_PATH").map_or_else(
+        || PathBuf::from("/var/run/badapple/substrate.sock"),
+        PathBuf::from,
+    )
 }
 
 fn identity_path() -> PathBuf {
-    std::env::var_os("BADAPPLE_IDENTITY_AGENT_SOCKET")
-        .map_or_else(|| PathBuf::from("/var/run/badapple/identity.sock"), PathBuf::from)
+    std::env::var_os("BADAPPLE_IDENTITY_AGENT_SOCKET").map_or_else(
+        || PathBuf::from("/var/run/badapple/identity.sock"),
+        PathBuf::from,
+    )
 }
 
 fn key_path() -> PathBuf {
-    std::env::var_os("BADAPPLE_SLICKS_KEY_PATH")
-        .map_or_else(|| PathBuf::from("/var/lib/bad_apple/slicks.key"), PathBuf::from)
+    std::env::var_os("BADAPPLE_SLICKS_KEY_PATH").map_or_else(
+        || PathBuf::from("/var/lib/bad_apple/slicks.key"),
+        PathBuf::from,
+    )
 }
 
 fn now_ms() -> u64 {
@@ -58,7 +64,11 @@ fn decode_hex(v: &str) -> Option<Vec<u8>> {
     }
     v.as_bytes()
         .chunks_exact(2)
-        .map(|p| std::str::from_utf8(p).ok().and_then(|s| u8::from_str_radix(s, 16).ok()))
+        .map(|p| {
+            std::str::from_utf8(p)
+                .ok()
+                .and_then(|s| u8::from_str_radix(s, 16).ok())
+        })
         .collect()
 }
 
@@ -81,8 +91,12 @@ fn hmac_hex(secret: &[u8], material: &str) -> String {
 }
 
 fn hmac_verify(secret: &[u8], material: &str, proof: &str) -> bool {
-    let Some(proof) = decode_hex(proof) else { return false };
-    let Ok(mut mac) = HmacSha256::new_from_slice(secret) else { return false };
+    let Some(proof) = decode_hex(proof) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(secret) else {
+        return false;
+    };
     mac.update(material.as_bytes());
     mac.verify_slice(&proof).is_ok()
 }
@@ -135,7 +149,9 @@ fn identity_sign(material: &str) -> Result<String, String> {
     if !resp.get("ok").and_then(Value::as_bool).unwrap_or(false) {
         return Err(format!(
             "identity sign failed: {}",
-            resp.get("error").and_then(Value::as_str).unwrap_or("unknown")
+            resp.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
         ));
     }
     resp.get("signature")
@@ -155,7 +171,9 @@ fn identity_verify(material: &str, signature: &str, pubkey: &str) -> Result<bool
     if !resp.get("ok").and_then(Value::as_bool).unwrap_or(false) {
         return Err(format!(
             "identity verify failed: {}",
-            resp.get("error").and_then(Value::as_str).unwrap_or("unknown")
+            resp.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
         ));
     }
     Ok(resp.get("valid").and_then(Value::as_bool).unwrap_or(false))
@@ -167,12 +185,24 @@ fn base64_encode(b: &[u8]) -> String {
     let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
     for chunk in b.chunks(3) {
         let n = chunk.len();
-        let buf = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let buf = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let v = ((buf[0] as u32) << 16) | ((buf[1] as u32) << 8) | buf[2] as u32;
         out.push(A[(v >> 18) as usize & 63] as char);
         out.push(A[(v >> 12) as usize & 63] as char);
-        out.push(if n > 1 { A[(v >> 6) as usize & 63] as char } else { '=' });
-        out.push(if n > 2 { A[v as usize & 63] as char } else { '=' });
+        out.push(if n > 1 {
+            A[(v >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if n > 2 {
+            A[v as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -187,8 +217,12 @@ enum Mode {
 fn load_secret() -> Result<Vec<u8>, String> {
     let raw = match std::env::var_os("BADAPPLE_SLICKS_SECRET") {
         Some(s) => s.to_string_lossy().into_owned(),
-        None => std::fs::read_to_string(key_path())
-            .map_err(|e| format!("unable to read the SLICKS key at {}: {e}", key_path().display()))?,
+        None => std::fs::read_to_string(key_path()).map_err(|e| {
+            format!(
+                "unable to read the SLICKS key at {}: {e}",
+                key_path().display()
+            )
+        })?,
     };
     let trimmed = raw.trim();
     let secret = decode_hex(trimmed).unwrap_or_else(|| trimmed.as_bytes().to_vec());
@@ -200,9 +234,7 @@ fn load_secret() -> Result<Vec<u8>, String> {
 
 fn resolve_mode() -> Result<Mode, String> {
     match std::env::var("BADAPPLE_SLICKS2").as_deref() {
-        Ok("0" | "false" | "no" | "off" | "disable" | "disabled") => {
-            Ok(Mode::V1(load_secret()?))
-        }
+        Ok("0" | "false" | "no" | "off" | "disable" | "disabled") => Ok(Mode::V1(load_secret()?)),
         Ok("1" | "true" | "yes" | "on" | "enable" | "enabled") => {
             let pk = identity_public_key()
                 .ok_or("BADAPPLE_SLICKS2=1 requires a running identity agent")?;
@@ -255,7 +287,9 @@ pub fn query(prompt: &str, max_new_tokens: usize) -> Result<(String, Option<Valu
         return Err(format!("prompt exceeds the {MAX_PROMPT_BYTES}-byte limit"));
     }
     if !(1..=MAX_NEW_TOKENS).contains(&max_new_tokens) {
-        return Err(format!("max_new_tokens must be between 1 and {MAX_NEW_TOKENS}"));
+        return Err(format!(
+            "max_new_tokens must be between 1 and {MAX_NEW_TOKENS}"
+        ));
     }
     let mode = resolve_mode()?;
     let ts = now_ms();
@@ -313,8 +347,7 @@ pub fn query(prompt: &str, max_new_tokens: usize) -> Result<(String, Option<Valu
     let proof = ch.get("proof").and_then(Value::as_str).unwrap_or("");
     match &mode {
         Mode::V1(secret) => {
-            let material =
-                format!("BADAPPLE-SLICKS/{SLICKS_V1}|server|{ts}|{cnonce}|{snonce}");
+            let material = format!("BADAPPLE-SLICKS/{SLICKS_V1}|server|{ts}|{cnonce}|{snonce}");
             if !hmac_verify(secret, &material, proof) {
                 return Err("substrate failed server authentication".into());
             }
@@ -324,8 +357,7 @@ pub fn query(prompt: &str, max_new_tokens: usize) -> Result<(String, Option<Valu
                 .get("server_pubkey")
                 .and_then(Value::as_str)
                 .ok_or("v2 challenge missing server public key")?;
-            let material =
-                format!("BADAPPLE-SLICKS/{SLICKS_V2}|server|{ts}|{cnonce}|{snonce}");
+            let material = format!("BADAPPLE-SLICKS/{SLICKS_V2}|server|{ts}|{cnonce}|{snonce}");
             if !identity_verify(&material, proof, server_pubkey)? {
                 return Err("substrate failed v2 server authentication".into());
             }
@@ -406,7 +438,11 @@ pub fn query(prompt: &str, max_new_tokens: usize) -> Result<(String, Option<Valu
 
 /// JSON-RPC through the agent envelope — reaches `inference`,
 /// `invoke_tool`, `run_agent_task`, `audit_event`, `list_models`, …
-pub fn call_agent(method: &str, params: Option<Value>, max_new_tokens: usize) -> Result<Value, String> {
+pub fn call_agent(
+    method: &str,
+    params: Option<Value>,
+    max_new_tokens: usize,
+) -> Result<Value, String> {
     let mut req = serde_json::Map::new();
     req.insert("id".into(), Value::String("coyote-1".into()));
     req.insert("method".into(), Value::String(method.into()));

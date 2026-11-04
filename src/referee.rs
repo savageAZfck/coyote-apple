@@ -35,6 +35,7 @@ fn run_backend(file: &Path, dir: &Path, cpu: bool) -> Result<RunOut, String> {
     let _ = std::fs::remove_dir_all(dir);
     let mut vm = coyote::load_vm(file, dir, cpu, false, true)?;
     crate::mind::bind_all(&mut vm);
+    crate::peer::bind_all(&mut vm);
     let r = vm.run_main()?;
     let ret = vm.stringify(&r);
     let trace = vm
@@ -153,7 +154,10 @@ fn dispute(file: &Path, lie: Option<usize>, json: bool) -> Result<(), String> {
         if json {
             println!("{}", serde_json::to_string_pretty(&v).unwrap());
         } else {
-            println!("referee — consistent: silicon and CPU reference agree on all {} witness events", a.len());
+            println!(
+                "referee — consistent: silicon and CPU reference agree on all {} witness events",
+                a.len()
+            );
             println!("  chain: {}", &ca[..16]);
         }
         return Ok(());
@@ -173,13 +177,23 @@ fn dispute(file: &Path, lie: Option<usize>, json: bool) -> Result<(), String> {
         return Err(format!("substrate divergence at seq {seq}"));
     }
     println!("referee — witness chains split");
-    println!("  bisected {} events → first divergence at seq {seq} in {} rounds", a.len(), rounds.len());
+    println!(
+        "  bisected {} events → first divergence at seq {seq} in {} rounds",
+        a.len(),
+        rounds.len()
+    );
     for r in &rounds {
         println!(
             "  r{}: [{},{}) {} — {}",
-            r["round"], r["lo"], r["mid"],
+            r["round"],
+            r["lo"],
+            r["mid"],
             &r[pa].as_str().unwrap_or("?")[..12],
-            if r["agree"].as_bool().unwrap_or(false) { "agree" } else { "DIVERGE" }
+            if r["agree"].as_bool().unwrap_or(false) {
+                "agree"
+            } else {
+                "DIVERGE"
+            }
         );
     }
     println!("  silicon emitted: {ba}");
@@ -239,7 +253,8 @@ pub fn run(args: &[String]) -> Result<(), i32> {
     }
     let file = Path::new(first);
     let lie = args.iter().position(|a| a == "--lie").and_then(|i| {
-        args.get(i + 1).and_then(|s| s.trim_start_matches("seq:").parse::<usize>().ok())
+        args.get(i + 1)
+            .and_then(|s| s.trim_start_matches("seq:").parse::<usize>().ok())
     });
     let json = args.iter().any(|a| a == "--json");
     dispute(file, lie, json).map_err(|e| {

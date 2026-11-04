@@ -204,6 +204,7 @@ impl Session {
     fn load(file: &Path, out: &Path, cpu: bool, rebuild: bool) -> Result<Self, String> {
         let mut vm = load_vm(file, out, cpu, rebuild, false)?;
         mind::bind_all(&mut vm);
+        crate::peer::bind_all(&mut vm);
         let src = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
         Ok(Self {
             vm,
@@ -217,13 +218,15 @@ impl Session {
     fn bare(out: &Path) -> Result<Self, String> {
         // no file — session starts empty; scratch eval only. the ping fn
         // guarantees a host stratum so the VM can always be built.
-        let src = "// coyote-apple repl session\n\nhost fn __repl_ping() -> i64 {\n    return 0;\n}\n"
-            .to_string();
+        let src =
+            "// coyote-apple repl session\n\nhost fn __repl_ping() -> i64 {\n    return 0;\n}\n"
+                .to_string();
         let anchor = out.join("__repl_session.cy");
         let h = check_src(&anchor, &src)?;
         let host = h.host.ok_or("internal: no host stratum")?;
         let mut vm = Vm::new(&host, Vec::new(), &sha256_hex(src.as_bytes()))?;
         mind::bind_all(&mut vm);
+        crate::peer::bind_all(&mut vm);
         Ok(Self {
             vm,
             src,
@@ -479,6 +482,7 @@ fn shell(file: Option<&Path>, out: &Path, cpu: bool, rebuild: bool) -> Result<()
                     let host = h.host.ok_or("internal: no host stratum")?;
                     let mut vm = Vm::new(&host, Vec::new(), &sha256_hex(eval_src.as_bytes()))?;
                     mind::bind_all(&mut vm);
+                    crate::peer::bind_all(&mut vm);
                     let v = vm.call_fn(&format!("__repl_eval_{n}"), Vec::new())?;
                     println!("{}", vm.stringify(&v));
                 }

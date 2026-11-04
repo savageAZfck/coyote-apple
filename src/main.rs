@@ -36,21 +36,28 @@ mod diff;
 mod doc;
 mod emit;
 mod enc_ckks;
+mod fleet;
 mod fmt;
 mod genmask;
 mod gold;
 mod gpu_emit;
 mod gpu_rt;
 mod lsp;
+mod mesh;
 mod mind;
 mod new;
 mod oracle;
 mod package;
+mod pcc;
+mod peer;
 mod prof;
+mod ranknode;
 mod referee;
 mod registry;
 mod repl;
+mod replay;
 mod run;
+mod serve;
 mod shardize;
 mod spec;
 mod stfile;
@@ -58,6 +65,7 @@ mod substrate;
 mod test;
 mod watch;
 mod weights;
+mod wire;
 
 fn usage() {
     eprintln!("coyote-apple — internal profile of the coyote toolchain");
@@ -97,6 +105,10 @@ fn main() {
         coyote::ast::Target::Enc,
         std::sync::Arc::new(enc_ckks::EncBackend),
     );
+    // execution sites — `mesh fn` dispatches to treaty'd peers, `pcc fn`
+    // to attested nodes. Both ride the Bad Apple mesh wire (wire.rs).
+    mesh::register();
+    pcc::register();
     // every Vm-building verb binds the mind externs on the Vm it
     // constructs — run.rs / bench.rs / test.rs / oracle.rs / prof.rs
     // / repl.rs each call mind::bind_all before executing.
@@ -146,6 +158,10 @@ fn main() {
         // `run` is intercepted: the public pipeline builds the VM
         // internally, so organisms that declare `mind_*` externs need
         // this distribution to build (and bind) it instead.
+        "replay" => replay::run(&args[2..]).map_err(|e| {
+            eprintln!("replay: {e}");
+            1
+        }),
         "run" => run::run(&args[2..]),
         // `repl` is intercepted for the same reason — the public shell
         // builds its VMs internally; this distribution's copy binds
@@ -160,6 +176,68 @@ fn main() {
         "fmt" => fmt::run(&args[2..]),
         "pkg" => registry::run(&args[2..]),
         "shardize" => shardize::run(&args[2..]),
+        "meshnode" => {
+            let listen = args
+                .iter()
+                .position(|a| a == "--listen")
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:9711".into());
+            mesh::serve(&listen).map_err(|_| 1i32)
+        }
+        "pccnode" => {
+            let listen = args
+                .iter()
+                .position(|a| a == "--listen")
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:9722".into());
+            pcc::serve(&listen).map_err(|_| 1i32)
+        }
+        "peernode" => {
+            let listen = args
+                .iter()
+                .position(|a| a == "--listen")
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:9733".into());
+            let treaty = args
+                .iter()
+                .position(|a| a == "--treaty")
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+                .unwrap_or_else(|| "treaties.json".into());
+            let prog_dir = args
+                .iter()
+                .position(|a| a == "--programs")
+                .and_then(|i| args.get(i + 1))
+                .cloned();
+            peer::serve(&listen, &treaty, prog_dir.as_deref()).map_err(|_| 1i32)
+        }
+        "serve" => serve::serve(&args[2..]).map_err(|e| {
+            eprintln!("serve: {e}");
+            1i32
+        }),
+        "ask" => serve::ask(&args[2..]).map_err(|e| {
+            eprintln!("ask: {e}");
+            1i32
+        }),
+        "mind" => mind::mind(&args[2..]).map_err(|e| {
+            eprintln!("mind: {e}");
+            1i32
+        }),
+        "fleet" => fleet::fleet(&args[2..]).map_err(|e| {
+            eprintln!("fleet: {e}");
+            1i32
+        }),
+        "fleetcheck" => fleet::fleetcheck(&args[2..]).map_err(|e| {
+            eprintln!("fleetcheck: {e}");
+            1i32
+        }),
+        "ranknode" => ranknode::ranknode(&args[2..]).map_err(|e| {
+            eprintln!("ranknode: {e}");
+            1i32
+        }),
         "lsp" => lsp::run().map_err(|_| 1i32),
         _ => coyote::cli::run(&args),
     };

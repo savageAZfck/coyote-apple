@@ -158,8 +158,7 @@ pub fn run(args: &[String]) -> Result<(), i32> {
         // ship the program's source too — `import "name"` resolves
         // `name/mod.cy`, so the pack carries everything needed to
         // rebuild or re-namespace it downstream.
-        let (combined, _prog) =
-            coyote::parser::parse_file(&path).map_err(|d| d.to_string())?;
+        let (combined, _prog) = coyote::parser::parse_file(&path).map_err(|d| d.to_string())?;
         files.push(("mod.cy".to_string(), combined.into_bytes()));
         files.sort_by(|a, b| a.0.cmp(&b.0));
         if files.is_empty() {

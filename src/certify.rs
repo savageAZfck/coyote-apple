@@ -25,6 +25,7 @@ fn run_backend(file: &Path, dir: &Path, cpu: bool) -> Result<(Vec<String>, Strin
     let _ = std::fs::remove_dir_all(dir);
     let mut vm = coyote::load_vm(file, dir, cpu, false, true)?;
     crate::mind::bind_all(&mut vm);
+    crate::peer::bind_all(&mut vm);
     let r = vm.run_main()?;
     let ret = vm.stringify(&r);
     let trace = vm
@@ -152,7 +153,10 @@ fn check(cert_path: &Path) -> Result<(), String> {
         dev_ret == cpu_ret
             && dev_trace == cpu_trace
             && c_dev == claims["commitments"]["silicon"].as_str().unwrap_or("")
-            && c_cpu == claims["commitments"]["cpu_reference"].as_str().unwrap_or(""),
+            && c_cpu
+                == claims["commitments"]["cpu_reference"]
+                    .as_str()
+                    .unwrap_or(""),
     );
     if ok {
         println!("✓ certificate verified — all claims hold");

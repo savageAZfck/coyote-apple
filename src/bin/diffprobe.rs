@@ -15,7 +15,9 @@ use mil_infer::e5rt::DeviceMask;
 const MASKED: f32 = -10_000.0;
 
 fn f16v(bits: &[u16]) -> Vec<f32> {
-    bits.iter().map(|&b| half::f16::from_bits(b).to_f32()).collect()
+    bits.iter()
+        .map(|&b| half::f16::from_bits(b).to_f32())
+        .collect()
 }
 
 fn stats(name: &str, a: &[f32], b: &[f32]) {
@@ -40,11 +42,17 @@ fn stats(name: &str, a: &[f32], b: &[f32]) {
     );
     println!(
         "    cpu[..6]={:?}",
-        &a[..6.min(a.len())].iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>()
+        &a[..6.min(a.len())]
+            .iter()
+            .map(|v| format!("{v:.4}"))
+            .collect::<Vec<_>>()
     );
     println!(
         "    ane[..6]={:?}",
-        &b[..6.min(b.len())].iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>()
+        &b[..6.min(b.len())]
+            .iter()
+            .map(|v| format!("{v:.4}"))
+            .collect::<Vec<_>>()
     );
     for (i, d) in worst.iter().take(4) {
         println!("    worst @{i}: cpu={:.5} ane={:.5} d={d:.5}", a[*i], b[*i]);
@@ -60,7 +68,10 @@ fn top5(v: &[f32]) -> Vec<(usize, f32)> {
 fn main() -> Result<(), String> {
     let file = PathBuf::from(std::env::args().nth(1).expect("file.cy"));
     let dir = PathBuf::from(std::env::args().nth(2).expect("shard dir"));
-    let steps: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(4);
+    let steps: usize = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
 
     // ---------- CPU side: parse, emit plans, make evaluators ----------
     let (src, ast) = coyote::parser::parse_file(&file).map_err(|d| d.to_string())?;
@@ -106,12 +117,21 @@ fn main() -> Result<(), String> {
         for (_key, port, ty) in &out.states {
             sizes.insert(
                 port.clone(),
-                ty.dims.iter().map(|&d| d as usize).product::<usize>().max(1),
+                ty.dims
+                    .iter()
+                    .map(|&d| d as usize)
+                    .product::<usize>()
+                    .max(1),
             );
         }
-        println!("cpu: {name} ins={:?} states={:?}",
-            out.inputs.iter().map(|(p,_,_)| p.clone()).collect::<Vec<_>>(),
-            sizes.keys().collect::<Vec<_>>());
+        println!(
+            "cpu: {name} ins={:?} states={:?}",
+            out.inputs
+                .iter()
+                .map(|(p, _, _)| p.clone())
+                .collect::<Vec<_>>(),
+            sizes.keys().collect::<Vec<_>>()
+        );
         evals.push((ev, out));
         state_sizes.push(sizes);
     }
@@ -120,7 +140,8 @@ fn main() -> Result<(), String> {
     // memory-tight hosts: only the first head shard is resident — the
     // logits comparison runs on its vocab window.
     let heads: Vec<PathBuf> = manifest.heads.iter().take(1).cloned().collect();
-    let pipe = Pipeline::open(&manifest.layers, &heads, DeviceMask::Ane).map_err(|e| e.to_string())?;
+    let pipe =
+        Pipeline::open(&manifest.layers, &heads, DeviceMask::Ane).map_err(|e| e.to_string())?;
     let emb = std::fs::File::open(&manifest.embedding).map_err(|e| e.to_string())?;
     let half = manifest.rope_dim / 2;
     let inv_freq: Vec<f64> = (0..half)
@@ -131,16 +152,14 @@ fn main() -> Result<(), String> {
     let mut attn = vec![half::f16::from_f32(MASKED).to_bits(); attn_rows * seq];
     let mut kv_mask = vec![0u16; seq];
     pipe.reset_state().map_err(|e| e.to_string())?;
-    pipe.set_shared("attn_mask", &attn).map_err(|e| e.to_string())?;
-    pipe.set_shared("kv_write_mask", &kv_mask).map_err(|e| e.to_string())?;
+    pipe.set_shared("attn_mask", &attn)
+        .map_err(|e| e.to_string())?;
+    pipe.set_shared("kv_write_mask", &kv_mask)
+        .map_err(|e| e.to_string())?;
 
     let mut cpu_states: Vec<HashMap<String, Vec<f32>>> = state_sizes
         .iter()
-        .map(|m| {
-            m.iter()
-                .map(|(k, &n)| (k.clone(), vec![0f32; n]))
-                .collect()
-        })
+        .map(|m| m.iter().map(|(k, &n)| (k.clone(), vec![0f32; n])).collect())
         .collect();
 
     // embedding row width is independent of the probed fn's output shape
@@ -159,7 +178,9 @@ fn main() -> Result<(), String> {
             .chunks_exact(2)
             .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
             .collect();
-        let pos_f: Vec<f32> = (0..seq).map(|i| if i == step { 1.0 } else { 0.0 }).collect();
+        let pos_f: Vec<f32> = (0..seq)
+            .map(|i| if i == step { 1.0 } else { 0.0 })
+            .collect();
         let mask_f: Vec<f32> = (0..seq)
             .map(|j| if j <= step { 0.0 } else { MASKED })
             .collect();
@@ -207,10 +228,18 @@ fn main() -> Result<(), String> {
         // the slot buffer is sized by the op's output; `x` reads the
         // first emb_row bytes — write the row and leave the rest as-is.
         unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), slot as *mut u8, row.len()) };
-        let cos16: Vec<u16> = cos_f.iter().map(|v| half::f16::from_f32(*v).to_bits()).collect();
-        let sin16: Vec<u16> = sin_f.iter().map(|v| half::f16::from_f32(*v).to_bits()).collect();
-        pipe.set_shared("rope_cos", &cos16).map_err(|e| e.to_string())?;
-        pipe.set_shared("rope_sin", &sin16).map_err(|e| e.to_string())?;
+        let cos16: Vec<u16> = cos_f
+            .iter()
+            .map(|v| half::f16::from_f32(*v).to_bits())
+            .collect();
+        let sin16: Vec<u16> = sin_f
+            .iter()
+            .map(|v| half::f16::from_f32(*v).to_bits())
+            .collect();
+        pipe.set_shared("rope_cos", &cos16)
+            .map_err(|e| e.to_string())?;
+        pipe.set_shared("rope_sin", &sin16)
+            .map_err(|e| e.to_string())?;
         let z = 0u16;
         for r in 0..attn_rows {
             attn[r * seq + step] = z;
@@ -219,8 +248,10 @@ fn main() -> Result<(), String> {
             kv_mask[step - 1] = 0;
         }
         kv_mask[step] = half::f16::from_f32(1.0).to_bits();
-        pipe.set_shared("attn_mask", &attn).map_err(|e| e.to_string())?;
-        pipe.set_shared("kv_write_mask", &kv_mask).map_err(|e| e.to_string())?;
+        pipe.set_shared("attn_mask", &attn)
+            .map_err(|e| e.to_string())?;
+        pipe.set_shared("kv_write_mask", &kv_mask)
+            .map_err(|e| e.to_string())?;
         pipe.step().map_err(|e| e.to_string())?;
 
         println!("== step {step} tok {tok}");
@@ -234,17 +265,21 @@ fn main() -> Result<(), String> {
                 }
             }
             for st in ["kv_k0lo", "kv_v0lo", "kv_k0hi"] {
-                if let (Some(abits), Some(cst)) = (
-                    pipe.state_f16(li, st),
-                    cpu_states[li].get(st),
-                ) {
+                if let (Some(abits), Some(cst)) = (pipe.state_f16(li, st), cpu_states[li].get(st)) {
                     stats(&format!("layer_{li:02} {st}"), cst, &f16v(&abits));
                 }
             }
         }
         let ane_logits = f16v(&pipe.logits());
-        stats("logits[0..37984]", &cpu_logits[..ane_logits.len().min(cpu_logits.len())], &ane_logits);
-        println!("    cpu top5 {:?}", top5(&cpu_logits[..ane_logits.len().min(cpu_logits.len())]));
+        stats(
+            "logits[0..37984]",
+            &cpu_logits[..ane_logits.len().min(cpu_logits.len())],
+            &ane_logits,
+        );
+        println!(
+            "    cpu top5 {:?}",
+            top5(&cpu_logits[..ane_logits.len().min(cpu_logits.len())])
+        );
         println!("    ane top5 {:?}", top5(&ane_logits));
         tok = cpu_logits[..ane_logits.len().min(cpu_logits.len())]
             .iter()

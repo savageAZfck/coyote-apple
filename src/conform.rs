@@ -98,20 +98,19 @@ pub fn run(args: &[String]) -> Result<(), i32> {
     };
     let r = (|| -> Result<(), String> {
         let cy = Path::new(file);
-        let terms = parse_protocol(
-            &std::fs::read_to_string(proto_path).map_err(|e| e.to_string())?,
-        )?;
+        let terms =
+            parse_protocol(&std::fs::read_to_string(proto_path).map_err(|e| e.to_string())?)?;
         // execute on silicon — the committed witness chain is the session trace
         let dir = std::env::temp_dir().join(format!("cyconform-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut vm = coyote::load_vm(cy, &dir, false, false, true)?;
         crate::mind::bind_all(&mut vm);
-        let ret = vm.run_main().map(|r| vm.stringify(&r)).unwrap_or_else(|e| e);
-        let tags: Vec<String> = vm
-            .witness_log()
-            .iter()
-            .map(|e| e.tag.clone())
-            .collect();
+        crate::peer::bind_all(&mut vm);
+        let ret = vm
+            .run_main()
+            .map(|r| vm.stringify(&r))
+            .unwrap_or_else(|e| e);
+        let tags: Vec<String> = vm.witness_log().iter().map(|e| e.tag.clone()).collect();
         let verdict = match match_protocol(&terms, &tags) {
             Ok(consumed) if consumed == tags.len() => Ok("conformant"),
             Ok(consumed) => Err(format!(

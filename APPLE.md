@@ -269,6 +269,106 @@ covers every imported file, so `audit` fingerprints the stdlib too.
   added/removed/changed, `~` lines carry both hash prefixes. The
   receipt for "what did this edit actually change."
 
+## the sites — substrate × execution location
+
+Compute targets answer *what* runs the math; **sites** answer *where*.
+`Site` is a second dimension on every tensor `fn` — the same typed
+program, the same io plan, the same witness semantics — dispatched by
+execution location through registered site backends:
+
+| site | syntax | where it runs | posture |
+|---|---|---|---|
+| local | `fn`, `gpu fn`, `enc fn` | this machine | resident backends |
+| mesh | `mesh fn`, `mesh gpu fn` | a treaty'd peer | mesh wire: HMAC `mb-c`/`mb-s` auth, AES-256-GCM packets |
+| pcc | `pcc fn`, `pcc enc fn` | an attested node | attest-before-secrets, signed results |
+
+The grammar carries `Site` on `Fn`/`TProgram`; the `emit` output is a
+dispatch manifest plus the program source; `load` binds to a node over
+`wire.rs` — a byte-exact port of the Bad Apple mesh-brain protocol
+(`[u32 BE jsonLen][json][payload]`, sealed = `nonce‖GCM(inner)‖tag`,
+secret ≥32B, AES key = SHA-256(secret)). A `coyote-apple` node and a
+Bad Apple rank server speak the same packets.
+
+- **meshnode** — serves `bind`/`exec`/`ping`/`reset` against the
+  resident evaluator. `exec` payload = declared ins concatenated f32;
+  `result` returns the output + `witness` entries.
+- **pccnode** — adds `attest`: the client receives a nonce-bound
+  manifest (`node`, `build`, `caps`, `sig` = HMAC(secret,
+  `pcc-attest:nonce`)) and verifies it **before** the program or any
+  tensor crosses — verify-before-secrets. Every `result` carries
+  `sig` = HMAC(secret, `pcc-result:nonce:sha256(payload)`), checked
+  client-side. Loopback attestation class is software-grade by design;
+  the manifest shape is what a hardware quote plugs into later.
+- **enc×pcc** — `pcc enc fn` encrypts inputs client-side (LWE), ships
+  Ct quads (4×u64 LE per lane: `a‖b‖noise‖scale`), the node evaluates
+  through `enc_ckks::run_ciphertext` in the ciphertext domain, and the
+  client decrypts. The node never sees plaintext; the client never
+  sees remote weights. This is the CHET posture as a language stratum.
+- **witness across the wire** — `BackendExec::drain_remote()` hands the
+  node's per-exec witness entries to the VM, which appends them to its
+  own hash-chained log in dispatch order. One computation, N nodes,
+  one ledger — the chain a `referee`/`certify` replay covers is the
+  whole computation, not just the local half.
+- **treaty/peer** — `treaty name { allow …; deny … }` is a program
+  decl; `peer` is a handle type; `peer_connect` performs the mesh
+  handshake then the *treaty exchange*: both sides ship allow/deny
+  sets and the connection binds to the intersection minus either
+  side's denies. `peer_call` re-gates the verb against that bound law
+  before a byte moves. All `peer_*` externs carry `cap treaty`.
+- **shardize --world N** — contiguous layer split across N ranks:
+  `rank{i}/` dirs (layer shards + head iff last rank + embedding iff
+  rank 0), per-rank `shard.json` in the bad_apple `ShardSpec` schema
+  (rank/world/host/next_host/layer bounds/ownership flags), and a
+  top-level `world.json` naming the wire (`badapple-mesh/1`) and auth.
+- **mesh fn vs. world** — the two mesh surfaces are different layers:
+  `mesh fn` ships a *program* to a peer's evaluator; `--world` shards
+  *weights* into bad_apple-compatible rank dirs a mesh serves natively.
+
+`demo/five_strata.sh` runs all five strata live: three nodes, one
+organism, one hash chain that records what every machine did.
+
+## the serving tier — `serve` / `ask`
+
+`coyote-apple serve --world world.json` fronts a rank pipeline as a
+session-managed inference daemon — the multi-client layer above the
+single-stream substrate. Clients speak the same wire as ranks (auth +
+AES-GCM); sessions pin KV **lanes** on the ranks via `frame.lane`, the
+lane pool *is* admission control (exhausted → `busy`), rank-0 transport
+failover retries onto the next candidate, and every request/response
+lands on a hash-chained witness journal tagged `session:lane:bytes`.
+`coyote-apple ask` is the client.
+
+### `ranknode` — a weight-carrying rank on the Neural Engine
+
+`coyote-apple ranknode --shard <dir>` is the rank the mesh was built
+for: it loads a `shardize --world` rank directory through
+`mil_infer::ane_pipeline::Pipeline` — the same `model.mil` graphs,
+compiled onto the ANE. KV lives in the graphs' resident state buffers;
+`--lanes N` spawns N independent pipelines so concurrent sessions hold
+isolated decode state. `generate` takes an i32 token-id payload *or*
+prompt text (auto-discovers `tokenizer.json` in the shard dir, or
+`--tokenizer`); results carry both the id payload and decoded `text`.
+Every step/generate writes rank-side witness entries (`rank-step` /
+`rank-generate` with rank:lane:pos) that land on the caller's witness
+chain — the serving path is as auditable as the exec path. Verified:
+two ranks decoding real tokens across the wire, sessions on separate
+lanes, LRU lane reaping, admission `busy` on true exhaustion.
+
+## the organ library — `lib/badapple/`
+
+Bad Apple's organ layer, in the language: 29 `.cy` ports folded in from
+the organism repo — `mesh_brain.cy` (wire client + shard tools),
+`p2p.cy`, `cert.cy`, `ledger.cy`, `protocol.cy`, `config.cy`,
+`scavenger.cy`, `slicks.cy`, `vault.cy`, `ify.cy`, `firewall.cy`,
+`cage.cy`, `sentinel.cy`, `watcher.cy`, `mcp.cy`, `cli.cy`, `sys.cy`,
+`strlib.cy`, `blueprint.cy`, `strategy.cy`, `layer.cy`, `mil.cy`,
+`org_policy.cy`, `puf_challenge.cy`, `referee_drift.cy`,
+`referee_match.cy`, `benchmark.cy`, `mesh_sync.cy`, and
+`badapple_organs.cy` — the five-organ fusion (axon reflex, akicita
+marshal, macuahuitl firewall, tokala council, camazotz erasure)
+compiled into one organism whose witness chain *is* the audit ledger.
+All check-clean; `import "badapple/x.cy"` resolves through `lib/`.
+
 ## integration map
 
 Nothing here is gated, stubbed, or "coming." Where internal capability
@@ -281,3 +381,6 @@ plugs in later, it plugs into existing seams:
   entitlement-backed residency is a load flag, not a redesign.
 - **signing** — `audit` produces the chain; a platform signature wraps
   the head hash. The manifest format is already the birth certificate.
+- **attestation** — `pcc` nodes answer `attest` with a nonce-bound,
+  treaty-signed manifest today; a hardware quote plugs into the same
+  `attestation()` seam without touching the language or the wire.

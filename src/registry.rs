@@ -87,7 +87,11 @@ fn list(json_out: bool) -> Result<(), String> {
                 "  {:<24} {} file{}  {}",
                 p["name"].as_str().unwrap_or("?"),
                 p["files"].as_u64().unwrap_or(0),
-                if p["files"].as_u64() == Some(1) { "" } else { "s" },
+                if p["files"].as_u64() == Some(1) {
+                    ""
+                } else {
+                    "s"
+                },
                 p["path"].as_str().unwrap_or(""),
             );
         }
@@ -116,12 +120,7 @@ fn search(q: &str) -> Result<(), String> {
         .cloned()
         .unwrap_or_default()
         .into_iter()
-        .filter(|p| {
-            p["name"]
-                .as_str()
-                .map(|n| n.contains(q))
-                .unwrap_or(false)
-        })
+        .filter(|p| p["name"].as_str().map(|n| n.contains(q)).unwrap_or(false))
         .collect();
     for p in &hits {
         println!("  {}", p["name"].as_str().unwrap_or("?"));

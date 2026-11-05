@@ -380,3 +380,29 @@ identical argmax, identical born-on-chip weights).
 - ANE execution throughput is program-load bound (~128 resident cap);
   CPU is the throughput path, ANE is the sovereign-silicon proof.
   Graph fusion is the known next lever, not a blocker to the claim.
+
+### ANE execution wall — measured (session 4 cont.)
+- **Compile coverage proven**: all 6 programs / ~135k node-programs
+  for d=512/L=4 compile (~2min total after the needs_grad fix).
+- **Execution probe results** (bounded epoch=1/pos=1 organism):
+  - train_l3 (22,553 nodes): reached node 19,304 (~86%) before dying
+  - train_head (2,281 nodes): reached node ~91 on retry
+  - d=64/L=1 train_l0 (7,325 nodes) — **previously ran the full
+    curriculum on ANE — now fails at node ~288**
+- **Root cause is environmental, not graph size**: kern.num_vnodes is
+  pinned at maxvnodes (250,688) system-wide after ~127k emitted
+  per-node .macho files; `issueSandboxExtensionForPath: file access
+  failure` / `loadModel failed: unknown|no memory` are the vnode +
+  aned quota exhausting. Confirmed by the d=64 regression failing —
+  the same organism that trained on ANE hours earlier.
+- `ensure` eviction now also retries on "no memory"/"resource"
+  strings (was matching only the stale "no ANE resources" phrasing).
+- `ESP_CLIENT=new` per-load clients fail instantly at scale
+  (`_ANEClient connection nil`) — sharedConnection is the only viable
+  path; per-node file loading is the structural ceiling.
+- **The real fix is fusion**: multi-op HWX programs collapse ~1000
+  node-loads into one — removes the vnode/sandbox/quota wall AND the
+  94% load-time overhead in one move. Deferred, now proven necessary.
+- Recovery path: reboot or `sudo purge` should restore ANE execution
+  (vnode cache reclaim); verified earlier-today ANE runs stand in the
+  archived witness set (/tmp/brain_witness_archive/witnesses.tgz).

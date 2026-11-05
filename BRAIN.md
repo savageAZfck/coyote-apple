@@ -481,3 +481,36 @@ Honest read: predictions are near-random — this is a 1-step bounded
 probe on fresh weights. The claim is **execution at scale on ANE**,
 not intelligence; learning signal comes from the CPU throughput path
 (chunked BCD) and longer curricula — Phase 3 work.
+
+### Session 6 — own tokenizer + GPU gradient path unblocked
+
+**Tokenized curriculum (`7ecea43`).** `gen_brain --bpe-vocab N` trains
+an own byte-level BPE on `--text` itself (`tokenizer.json` next to
+`--out`); `--tokenizer <json>` loads one. Vocab becomes the
+tokenizer's size; `cemb`/`seq`/`tgts` build over ids identically.
+Verified: BRAIN.md → own BPE vocab 1772 → trains + generates in-vocab.
+The `dmodel<=1024` assert is now synthetic-mode-only — text-mode
+brains exceed d=1024 on CPU (no tile table off-ANE).
+
+**GPU training (`bde7048`).** `gpu fn` on *train* programs now emits
+and runs on Metal — first mixed-substrate training run:
+`--gpu forward,train_head` → Metal kernels compute head grads
+(lmh is the largest gradient at big vocab) while `train_l0` runs
+7325 nodes on ANE; witness chained, organism returned.
+
+Four gpu_emit fixes, all correctness (mirroring eval semantics):
+- `orig_scopes` — scopes keep pre-scratch-rebind rhs; `back`/`can_grad`
+  see the expr DAG, `gen` keeps buffer reads. Was: every
+  reduction-valued let read as opaque buffer → "loss does not depend".
+- `resolve_limit`/`gen_limit` split — deep backward limits were hiding
+  later lets from adjoint-closure `gen` ("unbound tensor f0").
+- `back` block walk accepts `StateUpdate`/`Expr` — eval ignores
+  non-let stmts in backward; state writes are primal side effects.
+- M3b guard removed — matmuls with state-field rhs (`q @ kv.k.T`)
+  now emit the lhs adjoint only; `rhs_read` already handled the reads.
+
+**Remaining wall for full-network GPU train:** Metal's 31-buffer cap
+per kernel — d64/L1 needs ~45. Next lever is buffer pooling /
+argument buffers / fusion (the same lever as ANE program-load bound).
+Until then: `--gpu` tags pick which fns live on Metal; CPU eval is
+the full-network training path.

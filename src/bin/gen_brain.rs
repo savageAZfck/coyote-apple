@@ -28,6 +28,8 @@ struct Spec {
     text: Option<String>,
     corpus_len: usize,
     gpu_fns: Vec<String>,
+    tokenizer: Option<String>,
+    bpe_vocab: usize,
 }
 
 fn arg<T: std::str::FromStr>(args: &[String], flag: &str, cur: &mut T) {
@@ -75,6 +77,8 @@ fn main() {
         text: None,
         corpus_len: 8192,
         gpu_fns: Vec::new(),
+        tokenizer: None,
+        bpe_vocab: 0,
     };
     arg(&args, "--layers", &mut s.layers);
     arg(&args, "--dmodel", &mut s.dmodel);
@@ -97,6 +101,10 @@ fn main() {
     if let Some(i) = args.iter().position(|a| a == "--text") {
         s.text = args.get(i + 1).cloned();
     }
+    if let Some(i) = args.iter().position(|a| a == "--tokenizer") {
+        s.tokenizer = args.get(i + 1).cloned();
+    }
+    arg(&args, "--bpe-vocab", &mut s.bpe_vocab);
     let out = args
         .iter()
         .position(|a| a == "--out")
@@ -112,21 +120,101 @@ fn main() {
         .display()
         .to_string();
 
-    // text mode: byte-level curriculum — vocab is the byte range, the
-    // corpus supplies seq/tgts/cemb tensors instead of the synthetic
-    // position-ordinal drill.
-    let toks: Option<Vec<u8>> = s.text.as_ref().map(|p| {
+    // tokenized curriculum: --tokenizer <json> loads a BPE;
+    // --bpe-vocab N trains an own byte-level BPE on --text itself
+    // (tokenizer.json lands next to --out). Either switches the
+    // curriculum from bytes to subword ids — vocab becomes the
+    // tokenizer's size and cemb/seq/tgts are built over ids the same
+    // way bytes were.
+    let mut tok_vocab = 0usize;
+    let bpe_tok: Option<tokenizers::Tokenizer> =
+        if s.tokenizer.is_some() || s.bpe_vocab > 0 {
+            let p = s
+                .text
+                .as_deref()
+                .expect("--tokenizer/--bpe-vocab require --text");
+            if let Some(tp) = &s.tokenizer {
+                let t = tokenizers::Tokenizer::from_file(tp)
+                    .unwrap_or_else(|e| panic!("load tokenizer {tp}: {e}"));
+                tok_vocab = t.get_vocab_size(true);
+                Some(t)
+            } else {
+                use tokenizers::models::bpe::{BpeTrainerBuilder, BPE};
+                use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+                use tokenizers::TokenizerBuilder;
+                let mut trainer = BpeTrainerBuilder::new()
+                    .vocab_size(s.bpe_vocab.max(256))
+                    .min_frequency(2)
+                    .show_progress(false)
+                    .build();
+                let mut t = TokenizerBuilder::new()
+                    .with_model(BPE::default())
+                    .with_normalizer(Some(tokenizers::normalizers::Sequence::new(
+                        vec![],
+                    )))
+                    .with_pre_tokenizer(Some(ByteLevel::default()))
+                    .with_post_processor(Some(
+                        tokenizers::processors::byte_level::ByteLevel::default(),
+                    ))
+                    .with_decoder(Some(
+                        tokenizers::decoders::byte_level::ByteLevel::default(),
+                    ))
+                    .build()
+                    .expect("build bpe tokenizer");
+                t.train_from_files(&mut trainer, vec![p.to_string()])
+                    .expect("train bpe");
+                tok_vocab = t.get_vocab_size(true);
+                let tp = format!(
+                    "{}.tokenizer.json",
+                    out.strip_suffix(".cy").unwrap_or(&out)
+                );
+                t.save(&tp, false).expect("save tokenizer");
+                eprintln!("trained own BPE vocab {tok_vocab} → {tp}");
+                Some(t.into())
+            }
+        } else {
+            None
+        };
+    let toks: Option<Vec<u32>> = if let Some(tk) = &bpe_tok {
+        let p = s.text.as_deref().unwrap();
         let bytes = std::fs::read(p).unwrap_or_else(|e| panic!("read {p}: {e}"));
-        assert!(bytes.len() >= 2, "text corpus needs >= 2 bytes");
-        bytes
-            .into_iter()
-            .take(s.corpus_len + 1)
-            .collect::<Vec<u8>>()
-    });
+        let text = String::from_utf8_lossy(&bytes);
+        let enc = tk
+            .encode(text.as_ref(), false)
+            .unwrap_or_else(|e| panic!("encode {p}: {e}"));
+        Some(
+            enc.get_ids()
+                .iter()
+                .take(s.corpus_len + 1)
+                .map(|&i| i as u32)
+                .collect(),
+        )
+    } else {
+        s.text.as_ref().map(|p| {
+            let bytes = std::fs::read(p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+            assert!(bytes.len() >= 2, "text corpus needs >= 2 bytes");
+            bytes
+                .into_iter()
+                .take(s.corpus_len + 1)
+                .map(|b| b as u32)
+                .collect::<Vec<u32>>()
+        })
+    };
     if toks.is_some() {
-        s.vocab = 256;
+        s.vocab = if tok_vocab > 0 { tok_vocab } else { 256 };
     }
     let n_corpus = toks.as_ref().map_or(0usize, |t| t.len() - 1);
+    if let Some(t) = &toks {
+        let n = t.len() - 1;
+        assert!(
+            n * s.vocab <= 67_000_000,
+            "tgts one-hot table too large ({n} x {} = {} elems ~{}MB) — \
+             lower --corpus-len or --bpe-vocab",
+            s.vocab,
+            n * s.vocab,
+            n * s.vocab * 4 / (1 << 20)
+        );
+    }
     // chunked block-coordinate rounds: each round gives every train
     // program a `chunk`-epoch residency streak (no per-step program
     // switches → ANE programs stay loaded), while rounds preserve
@@ -149,10 +237,12 @@ fn main() {
             "vocab must be <= seq_len (gen gather)"
         );
     }
-    assert!(
-        s.dmodel <= 1024,
-        "dmodel > 1024 exceeds the qwen3-0.6b embed slice"
-    );
+    if toks.is_none() {
+        assert!(
+            s.dmodel <= 1024,
+            "dmodel > 1024 exceeds the qwen3-0.6b embed slice"
+        );
+    }
 
     if s.head_dim == 0 {
         s.head_dim = s.dmodel;

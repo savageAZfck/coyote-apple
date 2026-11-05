@@ -458,3 +458,26 @@ programs, 9.4 GiB**, ~2.5 min compile, zero guard trips (file table
 ~4k/122k, disk 23→12 GiB, mem ~50% free). Bounded execution
 (epochs=1/positions=1/rounds=1) in flight — the first ANE *run* at
 this scale.
+
+### d=512/L=4 ANE execution — LANDED (session 5 cont.)
+
+The bounded probe ran to completion on the Neural Engine — the
+first d=512/L=4 organism to *execute* on ANE, not just compile:
+
+| program | nodes | ensure (loads) | eval | pred vs want 32 |
+|---|---|---|---|---|
+| train_l0 | 43,613 | 132.8s (41,222 loads) | 7.9s | 34 |
+| train_l1 | 36,593 | 117.0s (34,462) | 6.6s | 34 |
+| train_l2 | 29,573 | 83.5s (27,702) | 4.9s | 255 |
+| train_l3 | 22,553 | 61.8s (20,942) | 3.7s | 28 |
+| train_head | 2,281 | 7.0s (2,108) | 0.4s | 255 |
+| forward ×8 | 757 | ~1.7s each | ~0.13s | gen toks all 255 |
+
+Witness: **15/15 chained, 0 broken** (born → 5 train preds → 8 gen
+toks → done). Receipts preserved at `/tmp/brain_receipts/`;
+127k regenerable `.macho` payloads cleaned (9.4 GiB reclaimed).
+
+Honest read: predictions are near-random — this is a 1-step bounded
+probe on fresh weights. The claim is **execution at scale on ANE**,
+not intelligence; learning signal comes from the CPU throughput path
+(chunked BCD) and longer curricula — Phase 3 work.

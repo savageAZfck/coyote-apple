@@ -27,6 +27,7 @@ struct Spec {
     rounds: usize,
     text: Option<String>,
     corpus_len: usize,
+    gpu_fns: Vec<String>,
 }
 
 fn arg<T: std::str::FromStr>(args: &[String], flag: &str, cur: &mut T) {
@@ -73,6 +74,7 @@ fn main() {
         rounds: 6,
         text: None,
         corpus_len: 8192,
+        gpu_fns: Vec::new(),
     };
     arg(&args, "--layers", &mut s.layers);
     arg(&args, "--dmodel", &mut s.dmodel);
@@ -87,6 +89,11 @@ fn main() {
     arg(&args, "--epochs", &mut s.epochs);
     arg(&args, "--corpus-len", &mut s.corpus_len);
     arg(&args, "--rounds", &mut s.rounds);
+    if let Some(i) = args.iter().position(|a| a == "--gpu") {
+        if let Some(v) = args.get(i + 1) {
+            s.gpu_fns = v.split(',').map(|x| x.trim().to_string()).collect();
+        }
+    }
     if let Some(i) = args.iter().position(|a| a == "--text") {
         s.text = args.get(i + 1).cloned();
     }
@@ -265,7 +272,18 @@ fn main() {
     }
 
     // forward signature
-    w!("fn forward(");
+    // cross-substrate partition: --gpu <fn,...> tags programs `gpu fn`
+    // (Metal backend) while the rest stay `fn` (ANE). Params/states
+    // flow through host tensors so every partition sees identical
+    // weights — one model, split across silicon.
+    let kw = |name: &str| {
+        if s.gpu_fns.iter().any(|g| g == name) {
+            "gpu fn"
+        } else {
+            "fn"
+        }
+    };
+    w!(&format!("{} forward(", kw("forward")));
     w!(&format!(
         "    x: f16[{d}], pos: f16[{sq}], mask: f16[{sq}],"
     ));
@@ -341,7 +359,7 @@ fn main() {
     w!("// teacher-forced step: forward + adam on this layer's params.");
     let fw = "forward(x, pos, mask, cos, sin)";
     for l in 0..l_n {
-        w!(&format!("fn train_l{l}("));
+        w!(&format!("{} train_l{l}(", kw(&format!("train_l{l}"))));
         w!(&format!(
             "    x: f16[{d}], pos: f16[{sq}], mask: f16[{sq}],"
         ));
@@ -374,7 +392,7 @@ fn main() {
         w!("");
     }
     w!("// head step: final norm + logit head.");
-    w!("fn train_head(");
+    w!(&format!("{} train_head(", kw("train_head")));
     w!(&format!(
         "    x: f16[{d}], pos: f16[{sq}], mask: f16[{sq}],"
     ));

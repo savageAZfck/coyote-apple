@@ -84,7 +84,7 @@ host det fn main() -> i64 {
 EOF
 
 echo "━━━ starting nodes (auth + AES-256-GCM wire) ━━━"
-"$BIN" meshnode --listen 127.0.0.1:9711 > "$OUT/meshnode.log" 2>&1 &
+"$BIN" meshnode --listen 127.0.0.1:9755 > "$OUT/meshnode.log" 2>&1 &
 MESH_PID=$!
 "$BIN" pccnode --listen 127.0.0.1:9722 > "$OUT/pccnode.log" 2>&1 &
 PCC_PID=$!
@@ -97,7 +97,7 @@ cat "$OUT/meshnode.log" "$OUT/pccnode.log" "$OUT/peernode.log"
 
 echo
 echo "━━━ mesh + pcc + treaty strata ━━━"
-COYOTE_MESH_HOST=127.0.0.1:9711 COYOTE_PCC_HOST=127.0.0.1:9722 \
+COYOTE_MESH_HOST=127.0.0.1:9755 COYOTE_PCC_HOST=127.0.0.1:9722 \
     "$BIN" run "$OUT/organism.cy" -o "$OUT/build_org" || true
 
 echo

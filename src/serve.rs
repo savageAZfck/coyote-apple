@@ -536,7 +536,13 @@ pub fn ask(args: &[String]) -> Result<(), String> {
     } else {
         // first non-flag arg that isn't a flag's value.
         let flags: Vec<&str> = vec![
-            "--to", "--session", "--max-tokens", "--temp", "--top-p", "--lane", "--serve",
+            "--to",
+            "--session",
+            "--max-tokens",
+            "--temp",
+            "--top-p",
+            "--lane",
+            "--serve",
         ];
         let mut prompt = None;
         let mut skip = false;

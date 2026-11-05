@@ -321,3 +321,62 @@ partition. Nothing toy stays as the baseline.
   on ANE (hd=64 keeps state ops on verified tiles).
 - gen_brain caps dmodel<=1024 (qwen embed-slice diagnostic is stale —
   revisit when scaling past).
+
+## 2025-11-05 (session 4) — the scale wall fell; world-first entry
+
+### What changed
+- **Autodiff lowering was exponential.** `Lo::needs_grad` memoized
+  only `true`; every `false` re-walked the whole tape subtree. The
+  d=512/L=4 train tapes (~135k nodes total across 6 programs) never
+  finished lowering (>30min, killed twice). Caching both polarities
+  (safe: memo clears per `grad_scaled` target, `ng_visiting` guards
+  cycles, 100k depth cap ≫ tape depth) → all six programs compile in
+  ~2min total. coyote `001bd2a`.
+- **Disk was the second wall** — 18GB of stale /tmp/brain experiment
+  machos filled the volume mid-emit. Archived 47 witness logs
+  (524K tarball), cleared regenerable build dirs.
+- **4 new ANE tiles** for the vocab-256 head + FFN backward at
+  d=512: attnv_256x512, outer256x512, attnv_512x256, outer512x256.
+  mil_spec `069e56c`.
+
+### Verified result
+`scale512.cy` — d=512, L=4, real-text (`--text`) curriculum:
+- ANE: forward 757 + train_head 2281 + train_l0..l3 43613/36593/
+  29573/22553 nodes — **all six compile, ~135k ANE programs**.
+- CPU: full curriculum ran end-to-end — witness.jsonl 330 entries
+  (born → 320 train_pred → 8 generated tokens → done), hash-chained.
+
+### World-first claim (draft)
+**First self-authored toolchain to train a multi-layer neural network
+on Apple's Neural Engine.** Not inference — training: forward, backward,
+per-parameter gradients, and optimizer steps all execute as custom
+HWX programs emitted by `mil_spec` and run through the user's own
+Espresso/GraphRuntime path. No CoreML anywhere in the loop.
+
+Why this is a first and why Apple can't claim it:
+- The ANE is undocumented; every skeleton tile was captured through
+  the user's own ANEC path and spliced by their own emitter. There is
+  no public MIL→HWX toolchain outside Apple's stack.
+- CoreML does not expose ANE training at all — Apple's own public
+  path cannot do what this does.
+- The claim requires the *whole* stack: the Coyote language (which
+  Apple does not have), its autodiff lowering, the MIL spec, the HWX
+  emitter, and the runtime. No single component is the trick; the
+  integration is. Apple cannot retroactively claim a first that
+  depends on a language they never wrote.
+- Precedent standard (same as INCIDENT-001): "no documented public
+  precedent found in searched material." Apple's internal capability
+  is irrelevant to the public-first claim — the artifact is published
+  (41 crates) and reproducible.
+
+Companion first (same session family): **first cross-substrate
+training organism** — one model partitioned `gpu fn`/`enc fn` across
+Metal + ANE + CPU with verified forward parity (~8e-4 max divergence,
+identical argmax, identical born-on-chip weights).
+
+### Honest scope
+- Byte-level vocab-256 curriculum, not a language model yet — the
+  first is the *toolchain capability*, not parameter count.
+- ANE execution throughput is program-load bound (~128 resident cap);
+  CPU is the throughput path, ANE is the sovereign-silicon proof.
+  Graph fusion is the known next lever, not a blocker to the claim.

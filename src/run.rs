@@ -29,6 +29,10 @@ pub fn run(args: &[String]) -> Result<(), i32> {
         .windows(2)
         .find(|w| w[0] == "--resume")
         .map(|w| PathBuf::from(&w[1]));
+    let export = args
+        .windows(2)
+        .find(|w| w[0] == "--export")
+        .map(|w| PathBuf::from(&w[1]));
 
     let r = (|| -> Result<(), String> {
         let mut vm = coyote::load_vm(&file, &dir, use_cpu, rebuild, false)?;
@@ -58,6 +62,15 @@ pub fn run(args: &[String]) -> Result<(), i32> {
                 vm.witness_log().len(),
                 dir.join("witness.jsonl").display()
             );
+        }
+        if let Some(ep) = &export {
+            // checkpoint export — every declared `param` global lands
+            // in one safetensors, in the layout `param @ "src"` loads,
+            // ready for `milc convert`.
+            let snap = vm.params_snapshot();
+            let bytes = crate::stfile::safetensors_multi(&snap);
+            std::fs::write(ep, &bytes).map_err(|e| e.to_string())?;
+            println!("  exported {} tensors → {}", snap.len(), ep.display());
         }
         Ok(())
     })();

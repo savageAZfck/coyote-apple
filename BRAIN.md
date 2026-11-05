@@ -406,3 +406,55 @@ identical argmax, identical born-on-chip weights).
 - Recovery path: reboot or `sudo purge` should restore ANE execution
   (vnode cache reclaim); verified earlier-today ANE runs stand in the
   archived witness set (/tmp/brain_witness_archive/witnesses.tgz).
+
+## 2025-11-05 (session 5) — execution restored; partitioner gated; guard corrected
+
+### Post-incident recovery (all verified, not assumed)
+
+- **d=64/L=1 full ANE curriculum re-ran end-to-end after reboot**:
+  8 epochs × 8 positions through train_l0 (7,325 nodes, ~19 s/step —
+  94% program-load bound as measured), train_head interleaved, 8
+  generated tokens through `cemb[argmax]`, witness **138/138 chained,
+  0 broken** → `/tmp/brain_work/d64_ane/witness.jsonl`.
+- **The vnode diagnosis was wrong.** `kern.num_vnodes ==
+  kern.maxvnodes` (250,604) is *steady state* on 16 GiB hosts — the
+  kernel recycles the cache continuously; it carries no exhaustion
+  signal. The real killers during the incident were disk = 0, the
+  system open-file table (`kern.num_files`/`maxfiles` → ENFILE, the
+  literal error that killed `identity.sekey`), and memory pressure.
+  BRAIN.md's earlier "vnode wall" attribution is corrected here.
+- **Emit guard v2** (mil_spec `b511cb8`, pushed): samples disk free,
+  `kern.num_files`/`kern.maxfiles`, and `memory_pressure` — the three
+  signals that actually fired. `MIL_EMIT_MAX_VNODE_PCT` →
+  `MIL_EMIT_MAX_FILE_PCT`. Guard caught itself false-positiving on
+  first live run and was fixed before any damage — the mechanism
+  works.
+- coyote-apple `[patch]` dropped; `mil_infer` resolves to mil_spec
+  git main (`b511cb8`) — guard live in every brain compile.
+
+### Cross-substrate partitioner — oracle-gated (item 4 closed)
+
+`gen_brain --gpu forward` emits `gpu fn forward` (Metal/MSL) while
+`train_l0`/`train_head` stay `fn` (ANE). One organism, three
+substrates, host-tensor params so every partition sees identical
+born-on-chip weights.
+
+- **`coyote-apple oracle part64f.cy --json` → `verdict: pass`**:
+  epochs=0 isolates forward+generate. Metal leg vs CPU leg:
+  identical organism ID `3846693533653480248`, identical 8-token
+  generation (28,28,28,4,28,4,36,4), identical return, 10 witness
+  entries each. The oracle's own gate — not a manual diff.
+- Training-leg note (honest): with epochs=1 the mixed organism
+  (Metal forward + ANE trainers) completes and witness-chains, but
+  post-training generations diverge across legs — expected: each
+  substrate's last-ulp arithmetic differs, gradients diverge, weights
+  diverge. Forward parity is the gate; trajectory divergence is
+  physics, not a bug.
+
+### d=512/L=4 ANE compile — reproduced under guard
+
+`coyote-apple build d512.cy` → all 6 programs, **127,141 `.macho`
+programs, 9.4 GiB**, ~2.5 min compile, zero guard trips (file table
+~4k/122k, disk 23→12 GiB, mem ~50% free). Bounded execution
+(epochs=1/positions=1/rounds=1) in flight — the first ANE *run* at
+this scale.

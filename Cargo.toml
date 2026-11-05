@@ -21,9 +21,3 @@ hmac = "0.12"
 sha2 = "0.10"
 aes-gcm = "0.10"
 tokenizers = "0.22"
-
-# Local iteration on the ANE emitter — points mil_infer at the working
-# tree while skeleton tiles are being added. Revert to the git rev once
-# mil_spec lands the new tiles upstream.
-[patch."https://github.com/savageAZfck/mil_spec"]
-mil_infer = { path = "/Users/savag3/mil_spec/crates/mil_infer" }

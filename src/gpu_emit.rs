@@ -131,6 +131,15 @@ struct Ge {
     /// let-bound names → their typed tree, *in binding order* (inlined
     /// lazily, recomputed per element — correctness first, fusion later)
     scopes: Vec<Vec<(String, Typed)>>,
+    /// parallel to `scopes`, same push/pop/binding order — but entries
+    /// keep the ORIGINAL let rhs even when `scopes` rebinds the name
+    /// to a materialized scratch buffer. `gen`/`rhs_read` resolve
+    /// through `scopes` (buffer reads = correct primal values);
+    /// `back`/`can_grad` resolve through this (the expr DAG = correct
+    /// gradient structure). Without it every reduction-valued let
+    /// (matmul/softmax/norm outputs — i.e. the whole network) reads
+    /// as an opaque buffer and `grad` reports "loss does not depend".
+    orig_scopes: Vec<Vec<(String, Typed)>>,
     /// while resolving a let-bound expr at position i of scope s, only
     /// earlier bindings *of s* are visible — the evaluator binds
     /// eagerly in order; the emitter mirrors that lazily. This is what
@@ -139,7 +148,14 @@ struct Ge {
     /// `w`/`x` refers to whatever was bound *before*, i.e. the buffer.
     /// Entries are (scope index, position) — a bound expr can open a
     /// nested Block, so the limit travels with its scope.
+    /// Two stacks, one per concern: `resolve_limit` constrains the
+    /// backward walk's structural recursion (`pos_of_orig`); adjoint
+    /// closures regenerate primal values through `gen`, whose own
+    /// inline-expansion recursion is guarded by `gen_limit` instead.
+    /// Sharing one stack let deep backward limits hide later lets from
+    /// closure-time `gen` calls (`unbound tensor f0` on real brains).
     resolve_limit: Vec<(usize, usize)>,
+    gen_limit: Vec<(usize, usize)>,
     /// kernels queued in dispatch order — scratch kernels (materialized
     /// reductions) and update kernels (`w op= s*grad(loss, w)`) land
     /// here as they're discovered; the main out-kernel is appended
@@ -221,10 +237,13 @@ impl Ge {
 
     /// find `name` among let bindings, innermost scope first, honoring
     /// `resolve_limit` per scope. Returns (scope, position, expr).
-    fn pos_of(&self, name: &str) -> Option<(usize, usize, &Typed)> {
+    fn pos_in(
+        &self,
+        name: &str,
+        limits: &[(usize, usize)],
+    ) -> Option<(usize, usize, &Typed)> {
         for (si, s) in self.scopes.iter().enumerate().rev() {
-            let lim = self
-                .resolve_limit
+            let lim = limits
                 .iter()
                 .rev()
                 .find(|(s2, _)| *s2 == si)
@@ -235,6 +254,25 @@ impl Ge {
             }
         }
         None
+    }
+
+    /// value-generation binding lookup — `gen`/`rhs_read`/`resolve_buf`
+    /// resolve let names to their materialized form under `gen_limit`.
+    fn pos_of(&self, name: &str) -> Option<(usize, usize, &Typed)> {
+        self.pos_in(name, &self.gen_limit)
+    }
+
+    /// structural binding lookup for the backward walk — same
+    /// (scope, pos) discipline as `pos_of`, but resolves under
+    /// `resolve_limit` and returns the pre-scratch-rebind expr so
+    /// `back`/`can_grad` see the DAG. Entries align 1:1 with
+    /// `scopes`, so the (si, pos) found indexes `orig_scopes`.
+    fn pos_of_orig(&self, name: &str) -> Option<(usize, usize, &Typed)> {
+        let (si, p, _) = self.pos_in(name, &self.resolve_limit)?;
+        self.orig_scopes
+            .get(si)?
+            .get(p)
+            .map(|(_, t)| (si, p, t))
     }
 
     /// flat buffer index for node dims `dims` at logical coords `c`,
@@ -929,12 +967,15 @@ impl Ge {
             TExpr::Ident(s) => {
                 if let Some((si, pos, b)) = self.pos_of(s) {
                     let b = b.clone();
-                    self.resolve_limit.push((si, pos));
+                    self.gen_limit.push((si, pos));
                     let r = self.gen(&b, coords);
-                    self.resolve_limit.pop();
+                    self.gen_limit.pop();
                     return r;
                 }
                 let Some((arg, ty, _kind)) = self.bufs.get(s) else {
+                    if std::env::var("COYOTE_GPU_DEBUG").is_ok() {
+                        eprintln!("backtrace:\n{}", std::backtrace::Backtrace::force_capture());
+                    }
                     return Err(format!("gpu emit: unbound tensor {s}"));
                 };
                 // params too read row-major over declared dims — their
@@ -1064,12 +1105,17 @@ impl Ge {
                 self.gen(base, &c)
             }
             TExpr::Block(stmts, last) => {
+                if std::env::var("COYOTE_GPU_DEBUG").is_ok() {
+                    eprintln!("gen_raw Block: {} stmts", stmts.len());
+                }
                 self.scopes.push(Vec::new());
+                self.orig_scopes.push(Vec::new());
                 for s in stmts {
                     self.stmt(s)?;
                 }
                 let v = self.gen(last, coords);
                 self.scopes.pop();
+                self.orig_scopes.pop();
                 v
             }
             TExpr::Call(name, args, _) => self.call(name, args, coords),
@@ -1268,7 +1314,7 @@ impl Ge {
             TExpr::Ident(s) => {
                 (s == wrt && self.is_param(s))
                     || self
-                        .pos_of(s)
+                        .pos_of_orig(s)
                         .map(|(_, _, b)| self.can_grad_d(b, wrt, depth + 1))
                         .unwrap_or(false)
             }
@@ -1303,13 +1349,22 @@ impl Ge {
     /// grads flat position `f`, or None when `wrt` is unreachable.
     fn grad_elem(&mut self, loss: &Typed, wrt: &str, f: &str) -> Result<Option<String>, String> {
         self.scopes.push(Vec::new());
+        self.orig_scopes.push(Vec::new());
         let r = (|| {
             let terminal = match &loss.e {
                 TExpr::Block(stmts, ret) => {
                     for s in stmts {
                         match s {
                             TStmt::Let { .. } => self.stmt(s)?,
-                            _ => return Err("gpu emit: non-let statement inside grad loss".into()),
+                            // same rule as `back`'s block walk — state
+                            // writes/expr statements are primal effects,
+                            // not adjoint paths.
+                            TStmt::StateUpdate { .. } | TStmt::Expr(_) => {}
+                            _ => {
+                                return Err(
+                                    "gpu emit: non-let statement inside grad loss".into()
+                                )
+                            }
                         }
                     }
                     (**ret).clone()
@@ -1331,6 +1386,7 @@ impl Ge {
             }
         })();
         self.scopes.pop();
+        self.orig_scopes.pop();
         r
     }
 
@@ -1361,7 +1417,7 @@ impl Ge {
                     let cs = Self::coords_of(f, &e.ty.dims);
                     return adj(self, &cs).map(Some);
                 }
-                match self.pos_of(s) {
+                match self.pos_of_orig(s) {
                     Some((si, p, b)) => {
                         let b = b.clone();
                         self.resolve_limit.push((si, p));
@@ -1439,14 +1495,13 @@ impl Ge {
                 }
             }
             TExpr::Bin(BinOp::MatMul, a, b) => {
-                let is_state_rhs = matches!(&b.e, TExpr::Field(..))
-                    || matches!(&b.e, TExpr::Transpose(i) if matches!(&i.e, TExpr::Field(..)));
-                if is_state_rhs {
-                    if self.can_grad(a, wrt) {
-                        return Err("gpu grad: through cache/state ops lands in M3b".into());
-                    }
-                    return Ok(None);
-                }
+                // state-field rhs (`q @ kv.k.T`, `s @ kv.v`) is a
+                // constant for this step — eval reads its primal
+                // value and routes the adjoint into the lhs only.
+                // `rhs_read` already emits those reads, and the
+                // param-weight branch can't fire (fields aren't
+                // params), so the generic path below IS the M3b
+                // semantics: dx_a = adj · bᵀ, no db.
                 let kd = *a.ty.dims.last().ok_or("gpu grad: matmul of scalars")? as usize;
                 let nn = b.ty.dims.get(1).copied().unwrap_or(1) as usize;
                 let pname = match &b.e {
@@ -1710,16 +1765,37 @@ impl Ge {
             }
             TExpr::Block(stmts, ret) => {
                 self.scopes.push(Vec::new());
+                self.orig_scopes.push(Vec::new());
                 let r = (|| {
                     for s in stmts {
                         match s {
                             TStmt::Let { .. } => self.stmt(s)?,
-                            _ => return Err("gpu emit: non-let statement inside grad path".into()),
+                            // eval's backward ignores block statements
+                            // wholesale (`Block(_stmts, ret) → back(ret)`)
+                            // — state writes are primal side effects the
+                            // forward pass already emitted, and state
+                            // reads are non-differentiable on both
+                            // substrates, so they carry no adjoint.
+                            TStmt::StateUpdate { .. } | TStmt::Expr(_) => {}
+                            other => {
+                                let k = match other {
+                                    TStmt::Assign { .. } => "Assign",
+                                    TStmt::ParamUpdate { .. } => "ParamUpdate",
+                                    TStmt::AdamUpdate { .. } => "AdamUpdate",
+                                    TStmt::Let { .. }
+                                    | TStmt::StateUpdate { .. }
+                                    | TStmt::Expr(_) => unreachable!(),
+                                };
+                                return Err(format!(
+                                    "gpu emit: non-let statement ({k}) inside grad path"
+                                ));
+                            }
                         }
                     }
                     self.back(ret, wrt, f, adj)
                 })();
                 self.scopes.pop();
+                self.orig_scopes.pop();
                 r
             }
             TExpr::Field(..) | TExpr::Grad { .. } => Err("gpu grad: unsupported node".into()),
@@ -1735,6 +1811,12 @@ impl Ge {
                 // updates can't retroactively change its value), and
                 // the name rebinds to a buffer ident that every reader
                 // (rhs_read, backward helpers) resolves as storage.
+                // orig_scopes keeps the real rhs either way — `back`
+                // and `can_grad` need the expr DAG, not the buffer.
+                self.orig_scopes
+                    .last_mut()
+                    .unwrap()
+                    .push((name.clone(), expr.clone()));
                 if expr.ty.numel() > 1 && Self::needs_scratch(expr) {
                     let buf = self.scratch_of(expr)?;
                     self.emit_q.extend(self.scratch.drain(..));
@@ -1763,7 +1845,8 @@ impl Ge {
                     let mark = self.scratch.len();
                     let saved = std::mem::take(&mut self.lines);
                     let g = self
-                        .grad_elem(loss, param, "gid")?
+                        .grad_elem(loss, param, "gid")
+                        .map_err(|e| format!("grad({param}): {e}"))?
                         .ok_or_else(|| format!("gpu emit: loss does not depend on {param}"))?;
                     self.lines
                         .push(self.param_st(param, "+=", &format!("float({scale}) * ({g})")));
@@ -1803,7 +1886,8 @@ impl Ge {
                     let mark = self.scratch.len();
                     let saved = std::mem::take(&mut self.lines);
                     let g = self
-                        .grad_elem(loss, param, "gid")?
+                        .grad_elem(loss, param, "gid")
+                        .map_err(|e| format!("grad({param}): {e}"))?
                         .ok_or_else(|| format!("gpu emit: loss does not depend on {param}"))?;
                     self.lines.push(format!("ag_{param}[gid] = ({g});"));
                     let body = std::mem::replace(&mut self.lines, saved);
@@ -1972,7 +2056,11 @@ impl Ge {
                         ),
                     },
                 };
-                self.scopes.last_mut().unwrap().push((name.clone(), new_e));
+                self.scopes.last_mut().unwrap().push((name.clone(), new_e.clone()));
+                self.orig_scopes
+                    .last_mut()
+                    .unwrap()
+                    .push((name.clone(), new_e));
                 Ok(())
             }
             TStmt::Expr(_) => Ok(()),
@@ -1987,7 +2075,9 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
     let mut ge = Ge {
         bufs: HashMap::new(),
         scopes: vec![Vec::new()],
-        resolve_limit: Vec::new(), // (scope, pos) pairs
+        orig_scopes: vec![Vec::new()],
+        resolve_limit: Vec::new(), // (scope, pos) pairs — backward walk
+        gen_limit: Vec::new(),     // (scope, pos) pairs — value gen
         emit_q: Vec::new(),
         post_q: Vec::new(),
         scratch: Vec::new(),

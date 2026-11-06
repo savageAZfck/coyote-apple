@@ -67,6 +67,15 @@ pub struct GpuOut {
     /// body references, so programs with more than 31 total buffers
     /// fit inside Metal's per-kernel buffer limit.
     pub kernel_uses: Vec<Vec<u32>>,
+    /// per-kernel descriptor tables for deduped kernels — parallel to
+    /// `kernels`. When `kernel_uses[i]` contains the desc sentinel the
+    /// runtime allocates one `device uint` buffer holding these
+    /// values; the shared kernel function indexes `__ptrs->p` and
+    /// `__params_pool` offsets through `__desc[slot]` instead of
+    /// baked constants, so structurally identical kernels (every
+    /// layer/head of a transformer) collapse to one MSL function.
+    /// Empty for kernels on the direct-binding path.
+    pub desc_templates: Vec<Vec<u32>>,
 }
 
 /// how a kernel maps threads: flat elementwise (`Linear`) or a
@@ -2382,6 +2391,101 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
             .collect()
     }
 
+    /// descriptor lowering: every buffer ident becomes
+    /// `(({cast})__ptrs->p[__desc[{slot}]])` where slot is a
+    /// per-kernel-local index whose value the runtime supplies via a
+    /// tiny `device uint` descriptor buffer. Baked constant offsets
+    /// (`[<digits> +` — pooled-param element offsets and friends)
+    /// become `__desc[{slot}]` too, so two kernels that differ ONLY
+    /// in which tensors/params they touch normalize to identical
+    /// source and share one compiled function. Returns the normalized
+    /// lines plus the slot→value template (entry indices for buffer
+    /// slots, literal offsets for offset slots).
+    fn desc_body(
+        body: &[String],
+        name_to_k: &HashMap<&str, u32>,
+        half_args: &std::collections::HashSet<String>,
+    ) -> (Vec<String>, Vec<u32>) {
+        let mut tpl: Vec<u32> = Vec::new();
+        // slot per unique entry index — K is Copy, and duplicate entry
+        // names (the shared `__params_pool`) resolve to the same K, so
+        // keying by K also dedups them for free.
+        let mut local: HashMap<u32, u32> = HashMap::new();
+        let mut lines = Vec::with_capacity(body.len());
+        for line in body {
+            let mut out = String::with_capacity(line.len() + 32);
+            let mut cur = String::new();
+            for ch in line.chars().chain(std::iter::once(' ')) {
+                if ch.is_alphanumeric() || ch == '_' {
+                    cur.push(ch);
+                } else {
+                    if let Some(&k) = name_to_k.get(cur.as_str()) {
+                        let slot = *local.entry(k).or_insert_with(|| {
+                            tpl.push(k);
+                            (tpl.len() - 1) as u32
+                        });
+                        let cast = if half_args.contains(cur.as_str()) {
+                            "device half*"
+                        } else {
+                            "device float*"
+                        };
+                        out.push_str(&format!("(({cast})__ptrs->p[__desc[{slot}]])"));
+                    } else {
+                        out.push_str(&cur);
+                    }
+                    cur.clear();
+                    out.push(ch);
+                }
+            }
+            lines.push(out);
+        }
+        // second pass: baked `[<digits> +` / `[(<digits> +` index
+        // offsets become descriptor slots carrying the literal value.
+        let mut out_lines = Vec::with_capacity(lines.len());
+        for line in &lines {
+            let b = line.as_bytes();
+            let mut out = String::with_capacity(line.len() + 16);
+            let mut i = 0usize;
+            while i < b.len() {
+                if b[i] == b'[' {
+                    let mut j = i + 1;
+                    let mut paren = false;
+                    if j < b.len() && b[j] == b'(' {
+                        paren = true;
+                        j += 1;
+                    }
+                    let ds = j;
+                    while j < b.len() && b[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if j > ds
+                        && j + 1 < b.len()
+                        && b[j] == b' '
+                        && b[j + 1] == b'+'
+                        && matches!(b.get(j + 2), Some(b' ' | b'('))
+                    {
+                        let val: u64 = line[ds..j].parse().unwrap_or(0);
+                        let slot = tpl.len() as u32;
+                        tpl.push(val.min(u32::MAX as u64) as u32);
+                        out.push('[');
+                        if paren {
+                            out.push('(');
+                        }
+                        out.push_str(&format!("__desc[{slot}]"));
+                        i = j;
+                        continue;
+                    }
+                }
+                // ASCII-safe: MSL bodies are ASCII; push the byte's
+                // char losslessly for our generated subset.
+                out.push(b[i] as char);
+                i += 1;
+            }
+            out_lines.push(out);
+        }
+        (out_lines, tpl)
+    }
+
     // format every queued kernel with its own minimal signature;
     // update kernels re-declare their param arg writable. Kernels
     // whose live-buffer count would exceed Metal's 31-slot cap are
@@ -2394,10 +2498,83 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(28);
     const PTRS_SLOTS: usize = 65536;
+    // kernel dedup: structurally identical kernels (every layer and
+    // head of a transformer emits the same op shapes) share one
+    // compiled function — per-dispatch constants move into a tiny
+    // `device uint` descriptor buffer. Without this a 36-layer
+    // forward emits ~23k kernels and blows the AGX compiled-
+    // variants footprint at pipeline-state creation. `CYO_DEDUP=0`
+    // forces the per-kernel path; default auto-enables past 2048
+    // queued kernels.
+    let dedup = match std::env::var("CYO_DEDUP").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => ge.emit_q.len() > 2048,
+    };
     let mut ptrs_used = false;
     let mut kernel_srcs = Vec::new();
     let mut kernels = Vec::new();
     let mut kernel_uses = Vec::new();
+    let mut desc_templates: Vec<Vec<u32>> = Vec::new();
+    if dedup {
+        if entries.len() > PTRS_SLOTS {
+            return Err(format!(
+                "gpu emit ({name}): {} buffers exceeds pointer-table capacity {PTRS_SLOTS}",
+                entries.len()
+            ));
+        }
+        ptrs_used = true;
+        // entry name → first global index (duplicate names like the
+        // shared `__params_pool` keep the first slot, matching the
+        // runtime's table construction).
+        let mut name_to_k: HashMap<&str, u32> = HashMap::new();
+        for (i, (n, _)) in entries.iter().enumerate() {
+            name_to_k.entry(n.as_str()).or_insert(i as u32);
+        }
+        let mut groups: HashMap<(String, String), usize> = HashMap::new();
+        let mut group_names: Vec<String> = Vec::new();
+        for ek in &ge.emit_q {
+            let (lines, tpl) = desc_body(&ek.body, &name_to_k, &ge.half_args);
+            let body_txt = lines
+                .iter()
+                .map(|l| format!("    {l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let key = (format!("{:?}", ek.dispatch), body_txt.clone());
+            let gi = match groups.get(&key) {
+                Some(&gi) => gi,
+                None => {
+                    let gi = group_names.len();
+                    let gname = format!("coyote_{name}_g{gi}");
+                    let thread_decl = match ek.dispatch {
+                        Dispatch::Linear(_) => "uint gid [[thread_position_in_grid]]",
+                        Dispatch::Group(_) => "uint lid [[thread_position_in_threadgroup]]",
+                        Dispatch::Gemv(_) => {
+                            "uint tgid [[threadgroup_position_in_grid]],\n    uint lid [[thread_position_in_threadgroup]]"
+                        }
+                        Dispatch::Tiled { .. } => {
+                            "uint2 gid2 [[thread_position_in_grid]],\n    uint2 lid2 [[thread_position_in_threadgroup]]"
+                        }
+                        Dispatch::Simdgemm { .. } => {
+                            "uint2 tgid2 [[threadgroup_position_in_grid]],\n    uint2 lid2 [[thread_position_in_threadgroup]]"
+                        }
+                    };
+                    group_names.push(gname.clone());
+                    kernel_srcs.push(format!(
+                        "kernel void {gname}(\n    device __CoyotePtrs* __ptrs [[buffer(0)]],\n    device uint* __desc [[buffer(1)]],\n    {thread_decl})\n{{\n{body_txt}\n}}\n"
+                    ));
+                    groups.insert(key, gi);
+                    gi
+                }
+            };
+            kernels.push((group_names[gi].clone(), ek.dispatch));
+            // buffer(0) = pointer table, buffer(1) = this dispatch's
+            // descriptor — MAX-1 is the desc sentinel the runtime
+            // resolves to the per-kernel desc buffer index.
+            kernel_uses.push(vec![u32::MAX, u32::MAX - 1]);
+            desc_templates.push(tpl);
+        }
+    } else {
     for ek in &ge.emit_q {
         let kname = format!("coyote_{name}_{}", ek.name);
         let idents = body_idents(&ek.body);
@@ -2501,6 +2678,8 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         kernels.push((kname, ek.dispatch));
         kernel_uses.push(uses);
     }
+    }
+    desc_templates.resize(kernels.len(), Vec::new());
 
     let msl = format!(
         "// coyote gpu emit — {name}\n#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n\nstruct __CoyotePtrs {{ device char* p[{PTRS_SLOTS}]; }};\n\n{}",
@@ -2540,5 +2719,6 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         output: (oname.clone(), oty.clone()),
         kernels,
         kernel_uses,
+        desc_templates,
     })
 }

@@ -260,6 +260,40 @@ impl GpuRuntime {
         } else {
             usize::MAX
         };
+        // descriptor buffers for deduped kernels — each dispatch
+        // binds its own tiny `device uint` table (emit-time slot
+        // values); the shared kernel function reads `__desc[i]` for
+        // pointer-table indices and pool offsets. The u32::MAX-1
+        // sentinel in `uses` is rewritten to this buffer's index.
+        const DESC_SENTINEL: u32 = u32::MAX - 1;
+        for (i, pipe) in pipes.iter_mut().enumerate() {
+            if !pipe.3.contains(&DESC_SENTINEL) {
+                continue;
+            }
+            let tpl = out
+                .desc_templates
+                .get(i)
+                .cloned()
+                .unwrap_or_default();
+            let one = [0u32; 1];
+            let (ptr, len) = if tpl.is_empty() {
+                (one.as_ptr() as *const c_void, 4u64)
+            } else {
+                (tpl.as_ptr() as *const c_void, (tpl.len() * 4) as u64)
+            };
+            let dbuf = dev.new_buffer_with_data(
+                ptr,
+                len,
+                MTLResourceOptions::StorageModeShared,
+            );
+            bufs.push(dbuf);
+            let idx = (bufs.len() - 1) as u32;
+            for u in pipe.3.iter_mut() {
+                if *u == DESC_SENTINEL {
+                    *u = idx;
+                }
+            }
+        }
         Ok(Self {
             _dev: dev,
             queue,

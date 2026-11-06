@@ -66,11 +66,11 @@ pub fn run(args: &[String]) -> Result<(), i32> {
         if let Some(ep) = &export {
             // checkpoint export — every declared `param` global lands
             // in one safetensors, in the layout `param @ "src"` loads,
-            // ready for `milc convert`. Deferred params
-            // (`CYO_LAZY_PARAMS`) materialize first so untouched
-            // weights export their init values, not empty slots.
-            vm.materialize_all_params()?;
-            let snap = vm.params_snapshot();
+            // ready for `milc convert`. Deferred params resolve
+            // per-param inside the snapshot: device-trained values
+            // read back through the owning runtime, untouched params
+            // materialize to init — the host store never holds it all.
+            let snap = vm.params_snapshot()?;
             let bytes = crate::stfile::safetensors_multi(&snap);
             std::fs::write(ep, &bytes).map_err(|e| e.to_string())?;
             println!("  exported {} tensors → {}", snap.len(), ep.display());

@@ -373,6 +373,16 @@ impl GpuRuntime {
                     bufs.push(buf_f32(&dev, &vec![0.0; *numel]));
                     sizes.insert(name.clone(), *numel);
                 }
+                Arg::ScratchHalf(name, numel) => {
+                    // f16 scratch (`CYO_F16_SCRATCH`) — activations and
+                    // tape adjoints; half the footprint of f32. Zeroed
+                    // like every scratch: contrib kernels accumulate
+                    // with `+=` and the emit side queues explicit
+                    // zero kernels ahead of first use each dispatch.
+                    bufs.push(buf_f16(&dev, &vec![0.0; *numel]));
+                    half_slots.insert(i);
+                    sizes.insert(name.clone(), *numel);
+                }
             }
         }
         // pointer table for oversized kernels — one device buffer

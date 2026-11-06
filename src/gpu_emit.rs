@@ -114,6 +114,9 @@ pub enum Arg {
     /// materialized-subexpression buffer — allocated zeroed by the
     /// runtime, written by a prelude kernel, read like an input.
     Scratch(String, usize),
+    /// scratch buffer stored as `half` (`CYO_F16_SCRATCH`) — kernels
+    /// read `float(b[i])`, writes round through `half(...)`.
+    ScratchHalf(String, usize),
     /// an `f16`-declared param staged as a half buffer (`CYO_HALF`) —
     /// kernels load `float(b[i])` for fp32 compute; update kernels
     /// write `half(v)`, matching the surface round-trip eval drivers
@@ -124,9 +127,12 @@ pub enum Arg {
 impl Arg {
     pub fn port(&self) -> &str {
         match self {
-            Arg::In(p) | Arg::Param(p) | Arg::State(p) | Arg::Scratch(p, _) | Arg::ParamHalf(p) => {
-                p
-            }
+            Arg::In(p)
+            | Arg::Param(p)
+            | Arg::State(p)
+            | Arg::Scratch(p, _)
+            | Arg::ScratchHalf(p, _)
+            | Arg::ParamHalf(p) => p,
         }
     }
 }
@@ -253,6 +259,13 @@ struct Ge {
     /// loss keys whose sweep failed — don't retry; callers fall back
     /// to per-param `grad_elem`.
     sweep_failed: std::collections::HashSet<u64>,
+    /// scratch buffer names stored as `half` under `CYO_F16_SCRATCH`:
+    /// forward activations (`b__m`), tape adjoints (`b__a`), softmax
+    /// exp staging (`b__e`). `ag_`/`am_`/`av_`/`at_` stay f32 —
+    /// gradient accumulation and Adam moments need the precision.
+    /// f32 scratch remains the default and the numerical reference.
+    half_scratch: std::collections::HashSet<String>,
+    scratch_f16: bool,
     lines: Vec<String>,
     tmp: usize,
 }
@@ -500,10 +513,11 @@ impl Ge {
     }
 
     /// buffer element read honoring half storage — `float(b[i])`
-    /// under `CYO_HALF`, `b[i]` otherwise. `idx` is the raw index
-    /// expression; callers compute it with the usual conventions.
+    /// under `CYO_HALF` params or `CYO_F16_SCRATCH` scratch,
+    /// `b[i]` otherwise. `idx` is the raw index expression; callers
+    /// compute it with the usual conventions.
     fn ld(&self, arg: &str, idx: &str) -> String {
-        if self.half_args.contains(arg) {
+        if self.half_args.contains(arg) || self.half_scratch.contains(arg) {
             format!("float({arg}[{idx}])")
         } else {
             format!("{arg}[{idx}]")
@@ -513,10 +527,32 @@ impl Ge {
     /// float4 vector load at `idx` (which must be 4-aligned) —
     /// half buffers load `half4` and widen.
     fn ld4(&self, arg: &str, idx: &str) -> String {
-        if self.half_args.contains(arg) {
+        if self.half_args.contains(arg) || self.half_scratch.contains(arg) {
             format!("float4(*(device const half4*)({arg} + ({idx})))")
         } else {
             format!("*(device const float4*)({arg} + ({idx}))")
+        }
+    }
+
+    /// element store to any buffer honoring scratch dtype —
+    /// `op_s` is the MSL assignment operator (`=`,`+=`,`-=`,`*=`,`/=`).
+    /// Half scratch does an explicit float read-modify-write, same
+    /// discipline as `param_st`. `_out`, ios, states, and the
+    /// ag_/am_/av_/at_ training buffers are never in `half_scratch`,
+    /// so they take the plain float path.
+    fn st_any(&self, buf: &str, idx: &str, op_s: &str, v: &str) -> String {
+        if self.half_scratch.contains(buf) {
+            let cur = format!("float({buf}[{idx}])");
+            let expr = match op_s {
+                "=" => v.to_string(),
+                "+=" => format!("({cur} + ({v}))"),
+                "-=" => format!("({cur} - ({v}))"),
+                "*=" => format!("({cur} * ({v}))"),
+                _ => format!("({cur} / ({v}))"),
+            };
+            format!("{buf}[{idx}] = half({expr});")
+        } else {
+            format!("{buf}[{idx}] {op_s} ({v});")
         }
     }
 
@@ -646,6 +682,9 @@ impl Ge {
             return Ok(b.clone());
         }
         let buf = format!("b__m{}", self.scratch_args.len());
+        if self.scratch_f16 {
+            self.half_scratch.insert(buf.clone());
+        }
         let dims = e.ty.dims.clone();
         let numel = e.ty.numel() as usize;
         self.scratch_args.push((buf.clone(), numel));
@@ -676,7 +715,8 @@ impl Ge {
                         coords.push(cname);
                     }
                     let v = self.gen_raw(e, &coords)?;
-                    self.lines.push(format!("{buf}[gid] = ({v});"));
+                    let st = self.st_any(&buf, "gid", "=", &v);
+                    self.lines.push(st);
                     (std::mem::take(&mut self.lines), Dispatch::Linear(numel))
                 }
             },
@@ -818,8 +858,9 @@ impl Ge {
             blk + 1
         ));
         l.push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+        let st = self.st_any(out_buf, &format!("(m)*{n_dim}+(n)"), "=", "Cs[r][c]");
         l.push(format!(
-            "for (uint idx = lid; idx < {}; idx += {sgt}) {{ uint r = idx/{blk}, c = idx%{blk}; uint m = m0 + r, n = n0 + c; if (m < {m_dim} && n < {n_dim}) {out_buf}[(m)*{n_dim}+(n)] = Cs[r][c]; }}",
+            "for (uint idx = lid; idx < {}; idx += {sgt}) {{ uint r = idx/{blk}, c = idx%{blk}; uint m = m0 + r, n = n0 + c; if (m < {m_dim} && n < {n_dim}) {st} }}",
             blk * blk
         ));
         Some((l, Dispatch::Simdgemm { m: m_dim, n: n_dim }))
@@ -989,7 +1030,7 @@ impl Ge {
                         .into(),
                 );
                 l.push("}".into());
-                l.push(format!("if (j < {n}) {out_buf}[j] = acc;"));
+                l.push(format!("if (j < {n}) {}", self.st_any(out_buf, "j", "=", "acc")));
                 Some((l, Dispatch::Gemv(n)))
             }
             Shape::Cols {
@@ -1015,7 +1056,10 @@ impl Ge {
                 );
                 l.push(format!("acc += ({xv}) * ({bv});"));
                 l.push("}".into());
-                l.push(format!("if (d < {dim_d}) {out_buf}[d] = acc;"));
+                l.push(format!(
+                    "if (d < {dim_d}) {}",
+                    self.st_any(out_buf, "d", "=", "acc")
+                ));
                 Some((l, Dispatch::Gemv(dim_d as usize)))
             }
         }
@@ -1057,13 +1101,12 @@ impl Ge {
             self.lines
                 .push(format!("for (uint j = 0; j < {cols}; ++j) {{"));
             let v = self.gen(x, &cs)?;
-            self.lines.push(format!(
-                "float ex = exp({v} - m); {out_buf}[gid*{cols}+j] = ex; s += ex;"
-            ));
+            let st = self.st_any(out_buf, &format!("gid*{cols}+j"), "=", "ex");
+            self.lines.push(format!("float ex = exp({v} - m); {st} s += ex;"));
             self.lines.push("}".into());
-            self.lines.push(format!(
-                "for (uint j = 0; j < {cols}; ++j) {out_buf}[gid*{cols}+j] /= s;"
-            ));
+            let st = self.st_any(out_buf, &format!("gid*{cols}+j"), "/=", "s");
+            self.lines
+                .push(format!("for (uint j = 0; j < {cols}; ++j) {st}"));
             let body = std::mem::replace(&mut self.lines, saved);
             return Ok(Some((body, Dispatch::Linear(rows as usize))));
         }
@@ -1082,6 +1125,9 @@ impl Ge {
                 // and the serial sum — same values eval sums, in the
                 // same order.
                 let eb = format!("b__e{}", self.scratch_args.len());
+                if self.scratch_f16 {
+                    self.half_scratch.insert(eb.clone());
+                }
                 self.scratch_args.push((eb.clone(), n as usize));
                 self.lines.push(format!("threadgroup float tr[{T}];"));
                 self.lines.push("threadgroup float ts;".into());
@@ -1108,7 +1154,8 @@ impl Ge {
                 self.lines
                     .push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
                 let v = self.gen(x, &cs)?;
-                self.lines.push(format!("{eb}[i] = exp({v} - tr[0]);"));
+                let st = self.st_any(&eb, "i", "=", &format!("exp({v} - tr[0])"));
+                self.lines.push(st);
                 self.lines.push("}".into());
                 self.lines
                     .push("threadgroup_barrier(mem_flags::mem_device);".into());
@@ -1118,9 +1165,9 @@ impl Ge {
                 ));
                 self.lines
                     .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
-                self.lines.push(format!(
-                    "for (uint i = lid; i < {n}; i += {T}) {out_buf}[i] = {eb}[i] / ts;"
-                ));
+                let st = self.st_any(out_buf, "i", "=", &format!("{eb}[i] / ts"));
+                self.lines
+                    .push(format!("for (uint i = lid; i < {n}; i += {T}) {st}"));
             }
             _ => {
                 self.lines.push("threadgroup float tv;".into());
@@ -1137,11 +1184,10 @@ impl Ge {
                 self.lines
                     .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
                 let wv = self.gen(&args[1], &cs)?;
-                self.lines
-                    .push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
+                self.lines.push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
                 let v = self.gen(x, &cs)?;
-                self.lines
-                    .push(format!("{out_buf}[i] = ({v}) * tv * ({wv});"));
+                let st = self.st_any(out_buf, "i", "=", &format!("({v}) * tv * ({wv})"));
+                self.lines.push(st);
                 self.lines.push("}".into());
             }
         }
@@ -1209,8 +1255,9 @@ impl Ge {
         l.push("    }".into());
         l.push("    threadgroup_barrier(mem_flags::mem_threadgroup);".into());
         l.push("}".into());
+        let st = self.st_any(out_buf, &format!("(m)*{n_dim}+(n)"), "=", "acc[i][j]");
         l.push(format!(
-            "for (uint i = 0; i < {tm}; ++i) for (uint j = 0; j < {tm}; ++j) {{ uint m = m0 + lid2.y*{tm} + i; uint n = n0 + lid2.x*{tm} + j; if (m < {m_dim} && n < {n_dim}) {out_buf}[(m)*{n_dim}+(n)] = acc[i][j]; }}"
+            "for (uint i = 0; i < {tm}; ++i) for (uint j = 0; j < {tm}; ++j) {{ uint m = m0 + lid2.y*{tm} + i; uint n = n0 + lid2.x*{tm} + j; if (m < {m_dim} && n < {n_dim}) {st} }}"
         ));
         Some((
             l,
@@ -2090,17 +2137,31 @@ impl Ge {
     // `adam`/`param update` then reads a ready grad buffer.
 
     /// adjoint buffer for tape node `name` — allocated lazily, zero-init.
+    /// Contrib kernels accumulate with `+=` and runtime buffers persist
+    /// across `run()` calls, so every fresh adjoint buffer gets a zero
+    /// kernel queued ahead of the first contrib that can target it —
+    /// without it step 2+ would read step 1's adjoints.
     fn adj_buf(&mut self, name: &str, ty: &CTy) -> String {
         if let Some(b) = self.adj_bufs.get(name) {
             return b.clone();
         }
         let b = format!("b__a{}", self.adj_n);
         self.adj_n += 1;
-        self.scratch_args
-            .push((b.clone(), ty.numel().max(1) as usize));
+        if self.scratch_f16 {
+            self.half_scratch.insert(b.clone());
+        }
+        let numel = ty.numel().max(1) as usize;
+        self.scratch_args.push((b.clone(), numel));
         self.bufs
             .insert(b.clone(), (b.clone(), ty.clone(), Kind::Row));
         self.adj_bufs.insert(name.to_string(), b.clone());
+        let z = self.st_any(&b, "gid", "=", "0.0f");
+        self.scratch.push(EK {
+            name: format!("zero_{b}"),
+            dispatch: Dispatch::Linear(numel),
+            body: vec![z],
+            writable: None,
+        });
         b
     }
 
@@ -2132,7 +2193,8 @@ impl Ge {
         let saved = std::mem::take(&mut self.lines);
         let coords = Self::coords_of("gid", &ty.dims);
         let v = adj(self, &coords)?;
-        self.lines.push(format!("{tgt}[gid] += ({v});"));
+        let line = self.st_any(tgt, "gid", "+=", &v);
+        self.lines.push(line);
         let body = std::mem::take(&mut self.lines);
         self.lines = saved;
         self.scratch.push(EK {
@@ -2525,10 +2587,11 @@ impl Ge {
         for (p, ty) in self.grad_param_tys.clone() {
             let ag = self.ag_buf(&p, &ty);
             let n = ty.numel().max(1) as usize;
+            let z = self.st_any(&ag, "gid", "=", "0.0f");
             self.scratch.push(EK {
                 name: format!("agz_{p}_{}", self.scratch.len()),
                 dispatch: Dispatch::Linear(n),
-                body: vec![format!("{ag}[gid] = 0.0f;")],
+                body: vec![z],
                 writable: None,
             });
         }
@@ -2594,12 +2657,16 @@ impl Ge {
                     let coords = Self::coords_of("gid", &pty.dims);
                     let pv = self.gen(&pred, &coords)?;
                     let tv = self.gen(&tgt, &coords)?;
+                    let sd = self.st_any(
+                        &ab,
+                        "gid",
+                        "=",
+                        &format!("2.0f * (({pv}) - ({tv})) / float({n})"),
+                    );
                     self.scratch.push(EK {
                         name: format!("seed_{seed_name}_{}", self.scratch.len()),
                         dispatch: Dispatch::Linear(numel),
-                        body: vec![format!(
-                            "{ab}[gid] = (2.0f * (({pv}) - ({tv})) / float({n}));"
-                        )],
+                        body: vec![sd],
                         writable: None,
                     });
                     // drain tape in reverse def order — a let's adjoint
@@ -2998,6 +3065,8 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         grad_param_tys: HashMap::new(),
         ag_hits: std::collections::HashSet::new(),
         sweep_failed: std::collections::HashSet::new(),
+        half_scratch: std::collections::HashSet::new(),
+        scratch_f16: std::env::var_os("CYO_F16_SCRATCH").is_some(),
         lines: Vec::new(),
         tmp: 0,
     };
@@ -3139,9 +3208,18 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         entries.push((arg.clone(), format!("{qual} {arg}")));
     }
     for (buf, n) in &ge.scratch_args {
-        entries.push((buf.clone(), format!("device float* {buf}")));
-        args.push(Arg::Scratch(buf.clone(), *n));
+        if ge.half_scratch.contains(buf) {
+            entries.push((buf.clone(), format!("device half* {buf}")));
+            args.push(Arg::ScratchHalf(buf.clone(), *n));
+        } else {
+            entries.push((buf.clone(), format!("device float* {buf}")));
+            args.push(Arg::Scratch(buf.clone(), *n));
+        }
     }
+    // merged half-storage set for the pointer-table/descriptor
+    // lowerings — kernel bodies reach scratch through the same casts.
+    let mut half_all = ge.half_args.clone();
+    half_all.extend(ge.half_scratch.iter().cloned());
 
     // identifiers referenced by a kernel body — buffer usage is the
     // intersection with the entry names (tokenized, so `b_k` never
@@ -3351,7 +3429,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         let mut groups: HashMap<(String, String), usize> = HashMap::new();
         let mut group_names: Vec<String> = Vec::new();
         for ek in &ge.emit_q {
-            let (lines, tpl) = desc_body(&ek.body, &name_to_k, &ge.half_args);
+            let (lines, tpl) = desc_body(&ek.body, &name_to_k, &half_all);
             let body_txt = lines
                 .iter()
                 .map(|l| format!("    {l}"))
@@ -3429,7 +3507,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
                         "uint2 tgid2 [[threadgroup_position_in_grid]],\n    uint2 lid2 [[thread_position_in_threadgroup]]"
                     }
                 },
-                ptrs_body(&ek.body, &entries, &ge.half_args)
+                ptrs_body(&ek.body, &entries, &half_all)
                     .iter()
                     .map(|l| format!("    {l}"))
                     .collect::<Vec<_>>()

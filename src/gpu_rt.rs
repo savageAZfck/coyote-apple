@@ -29,12 +29,18 @@ pub struct GpuRuntime {
         Vec<u32>,
     )>,
     out_n: usize,
-    /// buffer objects in arg order — index 0 is out.
+    /// buffer objects in arg order — index 0 is out. Pooled params
+    /// share one buffer: every `Arg::Param` position after the first
+    /// holds a small dummy (never bound — `uses` dedups to the first
+    /// `__params_pool` entry), keeping `bufs` index-aligned with the
+    /// emitter's entry order.
     bufs: Vec<metal::Buffer>,
-    /// port/param/state name → buffer index in `bufs`.
-    slot: HashMap<String, usize>,
-    /// numel per buffer, for staging writes.
-    elems: Vec<usize>,
+    /// port/param/state name → (buffer index, element offset). The
+    /// offset is nonzero only for pooled params — their weights live
+    /// inside the shared pool at `param_off`-assigned slots.
+    slot: HashMap<String, (usize, usize)>,
+    /// staged element count per port name — per-param inside the pool.
+    sizes: HashMap<String, usize>,
     /// buffer indices backed by `half` storage (`CYO_HALF` params) —
     /// `read_buf` decodes f16 → f32 for the host.
     half_slots: std::collections::HashSet<usize>,
@@ -46,6 +52,11 @@ pub struct GpuRuntime {
     per_kernel: bool,
     /// kernel name → ms for the last run (per_kernel mode only).
     last_kernels: Vec<(String, f64)>,
+    /// `bufs` index of the pointer-table buffer (`__CoyotePtrs`), or
+    /// `usize::MAX` when no kernel needed it. Kernels whose `uses`
+    /// contain the `u32::MAX` sentinel bind this one buffer; their
+    /// bodies reach every tensor through `__ptrs->p[K]`.
+    ptrs_i: usize,
 }
 
 fn buf_f32(dev: &metal::Device, data: &[f32]) -> metal::Buffer {
@@ -98,15 +109,34 @@ impl GpuRuntime {
 
         let mut bufs = Vec::new();
         let mut slot = HashMap::new();
-        let mut elems = Vec::new();
+        let mut sizes = HashMap::new();
         let mut half_slots = std::collections::HashSet::new();
         let out_n = out.output.1.numel() as usize;
         bufs.push(buf_f32(&dev, &vec![0.0f32; out_n]));
-        slot.insert("out".into(), 0);
-        elems.push(out_n);
+        slot.insert("out".into(), (0, 0));
+        sizes.insert("out".into(), out_n);
+        // pooled f32 params share one device buffer sized up front —
+        // 16-element-aligned slots, the same rule gpu_emit's
+        // `param_off` uses, so host offsets match kernel indices.
+        let pool_mode = out.param_pool;
+        let mut pool_total = 0usize;
+        if pool_mode {
+            for a in &out.args {
+                if let Arg::Param(pn) = a {
+                    let t = p
+                        .params
+                        .iter()
+                        .find(|t| &t.name == pn)
+                        .ok_or_else(|| format!("gpu arg {pn}: not a param"))?;
+                    pool_total += (t.ty.numel() as usize + 15) & !15;
+                }
+            }
+        }
+        let mut pool_idx = usize::MAX;
+        let mut pool_cursor = 0usize;
         for (a_i, a) in out.args.iter().enumerate() {
             let i = a_i + 1;
-            slot.insert(a.port().to_string(), i);
+            slot.insert(a.port().to_string(), (i, 0));
             match a {
                 Arg::In(port) => {
                     let ty = out
@@ -117,7 +147,7 @@ impl GpuRuntime {
                         .ok_or_else(|| format!("gpu arg {port}: no io type"))?;
                     let n = ty.numel() as usize;
                     bufs.push(buf_f32(&dev, &vec![0.0; n]));
-                    elems.push(n);
+                    sizes.insert(port.clone(), n);
                 }
                 Arg::State(port) => {
                     let ty = out
@@ -128,9 +158,9 @@ impl GpuRuntime {
                         .ok_or_else(|| format!("gpu arg {port}: no state type"))?;
                     let n = ty.numel() as usize;
                     bufs.push(buf_f32(&dev, &vec![0.0; n]));
-                    elems.push(n);
+                    sizes.insert(port.clone(), n);
                 }
-                Arg::Param(pname) | Arg::ParamHalf(pname) => {
+                Arg::Param(pname) => {
                     let t = p
                         .params
                         .iter()
@@ -152,20 +182,84 @@ impl GpuRuntime {
                     if t.ty.dt == coyote::ast::DType::Q4 {
                         data = coyote::lower::q4_quantize(&data);
                     }
-                    if matches!(a, Arg::ParamHalf(_)) {
-                        bufs.push(buf_f16(&dev, &data));
-                        half_slots.insert(i);
+                    if pool_mode {
+                        if pool_idx == usize::MAX {
+                            pool_idx = bufs.len();
+                            bufs.push(buf_f32(&dev, &vec![0.0; pool_total]));
+                        } else {
+                            // alignment placeholder — `uses` never
+                            // binds this position (dedup keeps the
+                            // first `__params_pool` entry).
+                            bufs.push(buf_f32(&dev, &[0.0; 4]));
+                        }
+                        let off = pool_cursor;
+                        pool_cursor += (t.ty.numel() as usize + 15) & !15;
+                        slot.insert(pname.clone(), (pool_idx, off));
+                        sizes.insert(pname.clone(), data.len());
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                data.as_ptr(),
+                                (bufs[pool_idx].contents() as *mut f32).add(off),
+                                data.len(),
+                            );
+                        }
                     } else {
                         bufs.push(buf_f32(&dev, &data));
+                        sizes.insert(pname.clone(), data.len());
                     }
-                    elems.push(data.len());
                 }
-                Arg::Scratch(_name, numel) => {
+                Arg::ParamHalf(pname) => {
+                    let t = p
+                        .params
+                        .iter()
+                        .find(|t| &t.name == pname)
+                        .ok_or_else(|| format!("gpu arg {pname}: not a param"))?;
+                    let expect: Vec<usize> = if t.ty.dims.len() == 2 {
+                        vec![t.ty.dims[1] as usize, t.ty.dims[0] as usize]
+                    } else {
+                        vec![t.ty.numel() as usize]
+                    };
+                    let mut data = coyote::weights::resolve(
+                        pname,
+                        Some(&expect),
+                        t.src.as_deref(),
+                        coyote::weights::param_fallback,
+                    )?;
+                    if t.ty.dt == coyote::ast::DType::Q4 {
+                        data = coyote::lower::q4_quantize(&data);
+                    }
+                    bufs.push(buf_f16(&dev, &data));
+                    half_slots.insert(i);
+                    sizes.insert(pname.clone(), data.len());
+                }
+                Arg::Scratch(name, numel) => {
                     bufs.push(buf_f32(&dev, &vec![0.0; *numel]));
-                    elems.push(*numel);
+                    sizes.insert(name.clone(), *numel);
                 }
             }
         }
+        // pointer table for oversized kernels — one device buffer
+        // holding every resident buffer's address; `__ptrs->p[K]`
+        // in the kernel indexes it. Unified memory means
+        // `contents()` IS the device-visible address.
+        let ptrs_i = if out.ptrs {
+            const PTRS_SLOTS: usize = 65536;
+            let n = bufs.len();
+            let tbl = dev.new_buffer(
+                (PTRS_SLOTS * 8) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let base = tbl.contents() as *mut u64;
+            for (i, b) in bufs.iter().enumerate() {
+                unsafe {
+                    *base.add(i) = b.contents() as usize as u64;
+                }
+            }
+            bufs.push(tbl);
+            n
+        } else {
+            usize::MAX
+        };
         Ok(Self {
             _dev: dev,
             queue,
@@ -173,8 +267,9 @@ impl GpuRuntime {
             out_n,
             bufs,
             slot,
-            elems,
+            sizes,
             half_slots,
+            ptrs_i,
             last_ms: 0.0,
             per_kernel: std::env::var_os("CYO_PKT").is_some(),
             last_kernels: Vec::new(),
@@ -191,21 +286,25 @@ impl GpuRuntime {
     /// buffers, dispatch, and return the output row-major.
     pub fn run(&mut self, writes: &[(String, Vec<f32>)]) -> Result<Vec<f32>, String> {
         for (port, data) in writes {
-            let &i = self
+            let &(bi, off) = self
                 .slot
                 .get(port)
                 .ok_or_else(|| format!("gpu run: no buffer for {port}"))?;
-            if data.len() != self.elems[i] {
+            let want = *self
+                .sizes
+                .get(port)
+                .ok_or_else(|| format!("gpu run: no size for {port}"))?;
+            if data.len() != want {
                 return Err(format!(
                     "gpu run {port}: {} elems staged, buffer wants {}",
                     data.len(),
-                    self.elems[i]
+                    want
                 ));
             }
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data.as_ptr(),
-                    self.bufs[i].contents() as *mut f32,
+                    (self.bufs[bi].contents() as *mut f32).add(off),
                     data.len(),
                 );
             }
@@ -273,7 +372,8 @@ impl GpuRuntime {
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(pipe);
                 for (li, &gi) in uses.iter().enumerate() {
-                    enc.set_buffer(li as u64, Some(&self.bufs[gi as usize]), 0);
+                    let bi = if gi == u32::MAX { self.ptrs_i } else { gi as usize };
+                    enc.set_buffer(li as u64, Some(&self.bufs[bi]), 0);
                 }
                 dispatch(enc, pipe, disp);
                 enc.end_encoding();
@@ -291,7 +391,8 @@ impl GpuRuntime {
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(pipe);
                 for (li, &gi) in uses.iter().enumerate() {
-                    enc.set_buffer(li as u64, Some(&self.bufs[gi as usize]), 0);
+                    let bi = if gi == u32::MAX { self.ptrs_i } else { gi as usize };
+                    enc.set_buffer(li as u64, Some(&self.bufs[bi]), 0);
                 }
                 dispatch(enc, pipe, disp);
                 enc.end_encoding();
@@ -313,18 +414,23 @@ impl GpuRuntime {
     /// mutate `b_param` in place across dispatches, so the owner's
     /// checkpoint lives here, not in `param_outs`.
     pub fn read_buf(&self, port: &str) -> Option<Vec<f32>> {
-        let &i = self.slot.get(port)?;
-        let n = self.elems[i];
-        if self.half_slots.contains(&i) {
+        let &(bi, off) = self.slot.get(port)?;
+        let n = *self.sizes.get(port)?;
+        if self.half_slots.contains(&bi) {
+            // half params are never pooled — `off` is always 0 here.
             Some(unsafe {
-                std::slice::from_raw_parts(self.bufs[i].contents() as *const u16, n)
+                std::slice::from_raw_parts(self.bufs[bi].contents() as *const u16, n)
                     .iter()
                     .map(|&b| half::f16::from_bits(b).to_f32())
                     .collect()
             })
         } else {
             Some(unsafe {
-                std::slice::from_raw_parts(self.bufs[i].contents() as *const f32, n).to_vec()
+                std::slice::from_raw_parts(
+                    (self.bufs[bi].contents() as *const f32).add(off),
+                    n,
+                )
+                .to_vec()
             })
         }
     }

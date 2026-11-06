@@ -48,6 +48,14 @@ pub struct GpuOut {
     pub states: Vec<(String, String, CTy)>,
     /// kernel arg order after `out`: In ports, all params, state ports.
     pub args: Vec<Arg>,
+    /// f32 params share one pooled device buffer (`__params_pool`);
+    /// the runtime allocates it once and stages each param at its
+    /// `param_off` element offset. `CYO_HALF` params stay per-arg.
+    pub param_pool: bool,
+    /// at least one kernel exceeded the per-signature buffer budget
+    /// and was lowered through the `__CoyotePtrs` pointer table —
+    /// the runtime must build the table buffer and bind it.
+    pub ptrs: bool,
     pub output: (String, CTy),
     /// kernels to dispatch in order — the main program kernel is
     /// always LAST (eval runs stmts incl. updates before ret); each
@@ -178,6 +186,15 @@ struct Ge {
     scratch_args: Vec<(String, usize)>,
     /// param name → numel, for update-kernel dispatch sizes.
     param_numel: HashMap<String, usize>,
+    /// param name → element offset inside the shared `__params_pool`
+    /// buffer. Metal caps a kernel signature at 31 `[[buffer(n)]]`
+    /// slots; per-param args blew past it on real training graphs
+    /// (one adjoint kernel referenced ~45). Pooling every f32 param
+    /// into one device buffer collapses those references to a single
+    /// slot — the per-param offset is baked into each index
+    /// expression instead. `CYO_HALF` params keep per-param args
+    /// (half storage can't share the f32 pool).
+    param_off: HashMap<String, i64>,
     /// arg names (`b_w`) backed by `half` storage under `CYO_HALF` —
     /// every read site wraps `float(...)`, every write wraps `half(...)`.
     half_args: std::collections::HashSet<String>,
@@ -228,6 +245,12 @@ fn bk_depth() -> usize {
 /// block — each simdgroup owns a 32×32 quadrant of 8×8 fragments.
 const SGBLK: usize = 64;
 const SGTHREADS: usize = 128;
+
+/// shared device buffer every pooled (non-`CYO_HALF`) param reads
+/// through — one `[[buffer(n)]]` slot covers all of them; per-param
+/// element offsets live in `Ge::param_off`. The leading underscores
+/// keep it collision-free against `b_{port}` arg names.
+const POOL_ARG: &str = "__params_pool";
 
 impl Ge {
     fn tmp(&mut self) -> String {
@@ -315,13 +338,29 @@ impl Ge {
         }
     }
 
-    /// writable-param store at `gid` honoring storage dtype — `op_s`
+    /// pooled-param element offset for a flat index expression —
+    /// `name` is the buffer's key in `bufs` (param name for params).
+    /// Pooled params read `__params_pool[off + idx]`; everything else
+    /// (ios, states, scratch, half params, let-bound names) passes
+    /// through untouched.
+    fn poff(&self, name: &str, flat: &str) -> String {
+        match self.param_off.get(name) {
+            Some(off) => format!("({off} + ({flat}))"),
+            None => flat.to_string(),
+        }
+    }
+
+    /// writable-param store honoring storage dtype — `op_s`
     /// is the MSL assignment operator (`=`,`+=`,`-=`,`*=`,`/=`); half
-    /// buffers do an explicit float read-modify-write.
+    /// buffers do an explicit float read-modify-write. Pooled params
+    /// store at `__params_pool[param_off + gid]`.
     fn param_st(&self, param: &str, op_s: &str, v: &str) -> String {
-        let arg = format!("b_{param}");
+        let (arg, idx) = match self.param_off.get(param) {
+            Some(off) => (POOL_ARG.to_string(), format!("{off} + gid")),
+            None => (format!("b_{param}"), "gid".to_string()),
+        };
         if self.half_args.contains(&arg) {
-            let cur = format!("float({arg}[gid])");
+            let cur = format!("float({arg}[{idx}])");
             let expr = match op_s {
                 "=" => v.to_string(),
                 "+=" => format!("({cur} + ({v}))"),
@@ -329,9 +368,9 @@ impl Ge {
                 "*=" => format!("({cur} * ({v}))"),
                 _ => format!("({cur} / ({v}))"),
             };
-            format!("{arg}[gid] = half({expr});")
+            format!("{arg}[{idx}] = half({expr});")
         } else {
-            format!("{arg}[gid] {op_s} ({v});")
+            format!("{arg}[{idx}] {op_s} ({v});")
         }
     }
 
@@ -473,12 +512,15 @@ impl Ge {
     /// chase `let`-bound names to their underlying buffer — eagerly
     /// materialized binds rebind to `Ident(b__mN)`, so one hop usually
     /// suffices; loop guards deeper alias chains.
-    fn resolve_buf(&self, e: &Typed) -> Option<(String, CTy, Kind)> {
+    /// returns (bufs key, arg, ty, kind) — the key is the buffer's
+    /// name in `bufs` (param name for params), needed for pooled-param
+    /// offset lookup via `poff`.
+    fn resolve_buf(&self, e: &Typed) -> Option<(String, String, CTy, Kind)> {
         let mut cur = e;
         for _ in 0..8 {
             let TExpr::Ident(s) = &cur.e else { return None };
             if let Some((a, t, k)) = self.bufs.get(s) {
-                return Some((a.clone(), t.clone(), *k));
+                return Some((s.clone(), a.clone(), t.clone(), *k));
             }
             match self.pos_of(s) {
                 Some((_, _, b)) => cur = b,
@@ -506,19 +548,19 @@ impl Ge {
             a.ty.dims[1] as usize,
             b.ty.dims[1] as usize,
         );
-        let (a_arg, _, _) = self.resolve_buf(a)?;
-        let a_e = self.ld(&a_arg, &format!("(m)*{k_dim}+(tk)"));
+        let (a_key, a_arg, _, _) = self.resolve_buf(a)?;
+        let a_e = self.ld(&a_arg, &self.poff(&a_key, &format!("(m)*{k_dim}+(tk)")));
         let b_e = match &b.e {
             TExpr::Ident(_) => {
-                let (arg, _, _) = self.resolve_buf(b)?;
-                self.ld(&arg, &format!("(bn)*{k_dim}+(tk)"))
+                let (b_key, arg, _, _) = self.resolve_buf(b)?;
+                self.ld(&arg, &self.poff(&b_key, &format!("(bn)*{k_dim}+(tk)")))
             }
             TExpr::Transpose(inner) => {
-                let (arg, ity, kind) = self.resolve_buf(inner)?;
+                let (i_key, arg, ity, kind) = self.resolve_buf(inner)?;
                 if matches!(kind, Kind::ParamT) && ity.dims[0] != ity.dims[1] {
-                    self.ld(&arg, &format!("(tk)*{n_dim}+(bn)"))
+                    self.ld(&arg, &self.poff(&i_key, &format!("(tk)*{n_dim}+(bn)")))
                 } else {
-                    self.ld(&arg, &format!("(bn)*{k_dim}+(tk)"))
+                    self.ld(&arg, &self.poff(&i_key, &format!("(bn)*{k_dim}+(tk)")))
                 }
             }
             _ => return None,
@@ -653,9 +695,20 @@ impl Ge {
         // reads).
         enum Shape {
             /// contiguous row per output: rhs[oidx*K + k]
-            Rows { buf: String, stride: i64 },
+            Rows {
+                buf: String,
+                stride: i64,
+                /// pooled-param element offset, when `buf` is
+                /// `__params_pool` — baked into every index expr.
+                off: Option<i64>,
+            },
             /// contract over rows, output over cols: rhs[t*D + oidx]
-            Cols { buf: String, dim_t: i64, dim_d: i64 },
+            Cols {
+                buf: String,
+                dim_t: i64,
+                dim_d: i64,
+                off: Option<i64>,
+            },
         }
         let field_buf = |e: &Typed| -> Option<(String, CTy)> {
             if let TExpr::Field(bx, f) = &e.e {
@@ -674,6 +727,7 @@ impl Ge {
                 Shape::Rows {
                     buf,
                     stride: ty.dims[1],
+                    off: None,
                 }
             }
             // `s @ kv.v` — out[d] = Σ_t x[t]·v[t*D+d] — contract over
@@ -684,30 +738,40 @@ impl Ge {
                     buf,
                     dim_t: ty.dims[0],
                     dim_d: ty.dims[1],
+                    off: None,
                 }
             }
             // non-square param .T keeps declared-order [K,N] storage:
             // out[j] = Σ_k x[k]·w[k*N+j] — strided output reads.
             TExpr::Transpose(i) if matches!(&i.e, TExpr::Ident(s) if matches!(self.bufs.get(s), Some((_, t, Kind::ParamT)) if t.dims[0] != t.dims[1])) =>
             {
-                let (buf, ty, _) = self.resolve_buf(i)?;
+                let (pk, buf, ty, _) = self.resolve_buf(i)?;
                 Shape::Cols {
                     buf,
                     dim_t: ty.dims[0],
                     dim_d: ty.dims[1],
+                    off: self.param_off.get(&pk).copied(),
                 }
             }
             // `x @ w` (param/io/scratch) and square `.T` — the named
             // rhs reads flat [N,K]: out[j] = Σ_k x[k]·w[j*K+k].
             _ => {
-                let (buf, _, _) = self.resolve_buf(b)?;
-                Shape::Rows { buf, stride: k }
+                let (pk, buf, _, _) = self.resolve_buf(b)?;
+                Shape::Rows {
+                    buf,
+                    stride: k,
+                    off: self.param_off.get(&pk).copied(),
+                }
             }
         };
 
         let mut l = Vec::new();
         match shape {
-            Shape::Rows { buf, stride } => {
+            Shape::Rows {
+                buf,
+                stride,
+                off,
+            } => {
                 // one thread per output, serial-k accumulator —
                 // eval's exact order — but the row is consumed as
                 // float4s so each thread issues a quarter of the
@@ -730,7 +794,13 @@ impl Ge {
                 l.push(format!("float4 xv = float4({});", x4.join(", ")));
                 l.push(format!(
                     "float4 wv = {};",
-                    self.ld4(&buf, &format!("j*{stride}+t*4"))
+                    self.ld4(
+                        &buf,
+                        &match off {
+                            Some(o) => format!("({o} + (j*{stride}+t*4))"),
+                            None => format!("j*{stride}+t*4"),
+                        }
+                    )
                 ));
                 l.push(
                     "acc += xv.x*wv.x; acc += xv.y*wv.y; acc += xv.z*wv.z; acc += xv.w*wv.w;"
@@ -740,7 +810,12 @@ impl Ge {
                 l.push(format!("if (j < {n}) {out_buf}[j] = acc;"));
                 Some((l, Dispatch::Gemv(n)))
             }
-            Shape::Cols { buf, dim_t, dim_d } => {
+            Shape::Cols {
+                buf,
+                dim_t,
+                dim_d,
+                off,
+            } => {
                 // contraction over the leading dim: out[d] =
                 // Σ_t x[t]·v[t*D+d]. one thread per output — for a
                 // fixed t the group's reads are already contiguous —
@@ -749,7 +824,13 @@ impl Ge {
                 l.push("float acc = 0.0f;".into());
                 l.push(format!("for (uint t = 0; t < {dim_t}; ++t) {{"));
                 let xv = self.gen(a, &["t".to_string()]).ok()?;
-                let bv = self.ld(&buf, &format!("t*{dim_d}+d"));
+                let bv = self.ld(
+                    &buf,
+                    &match off {
+                        Some(o) => format!("({o} + (t*{dim_d}+d))"),
+                        None => format!("t*{dim_d}+d"),
+                    },
+                );
                 l.push(format!("acc += ({xv}) * ({bv});"));
                 l.push("}".into());
                 l.push(format!("if (d < {dim_d}) {out_buf}[d] = acc;"));
@@ -982,7 +1063,7 @@ impl Ge {
                 // [N,K] storage IS the value (matches the evaluator);
                 // the transposed read only applies in matmul rhs.
                 let flat = Self::flat(&ty.dims, coords, &Kind::Row);
-                Ok(self.ld(&arg, &flat))
+                Ok(self.ld(&arg, &self.poff(s, &flat)))
             }
             TExpr::Field(base, f) => {
                 // `kv.k` — state field access.
@@ -1070,11 +1151,16 @@ impl Ge {
                             return Err("gpu emit: index result needs a free coord".into());
                         };
                         let d0 = base.ty.dims[0];
-                        let arg = match self.resolve_buf(base) {
-                            Some((a, _, _)) => a,
-                            None => self.scratch_of(base)?,
+                        let (pk, arg) = match self.resolve_buf(base) {
+                            Some((k, a, _, _)) => (Some(k), a),
+                            None => (None, self.scratch_of(base)?),
                         };
-                        return Ok(self.ld(&arg, &format!("({j})*{d0} + {r}")));
+                        let idx = format!("({j})*{d0} + {r}");
+                        let idx = match &pk {
+                            Some(k) => self.poff(k, &idx),
+                            None => idx,
+                        };
+                        return Ok(self.ld(&arg, &idx));
                     }
                 }
                 // index ops consume leading dims of base: Lit pins,
@@ -1217,7 +1303,7 @@ impl Ge {
                 let tv = match &tab.e {
                     TExpr::Ident(s) if self.bufs.contains_key(s) => {
                         let (arg, _, _) = self.bufs.get(s).unwrap().clone();
-                        self.ld(&arg, &f)
+                        self.ld(&arg, &self.poff(s, &f))
                     }
                     _ => {
                         let cs = Self::coords_of(&f, &tab.ty.dims);
@@ -1270,14 +1356,20 @@ impl Ge {
             TExpr::Field(..) => self.gen(b, rc),
             TExpr::Transpose(i) if matches!(&i.e, TExpr::Field(..)) => self.gen(b, rc),
             TExpr::Transpose(i) if matches!(&i.e, TExpr::Ident(s) if self.bufs.contains_key(s)) => {
-                let (arg, ty, kind) = match &i.e {
-                    TExpr::Ident(s) => self.bufs.get(s).unwrap().clone(),
+                let (arg, ty, kind, pk) = match &i.e {
+                    TExpr::Ident(s) => {
+                        let (a, t, k) = self.bufs.get(s).unwrap().clone();
+                        (a, t, k, s.clone())
+                    }
                     _ => unreachable!(),
                 };
                 if matches!(kind, Kind::ParamT) && ty.dims[0] != ty.dims[1] {
-                    Ok(self.ld(&arg, &Self::flat(&b.ty.dims, rc, &Kind::Row)))
+                    Ok(self.ld(
+                        &arg,
+                        &self.poff(&pk, &Self::flat(&b.ty.dims, rc, &Kind::Row)),
+                    ))
                 } else {
-                    Ok(self.ld(&arg, &kf))
+                    Ok(self.ld(&arg, &self.poff(&pk, &kf)))
                 }
             }
             TExpr::Transpose(i) => {
@@ -1286,7 +1378,7 @@ impl Ge {
             }
             TExpr::Ident(s) if self.bufs.contains_key(s) => {
                 let (arg, _, _) = self.bufs.get(s).unwrap().clone();
-                Ok(self.ld(&arg, &kf))
+                Ok(self.ld(&arg, &self.poff(s, &kf)))
             }
             _ => {
                 let cs = Self::coords_of(&kf, &b.ty.dims);
@@ -1900,14 +1992,20 @@ impl Ge {
                     });
                     // adam_step parity: b1=0.9 b2=0.999 eps=1e-2
                     // (fp16-safe), w rounded to half after the update.
+                    // Pooled params read-modify-write inside
+                    // `__params_pool` at their element offset.
                     let i = self.post_q.len();
+                    let (warg, widx) = match self.param_off.get(param.as_str()) {
+                        Some(off) => (POOL_ARG.to_string(), format!("{off} + gid")),
+                        None => (format!("b_{param}"), "gid".to_string()),
+                    };
                     let wline = if self.half_args.contains(&format!("b_{param}")) {
                         format!(
-                            "b_{param}[gid] = half(float(b_{param}[gid]) - {lr} * (m / bc1) / (sqrt(v / bc2) + 1e-2f));"
+                            "{warg}[{widx}] = half(float({warg}[{widx}]) - {lr} * (m / bc1) / (sqrt(v / bc2) + 1e-2f));"
                         )
                     } else {
                         format!(
-                            "b_{param}[gid] = float(half(b_{param}[gid] - {lr} * (m / bc1) / (sqrt(v / bc2) + 1e-2f)));"
+                            "{warg}[{widx}] = float(half({warg}[{widx}] - {lr} * (m / bc1) / (sqrt(v / bc2) + 1e-2f)));"
                         )
                     };
                     self.post_q.push(EK {
@@ -2089,6 +2187,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
             .iter()
             .map(|t| (t.name.clone(), t.ty.numel() as usize))
             .collect(),
+        param_off: HashMap::new(),
         lines: Vec::new(),
         tmp: 0,
     };
@@ -2109,17 +2208,27 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
     // CYO_HALF: f16-declared params stage as real half buffers —
     // bandwidth halves on param-heavy kernels while compute stays
     // fp32. Update writes round through `half`, matching the f16
-    // surface the eval drivers already write back to.
+    // surface the eval drivers already write back to. Everything else
+    // pools into `__params_pool`: one signature slot for all f32
+    // params, per-param element offsets in `param_off`.
     let half_mode = std::env::var_os("CYO_HALF").is_some();
+    let mut pool_next = 0i64;
     for t in &p.params {
-        let arg = format!("b_{}", t.name);
+        let pooled = !(half_mode && t.ty.dt == DType::F16);
+        let arg = if pooled {
+            ge.param_off.insert(t.name.clone(), pool_next);
+            pool_next += (t.ty.numel() as i64 + 15) & !15;
+            POOL_ARG.to_string()
+        } else {
+            format!("b_{}", t.name)
+        };
         ge.bufs
             .insert(t.name.clone(), (arg.clone(), t.ty.clone(), Kind::ParamT));
-        if half_mode && t.ty.dt == DType::F16 {
+        if pooled {
+            args.push(Arg::Param(t.name.clone()));
+        } else {
             ge.half_args.insert(arg.clone());
             args.push(Arg::ParamHalf(t.name.clone()));
-        } else {
-            args.push(Arg::Param(t.name.clone()));
         }
         base_args.push((arg, t.name.clone(), false));
     }
@@ -2229,35 +2338,140 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         set
     }
 
+    /// pointer-table lowering for oversized kernels: every buffer
+    /// ident `name` becomes `(({cast})__ptrs->p[{K}])` — K is the
+    /// entry's global buffer index (first occurrence wins, matching
+    /// the `uses` dedup so pooled params always resolve to the real
+    /// pool slot, never a dummy). The cast matches storage dtype so
+    /// subscripts, pointer arithmetic, and half-widening reads all
+    /// keep their original element semantics.
+    fn ptrs_body(
+        body: &[String],
+        entries: &[(String, String)],
+        half_args: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        let mut map: HashMap<&str, (usize, &str)> = HashMap::new();
+        for (i, (n, _)) in entries.iter().enumerate() {
+            let cast = if half_args.contains(n) {
+                "device half*"
+            } else {
+                "device float*"
+            };
+            map.entry(n.as_str()).or_insert((i, cast));
+        }
+        body.iter()
+            .map(|line| {
+                let mut out = String::with_capacity(line.len() + 24);
+                let mut cur = String::new();
+                for ch in line.chars().chain(std::iter::once(' ')) {
+                    if ch.is_alphanumeric() || ch == '_' {
+                        cur.push(ch);
+                    } else {
+                        match map.get(cur.as_str()) {
+                            Some(&(k, cast)) => {
+                                out.push_str(&format!("(({cast})__ptrs->p[{k}])"))
+                            }
+                            None => out.push_str(&cur),
+                        }
+                        cur.clear();
+                        out.push(ch);
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
     // format every queued kernel with its own minimal signature;
-    // update kernels re-declare their param arg writable.
+    // update kernels re-declare their param arg writable. Kernels
+    // whose live-buffer count would exceed Metal's 31-slot cap are
+    // lowered through the pointer table instead: one `__ptrs` arg,
+    // every buffer access becomes `__ptrs->p[K]` — K is the entry's
+    // global buffer index, so the runtime binds one table of device
+    // addresses and every tensor stays resident exactly once.
+    let ptrs_max = std::env::var("CYO_PTRS_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(28);
+    const PTRS_SLOTS: usize = 65536;
+    let mut ptrs_used = false;
     let mut kernel_srcs = Vec::new();
     let mut kernels = Vec::new();
     let mut kernel_uses = Vec::new();
     for ek in &ge.emit_q {
         let kname = format!("coyote_{name}_{}", ek.name);
         let idents = body_idents(&ek.body);
+        // pooled params all share the `__params_pool` entry name —
+        // dedup keeps the FIRST index so each kernel binds the pool
+        // exactly once regardless of how many params it touches.
+        let mut seen = std::collections::HashSet::new();
         let uses: Vec<u32> = entries
             .iter()
             .enumerate()
-            .filter(|(_, (n, _))| idents.contains(n))
+            .filter(|(_, (n, _))| idents.contains(n) && seen.insert(n.clone()))
             .map(|(i, _)| i as u32)
             .collect();
+        if uses.len() > ptrs_max {
+            if entries.len() > PTRS_SLOTS {
+                return Err(format!(
+                    "gpu emit ({name}/{}): {} buffers exceeds pointer-table capacity {PTRS_SLOTS}",
+                    ek.name,
+                    entries.len()
+                ));
+            }
+            ptrs_used = true;
+            kernel_srcs.push(format!(
+                "kernel void {kname}(\n    device __CoyotePtrs* __ptrs [[buffer(0)]],\n    {}\n)\n{{\n{}\n}}\n",
+                match ek.dispatch {
+                    Dispatch::Linear(_) => "uint gid [[thread_position_in_grid]]",
+                    Dispatch::Group(_) => "uint lid [[thread_position_in_threadgroup]]",
+                    Dispatch::Gemv(_) => {
+                        "uint tgid [[threadgroup_position_in_grid]],\n    uint lid [[thread_position_in_threadgroup]]"
+                    }
+                    Dispatch::Tiled { .. } => {
+                        "uint2 gid2 [[thread_position_in_grid]],\n    uint2 lid2 [[thread_position_in_threadgroup]]"
+                    }
+                    Dispatch::Simdgemm { .. } => {
+                        "uint2 tgid2 [[threadgroup_position_in_grid]],\n    uint2 lid2 [[thread_position_in_threadgroup]]"
+                    }
+                },
+                ptrs_body(&ek.body, &entries, &ge.half_args)
+                    .iter()
+                    .map(|l| format!("    {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ));
+            kernels.push((kname, ek.dispatch));
+            kernel_uses.push(vec![u32::MAX]); // sentinel → ptrs table
+            continue;
+        }
         let ksig: Vec<String> = uses
             .iter()
             .enumerate()
             .map(|(li, &gi)| {
                 let s = format!("{} [[buffer({li})]]", entries[gi as usize].1);
                 match &ek.writable {
-                    Some(param) => s
-                        .replace(
-                            &format!("device const float* b_{param}"),
-                            &format!("device float* b_{param}"),
-                        )
-                        .replace(
-                            &format!("device const half* b_{param}"),
-                            &format!("device half* b_{param}"),
-                        ),
+                    Some(param) => {
+                        let s = s
+                            .replace(
+                                &format!("device const float* b_{param}"),
+                                &format!("device float* b_{param}"),
+                            )
+                            .replace(
+                                &format!("device const half* b_{param}"),
+                                &format!("device half* b_{param}"),
+                            );
+                        // a pooled param's update kernel writes through
+                        // the shared pool — make its decl writable.
+                        if ge.param_off.contains_key(param.as_str()) {
+                            s.replace(
+                                "device const float* __params_pool",
+                                "device float* __params_pool",
+                            )
+                        } else {
+                            s
+                        }
+                    }
                     None => s,
                 }
             })
@@ -2289,7 +2503,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
     }
 
     let msl = format!(
-        "// coyote gpu emit — {name}\n#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n\n{}",
+        "// coyote gpu emit — {name}\n#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n\nstruct __CoyotePtrs {{ device char* p[{PTRS_SLOTS}]; }};\n\n{}",
         kernel_srcs.join("\n")
     );
     let msl_sha = sha256_hex(msl.as_bytes());
@@ -2321,6 +2535,8 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         trainable,
         states,
         args,
+        param_pool: !ge.param_off.is_empty(),
+        ptrs: ptrs_used,
         output: (oname.clone(), oty.clone()),
         kernels,
         kernel_uses,

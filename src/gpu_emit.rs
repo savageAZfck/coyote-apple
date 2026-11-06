@@ -3457,6 +3457,112 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
     // variants footprint at pipeline-state creation. `CYO_DEDUP=0`
     // forces the per-kernel path; default auto-enables past 2048
     // queued kernels.
+    // contrib fusion pass — the GPU-side graph collapse. Adjacent
+    // adjoint contrib kernels merge into one kernel body when the
+    // merge is provably safe: same linear dispatch, and every buffer
+    // the accumulated tail wrote is either unread by the incoming
+    // kernel or read only at gid-identity indices (elementwise
+    // chains — the tape's dominant shape). Anything else keeps its
+    // kernel boundary: that boundary IS the global sync a
+    // producer/consumer adjoint pair relies on. `CYO_FUSE=0` off.
+    if std::env::var_os("CYO_FUSE").is_none() {
+        let numels: HashMap<&str, usize> = ge
+            .scratch_args
+            .iter()
+            .map(|(n, c)| (n.as_str(), *c))
+            .collect();
+        // store-target extraction: `ident[ ... ] =` / `] +=` lines.
+        fn writes_of(body: &[String]) -> std::collections::HashSet<String> {
+            let mut s = std::collections::HashSet::new();
+            for line in body {
+                for marker in ["] += ", "] = "] {
+                    let mut rest = line.as_str();
+                    while let Some(p) = rest.find(marker) {
+                        let close = p;
+                        // walk back over the index expr to its '['
+                        let before = &rest[..close];
+                        if let Some(ob) = before.rfind('[') {
+                            let ident: String = before[..ob]
+                                .chars()
+                                .rev()
+                                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                                .collect::<String>()
+                                .chars()
+                                .rev()
+                                .collect();
+                            if !ident.is_empty() {
+                                s.insert(ident);
+                            }
+                        }
+                        rest = &rest[p + marker.len()..];
+                    }
+                }
+            }
+            s
+        }
+        // every `buf[...]` subscript must be gid-identity for a
+        // rank-1 scratch buffer — `(gid%N)*1` and friends normalize
+        // to gid when the dispatch covers exactly numel threads.
+        fn gid_reads_only(body: &[String], buf: &str, numel: usize) -> bool {
+            let pat = format!("{buf}[");
+            let want = format!("gid%{numel}");
+            for line in body {
+                let mut rest = line.as_str();
+                while let Some(p) = rest.find(&pat) {
+                    let inner = &rest[p + pat.len()..];
+                    let Some(e) = inner.find(']') else { return false };
+                    let idx = inner[..e]
+                        .replace(['(', ')', ' '], "")
+                        .replace("*1", "");
+                    if idx != "gid" && idx != want {
+                        return false;
+                    }
+                    rest = &inner[e..];
+                }
+            }
+            true
+        }
+        let emit_q = std::mem::take(&mut ge.emit_q);
+        let mut fused: Vec<EK> = Vec::with_capacity(emit_q.len());
+        let mut wsets: Vec<std::collections::HashSet<String>> = Vec::new();
+        for ek in emit_q {
+            let can_fuse = !fused.is_empty()
+                && ek.name.starts_with("adj_")
+                && fused.last().unwrap().name.starts_with("adj_")
+                && matches!(
+                    (fused.last().unwrap().dispatch, ek.dispatch),
+                    (Dispatch::Linear(a), Dispatch::Linear(b)) if a == b
+                );
+            let mut merged = false;
+            if can_fuse {
+                let last = fused.last().unwrap();
+                let reads = body_idents(&ek.body);
+                let ok = wsets.last().unwrap().iter().all(|b| {
+                    if !reads.contains(b.as_str()) {
+                        return true;
+                    }
+                    match numels.get(b.as_str()) {
+                        Some(&n) => gid_reads_only(&ek.body, b, n),
+                        None => false,
+                    }
+                });
+                if ok {
+                    let last = fused.last_mut().unwrap();
+                    last.body.push("{".into());
+                    last.body.extend(ek.body.iter().cloned());
+                    last.body.push("}".into());
+                    wsets.last_mut().unwrap().extend(writes_of(&ek.body));
+                    merged = true;
+                }
+            }
+            if !merged {
+                wsets.push(writes_of(&ek.body));
+                fused.push(ek);
+            }
+        }
+        ge.emit_q = fused;
+    }
+
     let dedup = match std::env::var("CYO_DEDUP").as_deref() {
         Ok("0") => false,
         Ok("1") => true,

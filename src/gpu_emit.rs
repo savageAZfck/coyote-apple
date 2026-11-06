@@ -225,8 +225,81 @@ struct Ge {
     in_backward: bool,
     /// (hits, misses) on `persistent` — emit diagnostics.
     pstats: (u64, u64),
+    /// AD tape (lower.rs discipline): every let bound at forward
+    /// position, in program order — name → defining expr. The
+    /// wrt-agnostic sweep walks these in reverse, accumulating
+    /// adjoints into scratch buffers so each def is differentiated
+    /// once instead of once per param.
+    tape_order: Vec<String>,
+    tape_def: HashMap<String, Typed>,
+    /// every `grad(_, w)` wrt seen in the program — param contribs
+    /// only emit for these (frozen params get no ag_ buffer).
+    grad_params: std::collections::HashSet<String>,
+    /// loss expr_key → already swept (one sweep fills ag_ for all
+    /// params sharing that loss).
+    sweeps_done: std::collections::HashSet<u64>,
+    /// adjoint buffer counter — `b__a{n}` names.
+    adj_n: usize,
+    /// tape name → materialized adjoint buffer.
+    adj_bufs: HashMap<String, String>,
+    /// param name → declared type (for grad buffer shapes).
+    param_tys: HashMap<String, CTy>,
+    /// grad(_, p) wrt → param type, pre-scanned so one sweep covers
+    /// every param sharing a loss.
+    grad_param_tys: HashMap<String, CTy>,
+    /// params that received at least one sweep contrib — distinguishes
+    /// "zero grad" from "loss doesn't reach this param".
+    ag_hits: std::collections::HashSet<String>,
+    /// loss keys whose sweep failed — don't retry; callers fall back
+    /// to per-param `grad_elem`.
+    sweep_failed: std::collections::HashSet<u64>,
     lines: Vec<String>,
     tmp: usize,
+}
+
+/// collect every `grad(_, w)` wrt in stmts/exprs — the sweep needs
+/// the full param set before the first update stmt runs.
+fn scan_grads_e(e: &Typed, out: &mut std::collections::HashSet<String>) {
+    match &e.e {
+        TExpr::Grad { loss, wrt } => {
+            out.insert(wrt.clone());
+            scan_grads_e(loss, out);
+        }
+        TExpr::Lit(_) | TExpr::Int(_) | TExpr::Ident(_) => {}
+        TExpr::Unary(_, a) | TExpr::Transpose(a) => scan_grads_e(a, out),
+        TExpr::Bin(_, a, b) => {
+            scan_grads_e(a, out);
+            scan_grads_e(b, out);
+        }
+        TExpr::Call(_, args, named) => {
+            for a in args {
+                scan_grads_e(a, out);
+            }
+            for (_, a) in named {
+                scan_grads_e(a, out);
+            }
+        }
+        TExpr::Index(b, _) => scan_grads_e(b, out),
+        TExpr::Field(b, _) => scan_grads_e(b, out),
+        TExpr::Block(stmts, ret) => {
+            for s in stmts {
+                scan_grads_s(s, out);
+            }
+            scan_grads_e(ret, out);
+        }
+    }
+}
+
+fn scan_grads_s(s: &TStmt, out: &mut std::collections::HashSet<String>) {
+    match s {
+        TStmt::Let { expr, .. }
+        | TStmt::Assign { expr, .. }
+        | TStmt::StateUpdate { expr, .. }
+        | TStmt::Expr(expr) => scan_grads_e(expr, out),
+        TStmt::ParamUpdate { grad, .. } | TStmt::AdamUpdate { grad, .. } => {
+            scan_grads_e(grad, out)
+        }
+    }
 }
 
 /// structural hash of a typed expr — the dedup key for `persistent`.
@@ -2006,6 +2079,562 @@ impl Ge {
         }
     }
 
+    // ---- tape-based wrt-agnostic backward (lower.rs discipline) ----
+    //
+    // `back`/`grad_elem` differentiate one param per call, inlining the
+    // whole adjoint DAG as a string — shared activations tree-ify
+    // exponentially (34k-line kernels). The sweep instead walks the
+    // tape once in reverse: every let's adjoint accumulates into a
+    // `b__aN` scratch buffer via `+=` contrib kernels, params into
+    // `ag_<p>`; each def is differentiated exactly once and every
+    // `adam`/`param update` then reads a ready grad buffer.
+
+    /// adjoint buffer for tape node `name` — allocated lazily, zero-init.
+    fn adj_buf(&mut self, name: &str, ty: &CTy) -> String {
+        if let Some(b) = self.adj_bufs.get(name) {
+            return b.clone();
+        }
+        let b = format!("b__a{}", self.adj_n);
+        self.adj_n += 1;
+        self.scratch_args
+            .push((b.clone(), ty.numel().max(1) as usize));
+        self.bufs
+            .insert(b.clone(), (b.clone(), ty.clone(), Kind::Row));
+        self.adj_bufs.insert(name.to_string(), b.clone());
+        b
+    }
+
+    /// `ag_<param>` grad buffer — same scratch slot the adam path used.
+    fn ag_buf(&mut self, param: &str, ty: &CTy) -> String {
+        let b = format!("ag_{param}");
+        if !self.scratch_args.iter().any(|(x, _)| x == &b) {
+            self.scratch_args
+                .push((b.clone(), ty.numel().max(1) as usize));
+        }
+        b
+    }
+
+    /// emit `tgt[gid] += (adj-expr)` — one contrib kernel. `adj`
+    /// produces the expr at the target's logical coords; prelude
+    /// lines it pushes (reduction loops) land in this kernel's body.
+    /// Nested scratch kernels queue ahead of it in `self.scratch`, so
+    /// FIFO drain order keeps dependencies first.
+    fn emit_contrib(
+        &mut self,
+        tgt: &str,
+        ty: &CTy,
+        adj: &mut dyn FnMut(&mut Ge, &[String]) -> Result<String, String>,
+    ) -> Result<(), String> {
+        let numel = ty.numel().max(1) as usize;
+        if let Some(p) = tgt.strip_prefix("ag_") {
+            self.ag_hits.insert(p.to_string());
+        }
+        let saved = std::mem::take(&mut self.lines);
+        let coords = Self::coords_of("gid", &ty.dims);
+        let v = adj(self, &coords)?;
+        self.lines.push(format!("{tgt}[gid] += ({v});"));
+        let body = std::mem::take(&mut self.lines);
+        self.lines = saved;
+        self.scratch.push(EK {
+            name: format!("adj_{tgt}_{}", self.scratch.len()),
+            dispatch: Dispatch::Linear(numel),
+            body,
+            writable: None,
+        });
+        Ok(())
+    }
+
+    /// tape-node adjoint read: `adjb[flat(coords)]` — the seed every
+    /// backward walk starts from once a node's adjoint is materialized.
+    fn adj_rd(&self, buf: &str, ty: &CTy, c: &[String]) -> String {
+        format!("{}[{}]", buf, Self::flat(&ty.dims, c, &Kind::Row))
+    }
+
+    /// reverse-mode walk over one tape def — `adj` yields the expr
+    /// for dL/d(e) at e's logical coords (composed closures, same
+    /// convention as `back`). Effects are contrib kernels: tape nodes
+    /// accumulate into `b__aN`, grad params into `ag_<p>`; other
+    /// leaves (inputs, literals, frozen params) drop.
+    fn back_tape(
+        &mut self,
+        e: &Typed,
+        adj: &mut dyn FnMut(&mut Ge, &[String]) -> Result<String, String>,
+    ) -> Result<(), String> {
+        match &e.e {
+            TExpr::Ident(s) => {
+                if self.grad_params.contains(s) && self.is_param(s) {
+                    let ag = self.ag_buf(s, &e.ty);
+                    return self.emit_contrib(&ag, &e.ty, adj);
+                }
+                if self.tape_def.contains_key(s) {
+                    let ab = self.adj_buf(s, &e.ty);
+                    return self.emit_contrib(&ab, &e.ty, adj);
+                }
+                Ok(())
+            }
+            TExpr::Lit(_) | TExpr::Int(_) => Ok(()),
+            TExpr::Unary(UnOp::Neg, a) => {
+                self.back_tape(a, &mut |em: &mut Ge, c: &[String]| {
+                    Ok(format!("(-({}))", adj(em, c)?))
+                })
+            }
+            TExpr::Unary(UnOp::Not, _) => Err("gpu grad: `!` is host-stratum".into()),
+            TExpr::Bin(BinOp::Add, a, b) => {
+                self.back_tape(a, &mut *adj)?;
+                self.back_tape(b, adj)
+            }
+            TExpr::Bin(BinOp::Sub, a, b) => {
+                self.back_tape(a, &mut *adj)?;
+                self.back_tape(b, &mut |em: &mut Ge, c: &[String]| {
+                    Ok(format!("(-({}))", adj(em, c)?))
+                })
+            }
+            TExpr::Bin(BinOp::Mul, a, b) => {
+                self.back_tape(a, &mut |em: &mut Ge, c: &[String]| {
+                    let d = adj(em, c)?;
+                    let bv = em.gen(b, c)?;
+                    Ok(format!("(({d}) * ({bv}))"))
+                })?;
+                self.back_tape(b, &mut |em: &mut Ge, c: &[String]| {
+                    let d = adj(em, c)?;
+                    let av = em.gen(a, c)?;
+                    Ok(format!("(({d}) * ({av}))"))
+                })
+            }
+            TExpr::Bin(BinOp::Div, a, b) => {
+                if let TExpr::Lit(s) = b.e {
+                    self.back_tape(a, &mut |em: &mut Ge, c: &[String]| {
+                        Ok(format!("(({}) / {}f)", adj(em, c)?, s))
+                    })
+                } else {
+                    self.back_tape(a, &mut |em: &mut Ge, c: &[String]| {
+                        let d = adj(em, c)?;
+                        let bv = em.gen(b, c)?;
+                        Ok(format!("(({d}) / ({bv}))"))
+                    })?;
+                    self.back_tape(b, &mut |em: &mut Ge, c: &[String]| {
+                        let d = adj(em, c)?;
+                        let av = em.gen(a, c)?;
+                        let bv = em.gen(b, c)?;
+                        Ok(format!("(-(({d}) * ({av})) / (({bv}) * ({bv})))"))
+                    })
+                }
+            }
+            TExpr::Bin(BinOp::MatMul, a, b) => {
+                let kd = *a.ty.dims.last().ok_or("gpu grad: matmul of scalars")? as usize;
+                let nn = b.ty.dims.get(1).copied().unwrap_or(1) as usize;
+                let pname = match &b.e {
+                    TExpr::Ident(s) => Some(s.clone()),
+                    TExpr::Transpose(i) => match &i.e {
+                        TExpr::Ident(s) => Some(s.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                // param-weight grad: dW[j,i] = Σ_br adj[br,j] · x[br,i]
+                if let Some(p) = &pname {
+                    if self.grad_params.contains(p) && self.is_param(p) {
+                        let pty = self.param_tys.get(p).cloned().unwrap_or_else(|| {
+                            CTy {
+                                dt: a.ty.dt,
+                                dims: vec![nn as i64, kd as i64],
+                            }
+                        });
+                        let ag = self.ag_buf(p, &pty);
+                        let m_batch = if a.ty.dims.len() == 2 {
+                            a.ty.dims[0] as usize
+                        } else {
+                            1
+                        };
+                        let adjw = &mut *adj;
+                        self.emit_contrib(&ag, &pty, &mut |em: &mut Ge, c: &[String]| {
+                            let sc = Self::coords_of("gid", &[nn as i64, kd as i64]);
+                            let _ = c;
+                            if m_batch == 1 {
+                                let av = adjw(em, &sc[..1])?;
+                                let xv = em.gen(a, &sc[1..])?;
+                                Ok(format!("(({av}) * ({xv}))"))
+                            } else {
+                                let acc = em.tmp();
+                                let br = em.tmp();
+                                em.lines.push(format!("float {acc} = 0.0f;"));
+                                em.lines
+                                    .push(format!("for (int {br} = 0; {br} < {m_batch}; ++{br}) {{"));
+                                let av = adjw(em, &[br.clone(), sc[0].clone()])?;
+                                let xv = em.gen(a, &[br.clone(), sc[1].clone()])?;
+                                em.lines.push(format!("{acc} += ({av}) * ({xv});"));
+                                em.lines.push("}".into());
+                                Ok(acc)
+                            }
+                        })?;
+                    }
+                }
+                // dx[br,i] = Σ_j adj[br,j] · w[j,i]
+                let b2 = (**b).clone();
+                let batched = a.ty.dims.len() == 2;
+                let adj3 = &mut *adj;
+                self.back_tape(a, &mut |em: &mut Ge, c: &[String]| {
+                    let acc = em.tmp();
+                    let j = em.tmp();
+                    em.lines.push(format!("float {acc} = 0.0f;"));
+                    em.lines.push(format!("for (int {j} = 0; {j} < {nn}; ++{j}) {{"));
+                    let av = if batched {
+                        adj3(em, &[c[0].clone(), j.clone()])?
+                    } else {
+                        adj3(em, &[j.clone()])?
+                    };
+                    let kc = if batched { c[1].clone() } else { c[0].clone() };
+                    let wv = em.rhs_read(&b2, &[kc, j.clone()], kd as i64)?;
+                    em.lines.push(format!("{acc} += ({av}) * ({wv});"));
+                    em.lines.push("}".into());
+                    Ok(acc)
+                })
+            }
+            TExpr::Bin(_, _, _) => Err("gpu grad: unsupported binop in tape walk".into()),
+            TExpr::Call(name, args, _) => {
+                let x = args[0].clone();
+                let e2 = e.clone();
+                match name.as_str() {
+                    "sigmoid" => self.back_tape(&x, &mut |em: &mut Ge, c: &[String]| {
+                        let d = adj(em, c)?;
+                        let h = em.gen(&e2, c)?;
+                        Ok(format!("({d}) * ({h}) * (1.0f - ({h}))"))
+                    }),
+                    "tanh" => self.back_tape(&x, &mut |em: &mut Ge, c: &[String]| {
+                        let d = adj(em, c)?;
+                        let t = em.gen(&e2, c)?;
+                        Ok(format!("({d}) * (1.0f - ({t}) * ({t}))"))
+                    }),
+                    "relu" => self.back_tape(&x, &mut |em: &mut Ge, c: &[String]| {
+                        let d = adj(em, c)?;
+                        let xv = em.gen(&x, c)?;
+                        Ok(format!("(({xv}) > 0.0f ? ({d}) : 0.0f)"))
+                    }),
+                    "silu" => self.back_tape(&x, &mut |em: &mut Ge, c: &[String]| {
+                        let d = adj(em, c)?;
+                        let xv = em.gen(&x, c)?;
+                        Ok(format!(
+                            "({d}) * (1.0f / (1.0f + exp(-({xv})))) * (1.0f + ({xv}) * (1.0f - (1.0f / (1.0f + exp(-({xv}))))))"
+                        ))
+                    }),
+                    "gelu" => self.back_tape(&x, &mut |em: &mut Ge, c: &[String]| {
+                        let d = adj(em, c)?;
+                        let xv = em.gen(&x, c)?;
+                        Ok(format!(
+                            "({d}) * (0.5f * (1.0f + tanh(0.7978845608028654f * (({xv}) + 0.044715f * ({xv}) * ({xv}) * ({xv})))) + 0.5f * ({xv}) * (1.0f - pow(tanh(0.7978845608028654f * (({xv}) + 0.044715f * ({xv}) * ({xv}) * ({xv}))), 2.0f)) * 0.7978845608028654f * (1.0f + 3.0f * 0.044715f * ({xv}) * ({xv})))"
+                        ))
+                    }),
+                    "softmax" => {
+                        let es = e2.clone();
+                        let n = e.ty.numel().max(1);
+                        self.back_tape(&x, &mut |em: &mut Ge, c: &[String]| {
+                            let dot = em.tmp();
+                            let j = em.tmp();
+                            em.lines.push(format!("float {dot} = 0.0f;"));
+                            em.lines
+                                .push(format!("for (int {j} = 0; {j} < {n}; ++{j}) {{"));
+                            let av = adj(em, &[j.clone()])?;
+                            let sv = em.gen(&es, &[j.clone()])?;
+                            em.lines.push(format!("{dot} += ({av}) * ({sv});"));
+                            em.lines.push("}".into());
+                            let d = adj(em, c)?;
+                            let s = em.gen(&es, c)?;
+                            Ok(format!("({s}) * (({d}) - {dot})"))
+                        })
+                    }
+                    "rsoftmax" => {
+                        let es = e2.clone();
+                        let cols = x.ty.dims[1];
+                        self.back_tape(&x, &mut |em: &mut Ge, c: &[String]| {
+                            let dot = em.tmp();
+                            let k = em.tmp();
+                            em.lines.push(format!("float {dot} = 0.0f;"));
+                            em.lines
+                                .push(format!("for (int {k} = 0; {k} < {cols}; ++{k}) {{"));
+                            let av = adj(em, &[c[0].clone(), k.clone()])?;
+                            let sv = em.gen(&es, &[c[0].clone(), k.clone()])?;
+                            em.lines.push(format!("{dot} += ({av}) * ({sv});"));
+                            em.lines.push("}".into());
+                            let d = adj(em, c)?;
+                            let s = em.gen(&es, c)?;
+                            Ok(format!("({s}) * (({d}) - {dot})"))
+                        })
+                    }
+                    "rmsnorm" => {
+                        let w2 = args[1].clone();
+                        let nn = e.ty.numel().max(1);
+                        // ms/rvar are per-kernel prelude: each contrib
+                        // closure emits its own copy (contrib kernels
+                        // are separate bodies — shared `self.lines`
+                        // state would leak into the wrong kernel).
+                        let mk_prefix = |em: &mut Ge| -> Result<String, String> {
+                            let ms = em.tmp();
+                            let ix = em.tmp();
+                            em.lines.push(format!("float {ms} = 0.0f;"));
+                            em.lines.push(format!(
+                                "for (int {ix} = 0; {ix} < {nn}; ++{ix}) {{"
+                            ));
+                            let xv = em.gen(&x, &[ix.clone()])?;
+                            em.lines.push(format!("{ms} += ({xv}) * ({xv});"));
+                            em.lines.push("}".into());
+                            let rvar = em.tmp();
+                            em.lines.push(format!(
+                                "float {rvar} = rsqrt({ms} / float({nn}) + 1e-5f);"
+                            ));
+                            Ok(rvar)
+                        };
+                        // dw contrib: adj·x·r
+                        if let TExpr::Ident(wp) = &args[1].e {
+                            if self.grad_params.contains(wp) && self.is_param(wp) {
+                                let wty = args[1].ty.clone();
+                                let ag = self.ag_buf(wp, &wty);
+                                let x2 = x.clone();
+                                self.emit_contrib(&ag, &wty, &mut |em: &mut Ge, c: &[String]| {
+                                    let rv = mk_prefix(em)?;
+                                    let d = adj(em, c)?;
+                                    let xv = em.gen(&x2, c)?;
+                                    Ok(format!("(({d}) * ({xv}) * ({rv}))"))
+                                })?;
+                            }
+                        }
+                        let (w2c, xc) = (w2.clone(), x.clone());
+                        let adj4 = &mut *adj;
+                        self.back_tape(&x, &mut |em: &mut Ge, c: &[String]| {
+                            let rv = mk_prefix(em)?;
+                            let mg = em.tmp();
+                            let j = em.tmp();
+                            em.lines.push(format!("float {mg} = 0.0f;"));
+                            em.lines.push(format!(
+                                "for (int {j} = 0; {j} < {nn}; ++{j}) {{"
+                            ));
+                            let av = adj4(em, &[j.clone()])?;
+                            let wv = em.gen(&w2c, &[j.clone()])?;
+                            let xv = em.gen(&xc, &[j.clone()])?;
+                            em.lines.push(format!(
+                                "{mg} += ({av}) * ({wv}) * ({xv}) * {rv};"
+                            ));
+                            em.lines.push("}".into());
+                            let d = adj4(em, c)?;
+                            let wv = em.gen(&w2c, c)?;
+                            let xv = em.gen(&xc, c)?;
+                            Ok(format!(
+                                "{rv} * (({d}) * ({wv}) - ({xv}) * {rv} * ({mg} / float({nn})))"
+                            ))
+                        })
+                    }
+                    "concat" => {
+                        let k1 = args[0].ty.dims[0];
+                        self.back_tape(&args[0], &mut *adj)?;
+                        self.back_tape(&args[1], &mut |em: &mut Ge, c: &[String]| {
+                            adj(em, &[format!("({}) + {k1}", c[0])])
+                        })
+                    }
+                    "gather" | "embed" => {
+                        let synth = Typed {
+                            e: TExpr::Bin(
+                                BinOp::MatMul,
+                                Box::new(args[1].clone()),
+                                Box::new(args[0].clone()),
+                            ),
+                            ty: e.ty.clone(),
+                        };
+                        self.back_tape(&synth, adj)
+                    }
+                    "mse" => {
+                        let (p2, t2) = (args[0].clone(), args[1].clone());
+                        let nn = e.ty.numel().max(1);
+                        self.back_tape(&args[0], &mut |em: &mut Ge, c: &[String]| {
+                            let d = adj(em, c)?;
+                            let p = em.gen(&p2, c)?;
+                            let t = em.gen(&t2, c)?;
+                            Ok(format!("(({d}) * 2.0f * (({p}) - ({t})) / float({nn}))"))
+                        })
+                    }
+                    _ => Err(format!("gpu emit: no grad rule for {name}")),
+                }
+            }
+            TExpr::Transpose(inner) => self.back_tape(inner, &mut |em: &mut Ge, c: &[String]| {
+                let mut sw = c.to_vec();
+                sw.swap(0, 1);
+                adj(em, &sw)
+            }),
+            TExpr::Index(base, idxs) => {
+                if base.ty.dims.len() == 1 && idxs.len() == 1 {
+                    if let TIndex::Range(lo, hi) = idxs[0] {
+                        let (lo2, hi2) = (lo, hi);
+                        return self.back_tape(base, &mut |em: &mut Ge, c: &[String]| {
+                            let i = c[0].clone();
+                            let d = adj(em, &[format!("({i}) - {lo2}")])?;
+                            Ok(format!(
+                                "((({i}) >= {lo2} && ({i}) < {hi2}) ? ({d}) : 0.0f)"
+                            ))
+                        });
+                    }
+                }
+                Err("gpu emit: grad through this index form not lowered".into())
+            }
+            TExpr::Block(stmts, ret) => {
+                self.scopes.push(Vec::new());
+                self.orig_scopes.push(Vec::new());
+                let saved_bw = std::mem::replace(&mut self.in_backward, true);
+                let r = (|| {
+                    for s in stmts {
+                        match s {
+                            TStmt::Let { .. } => self.stmt(s)?,
+                            TStmt::StateUpdate { .. } | TStmt::Expr(_) => {}
+                            other => {
+                                let k = match other {
+                                    TStmt::Assign { .. } => "Assign",
+                                    TStmt::ParamUpdate { .. } => "ParamUpdate",
+                                    TStmt::AdamUpdate { .. } => "AdamUpdate",
+                                    _ => unreachable!(),
+                                };
+                                return Err(format!(
+                                    "gpu emit: non-let statement ({k}) inside grad path"
+                                ));
+                            }
+                        }
+                    }
+                    self.back_tape(ret, adj)
+                })();
+                self.in_backward = saved_bw;
+                self.scopes.pop();
+                self.orig_scopes.pop();
+                r
+            }
+            TExpr::Field(..) | TExpr::Grad { .. } => Err("gpu grad: unsupported node".into()),
+        }
+    }
+
+    /// one wrt-agnostic sweep for `loss` — seeds the terminal node's
+    /// adjoint, then drains the tape in reverse def order. Every
+    /// `grad(_, p)` sharing this loss reads `ag_<p>` afterwards.
+    fn sweep(&mut self, loss: &Typed) -> Result<(), String> {
+        let key = expr_key(loss);
+        if self.sweep_failed.contains(&key) {
+            return Err("gpu sweep: previously failed for this loss".into());
+        }
+        if !self.sweeps_done.insert(key) {
+            return Ok(());
+        }
+        // failure cleanup: contrib kernels sit in `self.scratch`
+        // un-emitted — truncate them so a fallback `grad_elem` path
+        // can't be corrupted by partial `+=` writes landing later.
+        let scratch_mark = self.scratch.len();
+        // zero + allocate ag_ for every grad param up front.
+        for (p, ty) in self.grad_param_tys.clone() {
+            let ag = self.ag_buf(&p, &ty);
+            let n = ty.numel().max(1) as usize;
+            self.scratch.push(EK {
+                name: format!("agz_{p}_{}", self.scratch.len()),
+                dispatch: Dispatch::Linear(n),
+                body: vec![format!("{ag}[gid] = 0.0f;")],
+                writable: None,
+            });
+        }
+        // bind the whole tape into scope: primal reads resolve to the
+        // forward-time buffers (persistent) or inline small defs.
+        self.scopes.push(Vec::new());
+        self.orig_scopes.push(Vec::new());
+        let saved_bw = std::mem::replace(&mut self.in_backward, true);
+        for name in self.tape_order.clone() {
+            let def = self.tape_def[&name].clone();
+            match self.persistent.get(&name) {
+                Some((_, _, buf)) => {
+                    let e = Typed {
+                        e: TExpr::Ident(buf.clone()),
+                        ty: def.ty.clone(),
+                    };
+                    self.scopes.last_mut().unwrap().push((name.clone(), e));
+                }
+                None => {
+                    self.scopes
+                        .last_mut()
+                        .unwrap()
+                        .push((name.clone(), def.clone()));
+                }
+            }
+            self.orig_scopes
+                .last_mut()
+                .unwrap()
+                .push((name.clone(), def));
+        }
+        let r = (|| {
+            let terminal = match &loss.e {
+                TExpr::Block(stmts, ret) => {
+                    for s in stmts {
+                        match s {
+                            TStmt::Let { .. } => self.stmt(s)?,
+                            TStmt::StateUpdate { .. } | TStmt::Expr(_) => {}
+                            _ => {
+                                return Err(
+                                    "gpu emit: non-let statement inside grad loss".into()
+                                )
+                            }
+                        }
+                    }
+                    (**ret).clone()
+                }
+                _ => loss.clone(),
+            };
+            match &terminal.e {
+                TExpr::Call(name, args, _) if name == "mse" => {
+                    let n = args[0].ty.numel().max(1);
+                    let pred = args[0].clone();
+                    let tgt = args[1].clone();
+                    // seed: adjoint of the prediction = 2(p−t)/n,
+                    // materialized into the pred node's adjb buffer.
+                    let seed_name = match &pred.e {
+                        TExpr::Ident(s) => s.clone(),
+                        _ => return Err("gpu sweep: mse pred must be a let-bound ident".into()),
+                    };
+                    let pty = pred.ty.clone();
+                    let ab = self.adj_buf(&seed_name, &pty);
+                    let numel = pty.numel().max(1) as usize;
+                    let coords = Self::coords_of("gid", &pty.dims);
+                    let pv = self.gen(&pred, &coords)?;
+                    let tv = self.gen(&tgt, &coords)?;
+                    self.scratch.push(EK {
+                        name: format!("seed_{seed_name}_{}", self.scratch.len()),
+                        dispatch: Dispatch::Linear(numel),
+                        body: vec![format!(
+                            "{ab}[gid] = (2.0f * (({pv}) - ({tv})) / float({n}));"
+                        )],
+                        writable: None,
+                    });
+                    // drain tape in reverse def order — a let's adjoint
+                    // is complete once every later def has contributed.
+                    let order: Vec<String> = self.tape_order.iter().rev().cloned().collect();
+                    for name in order {
+                        let Some(abuf) = self.adj_bufs.get(&name).cloned() else {
+                            continue;
+                        };
+                        let def = self.tape_def[&name].clone();
+                        let dty = def.ty.clone();
+                        let adj_buf_name = abuf.clone();
+                        self.back_tape(&def, &mut |em: &mut Ge, c: &[String]| {
+                            Ok(em.adj_rd(&adj_buf_name, &dty, c))
+                        })?;
+                    }
+                    Ok(())
+                }
+                _ => Err("gpu emit: grad v1 losses must end in mse".into()),
+            }
+        })();
+        self.in_backward = saved_bw;
+        self.scopes.pop();
+        self.orig_scopes.pop();
+        if r.is_err() {
+            if std::env::var("COYOTE_GPU_DEBUG").is_ok() {
+                eprintln!("gpu sweep failed: {}", r.as_ref().err().unwrap());
+            }
+            self.scratch.truncate(scratch_mark);
+            self.sweeps_done.remove(&key);
+            self.sweep_failed.insert(key);
+        }
+        r
+    }
+
     fn stmt(&mut self, s: &TStmt) -> Result<(), String> {
         match s {
             TStmt::Let { name, expr } => {
@@ -2054,6 +2683,14 @@ impl Ge {
                         .unwrap()
                         .push((name.clone(), expr.clone()));
                 }
+                // tape: record AFTER the rhs — inner lets of an
+                // inlined block land first, so tape_order is post-order
+                // (dependencies before consumers) and the sweep's
+                // reverse walk is a valid backward topological order.
+                if !self.in_backward {
+                    self.tape_order.push(name.clone());
+                    self.tape_def.insert(name.clone(), expr.clone());
+                }
                 Ok(())
             }
             TStmt::ParamUpdate { param, scale, grad } => match &grad.e {
@@ -2065,12 +2702,25 @@ impl Ge {
                         .get(param)
                         .copied()
                         .ok_or_else(|| format!("gpu emit: {param} not a param"))?;
+                    // tape sweep: one wrt-agnostic backward fills ag_
+                    // for every param sharing this loss — the update
+                    // then reads the grad buffer instead of inlining
+                    // a per-param adjoint DAG.
+                    let swept = self.sweep(loss).is_ok() && self.ag_hits.contains(param);
+                    if swept {
+                        self.emit_q.extend(self.scratch.drain(..));
+                    }
                     let mark = self.scratch.len();
                     let saved = std::mem::take(&mut self.lines);
-                    let g = self
-                        .grad_elem(loss, param, "gid")
-                        .map_err(|e| format!("grad({param}): {e}"))?
-                        .ok_or_else(|| format!("gpu emit: loss does not depend on {param}"))?;
+                    let g = if swept {
+                        format!("ag_{param}[gid]")
+                    } else {
+                        self.grad_elem(loss, param, "gid")
+                            .map_err(|e| format!("grad({param}): {e}"))?
+                            .ok_or_else(|| {
+                                format!("gpu emit: loss does not depend on {param}")
+                            })?
+                    };
                     self.lines
                         .push(self.param_st(param, "+=", &format!("float({scale}) * ({g})")));
                     let body = std::mem::replace(&mut self.lines, saved);
@@ -2107,21 +2757,32 @@ impl Ge {
                             self.scratch_args.push((b, n));
                         }
                     }
-                    let mark = self.scratch.len();
-                    let saved = std::mem::take(&mut self.lines);
-                    let g = self
-                        .grad_elem(loss, param, "gid")
-                        .map_err(|e| format!("grad({param}): {e}"))?
-                        .ok_or_else(|| format!("gpu emit: loss does not depend on {param}"))?;
-                    self.lines.push(format!("ag_{param}[gid] = ({g});"));
-                    let body = std::mem::replace(&mut self.lines, saved);
-                    self.emit_q.extend(self.scratch.drain(mark..));
-                    self.emit_q.push(EK {
-                        name: format!("grd_{param}_{}", self.emit_q.len()),
-                        dispatch: Dispatch::Linear(numel),
-                        body,
-                        writable: None, // writes ag_ scratch — always device
-                    });
+                    // tape sweep: one wrt-agnostic backward fills ag_
+                    // for every param sharing this loss — when it
+                    // covers `param`, the per-param grd kernel is
+                    // unnecessary (ag_ already holds the gradient).
+                    let swept = self.sweep(loss).is_ok() && self.ag_hits.contains(param);
+                    if swept {
+                        self.emit_q.extend(self.scratch.drain(..));
+                    } else {
+                        let mark = self.scratch.len();
+                        let saved = std::mem::take(&mut self.lines);
+                        let g = self
+                            .grad_elem(loss, param, "gid")
+                            .map_err(|e| format!("grad({param}): {e}"))?
+                            .ok_or_else(|| {
+                                format!("gpu emit: loss does not depend on {param}")
+                            })?;
+                        self.lines.push(format!("ag_{param}[gid] = ({g});"));
+                        let body = std::mem::replace(&mut self.lines, saved);
+                        self.emit_q.extend(self.scratch.drain(mark..));
+                        self.emit_q.push(EK {
+                            name: format!("grd_{param}_{}", self.emit_q.len()),
+                            dispatch: Dispatch::Linear(numel),
+                            body,
+                            writable: None, // writes ag_ scratch — always device
+                        });
+                    }
                     // adam_step parity: b1=0.9 b2=0.999 eps=1e-2
                     // (fp16-safe), w rounded to half after the update.
                     // Pooled params read-modify-write inside
@@ -2327,9 +2988,35 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         ver: 0,
         in_backward: false,
         pstats: (0, 0),
+        tape_order: Vec::new(),
+        tape_def: HashMap::new(),
+        grad_params: std::collections::HashSet::new(),
+        sweeps_done: std::collections::HashSet::new(),
+        adj_n: 0,
+        adj_bufs: HashMap::new(),
+        param_tys: HashMap::new(),
+        grad_param_tys: HashMap::new(),
+        ag_hits: std::collections::HashSet::new(),
+        sweep_failed: std::collections::HashSet::new(),
         lines: Vec::new(),
         tmp: 0,
     };
+    // tape sweep bookkeeping: every param's type, and the full set of
+    // grad(_, w) targets so one sweep covers all params sharing a loss.
+    for t in &p.params {
+        ge.param_tys.insert(t.name.clone(), t.ty.clone());
+    }
+    let mut gps = std::collections::HashSet::new();
+    for s in &p.body {
+        scan_grads_s(s, &mut gps);
+    }
+    scan_grads_e(&p.ret, &mut gps);
+    for w in gps {
+        if let Some(t) = p.params.iter().find(|t| t.name == w) {
+            ge.grad_params.insert(w.clone());
+            ge.grad_param_tys.insert(w, t.ty.clone());
+        }
+    }
     // arg names — buffer indices are assigned once scratch buffers
     // are counted (they append after the declared args).
     let mut base_args: Vec<(String, String, bool)> = Vec::new(); // (arg, port, state?)

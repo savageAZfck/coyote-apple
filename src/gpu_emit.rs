@@ -2379,6 +2379,90 @@ impl Ge {
         Ok(())
     }
 
+    /// materialize `out[o] = Σ_{j<contract} term(j, o)` as a f32
+    /// scratch buffer: C-way j-chunk partial sums plus a cross-thread
+    /// reduce. Replaces the per-element serial contraction loops that
+    /// backward rules (rmsnorm ms/mg, softmax dot) used to recompute
+    /// inside every contrib thread — O(contract) work per output
+    /// element becomes O(contract/C) per thread with C×M threads.
+    /// `term` yields the j-th product expr; `jcoords` is `["pj"]`,
+    /// `ocoords` the output element's coord exprs (empty for scalars).
+    /// Returns the out buffer name.
+    fn emit_contract_sum(
+        &mut self,
+        out_dims: &[i64],
+        contract: usize,
+        term: &mut dyn FnMut(&mut Ge, &[String], &[String]) -> Result<String, String>,
+    ) -> Result<String, String> {
+        let m_out = out_dims.iter().product::<i64>().max(1) as usize;
+        let c_num = ((32768 / m_out).clamp(1, 32)).min(contract);
+        if c_num <= 1 {
+            return Err("gpu emit: contract too small for chunked sum".into());
+        }
+        let cs = contract.div_ceil(c_num);
+        let nbuf = self.scratch_args.len();
+        let part = format!("b__sp{nbuf}");
+        let out = format!("b__sc{nbuf}");
+        self.scratch_args.push((part.clone(), c_num * m_out));
+        self.scratch_args.push((out.clone(), m_out));
+        self.bufs.insert(
+            out.clone(),
+            (
+                out.clone(),
+                CTy {
+                    dt: DType::F32,
+                    dims: out_dims.to_vec(),
+                },
+                Kind::Row,
+            ),
+        );
+        // partials: gid ↦ (oi, pc); part[gid] keeps the same linear
+        // order so no index math is needed on either side.
+        let saved = std::mem::take(&mut self.lines);
+        {
+            self.lines.push(format!("uint oi = gid % {m_out}u;"));
+            self.lines.push(format!("uint pc = gid / {m_out}u;"));
+            self.lines.push(format!("uint pj0 = pc * {cs}u;"));
+            self.lines
+                .push(format!("uint pj1 = min(pj0 + {cs}u, {contract}u);"));
+            self.lines.push("float acc = 0.0f;".into());
+            self.lines.push("for (uint pj = pj0; pj < pj1; ++pj) {".into());
+            let ocoords = Self::coords_of("oi", out_dims);
+            let jc = vec!["pj".to_string()];
+            let tv = term(self, &jc, &ocoords)?;
+            self.lines.push(format!("acc += ({tv});"));
+            self.lines.push("}".into());
+            let st = self.st_any(&part, "gid", "=", "acc");
+            self.lines.push(st);
+        }
+        let pbody = std::mem::take(&mut self.lines);
+        self.lines = saved;
+        self.scratch.push(EK {
+            name: format!("csp_{nbuf}"),
+            dispatch: Dispatch::Linear(c_num * m_out),
+            body: pbody,
+            writable: None,
+        });
+        // reduce: out[gid] = Σ_c part[c·m_out + gid]
+        let saved = std::mem::take(&mut self.lines);
+        self.lines.push("float acc = 0.0f;".into());
+        self.lines.push(format!("for (uint pc = 0; pc < {c_num}; ++pc) {{"));
+        let pv = self.ld(&part, &format!("pc * {m_out} + gid"));
+        self.lines.push(format!("acc += {pv};"));
+        self.lines.push("}".into());
+        let st = self.st_any(&out, "gid", "=", "acc");
+        self.lines.push(st);
+        let rbody = std::mem::take(&mut self.lines);
+        self.lines = saved;
+        self.scratch.push(EK {
+            name: format!("csr_{nbuf}"),
+            dispatch: Dispatch::Linear(m_out),
+            body: rbody,
+            writable: None,
+        });
+        Ok(out)
+    }
+
     /// tape-node adjoint read: `adjb[flat(coords)]` — the seed every
     /// backward walk starts from once a node's adjoint is materialized.
     /// Half adjoints widen to float — bare `half` r-values make
@@ -2677,6 +2761,24 @@ impl Ge {
                     "softmax" => {
                         let es = e2.clone();
                         let n = e.ty.numel().max(1);
+                        if n >= 256 {
+                            // dot = Σ_j adj[j]·s[j] — one scalar per
+                            // node; materialize it instead of letting
+                            // every output element redo the n-loop.
+                            let es_s = es.clone();
+                            let adj_s = &mut *adj;
+                            let dot_buf = self.emit_contract_sum(&[], n as usize, &mut |em, jc, _oc| {
+                                let av = adj_s(em, jc)?;
+                                let sv = em.gen(&es_s, jc)?;
+                                Ok(format!("(({av}) * ({sv}))"))
+                            })?;
+                            let db = dot_buf.clone();
+                            self.back_tape(&x, &mut |em: &mut Ge, c: &[String]| {
+                                let d = adj(em, c)?;
+                                let s = em.gen(&es, c)?;
+                                Ok(format!("({s}) * (({d}) - {db}[0])"))
+                            })
+                        } else {
                         self.back_tape(&x, &mut |em: &mut Ge, c: &[String]| {
                             let dot = em.tmp();
                             let j = em.tmp();
@@ -2691,10 +2793,30 @@ impl Ge {
                             let s = em.gen(&es, c)?;
                             Ok(format!("({s}) * (({d}) - {dot})"))
                         })
+                        }
                     }
                     "rsoftmax" => {
                         let es = e2.clone();
                         let cols = x.ty.dims[1];
+                        if cols >= 256 {
+                            // dot[r] = Σ_k adj[r,k]·s[r,k] — one scalar
+                            // per row; chunked partials + reduce.
+                            let rows = x.ty.dims[0];
+                            let es_r = es.clone();
+                            let adj_r = &mut *adj;
+                            let dot_buf = self.emit_contract_sum(&[rows], cols as usize, &mut |em, jc, oc| {
+                                let rc = [oc[0].clone(), jc[0].clone()];
+                                let av = adj_r(em, &rc)?;
+                                let sv = em.gen(&es_r, &rc)?;
+                                Ok(format!("(({av}) * ({sv}))"))
+                            })?;
+                            let db = dot_buf.clone();
+                            self.back_tape(&x, &mut |em: &mut Ge, c: &[String]| {
+                                let d = adj(em, c)?;
+                                let s = em.gen(&es, c)?;
+                                Ok(format!("({s}) * (({d}) - {db}[{}]))", c[0]))
+                            })
+                        } else {
                         self.back_tape(&x, &mut |em: &mut Ge, c: &[String]| {
                             let dot = em.tmp();
                             let k = em.tmp();
@@ -2709,10 +2831,61 @@ impl Ge {
                             let s = em.gen(&es, c)?;
                             Ok(format!("({s}) * (({d}) - {dot})"))
                         })
+                        }
                     }
                     "rmsnorm" => {
                         let w2 = args[1].clone();
                         let nn = e.ty.numel().max(1);
+                        if nn >= 256 && x.ty.dims.len() == 1 {
+                            // materialize ms=Σx² and mg=Σ adj·w·x·rvar
+                            // once per node — the serial versions made
+                            // every contrib thread redo both nn-loops.
+                            let x_ms = x.clone();
+                            let ms_buf = self.emit_contract_sum(&[], nn as usize, &mut |em, jc, _oc| {
+                                let xv = em.gen(&x_ms, jc)?;
+                                Ok(format!("(({xv}) * ({xv}))"))
+                            })?;
+                            let rvar_e =
+                                format!("rsqrt({ms_buf}[0] / float({nn}) + 1e-5f)");
+                            let (w_m, x_m) = (args[1].clone(), x.clone());
+                            let rv_m = rvar_e.clone();
+                            let adj_m = &mut *adj;
+                            let mg_buf = self.emit_contract_sum(&[], nn as usize, &mut |em, jc, _oc| {
+                                let av = adj_m(em, jc)?;
+                                let wv = em.gen(&w_m, jc)?;
+                                let xv = em.gen(&x_m, jc)?;
+                                Ok(format!("(({av}) * ({wv}) * ({xv}) * ({rv_m}))"))
+                            })?;
+                            // dw contrib: adj·x·r — pure elementwise now
+                            if let TExpr::Ident(wp) = &args[1].e {
+                                if self.grad_params.contains(wp) && self.is_param(wp) {
+                                    let wty = args[1].ty.clone();
+                                    let ag = self.ag_buf(wp, &wty);
+                                    let (x2, rv2) = (x.clone(), rvar_e.clone());
+                                    let adjw = &mut *adj;
+                                    self.emit_contrib(&ag, &wty, &mut |em: &mut Ge, c: &[String]| {
+                                        let d = adjw(em, c)?;
+                                        let xv = em.gen(&x2, c)?;
+                                        Ok(format!("(({d}) * ({xv}) * ({rv2}))"))
+                                    })?;
+                                }
+                            }
+                            let (w2c, xc, mgv, rve) = (
+                                args[1].clone(),
+                                x.clone(),
+                                format!("{mg_buf}[0]"),
+                                rvar_e.clone(),
+                            );
+                            let adj4 = &mut *adj;
+                            self.back_tape(&x, &mut |em: &mut Ge, c: &[String]| {
+                                let d = adj4(em, c)?;
+                                let wv = em.gen(&w2c, c)?;
+                                let xv = em.gen(&xc, c)?;
+                                Ok(format!(
+                                    "{rve} * (({d}) * ({wv}) - ({xv}) * {rve} * ({mgv} / float({nn})))"
+                                ))
+                            })
+                        } else {
                         // ms/rvar are per-kernel prelude: each contrib
                         // closure emits its own copy (contrib kernels
                         // are separate bodies — shared `self.lines`
@@ -2771,6 +2944,7 @@ impl Ge {
                                 "{rv} * (({d}) * ({wv}) - ({xv}) * {rv} * ({mg} / float({nn})))"
                             ))
                         })
+                        }
                     }
                     "concat" => {
                         let k1 = args[0].ty.dims[0];

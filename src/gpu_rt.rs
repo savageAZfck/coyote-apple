@@ -201,6 +201,9 @@ pub struct GpuRuntime {
     /// GPU-side duration of the last dispatch (command buffer
     /// GPUStartTime→GPUEndTime), milliseconds.
     last_ms: f64,
+    /// host wall time of commit→completed across all chunks — the
+    /// fallback clock when GPU timestamps report ~0 on huge CBs.
+    last_wall_ms: f64,
     /// CYO_PKT: one command buffer per kernel, so each pipeline gets
     /// its own GPU timestamp — per-kernel breakdown in `prof`.
     per_kernel: bool,
@@ -463,7 +466,8 @@ impl GpuRuntime {
             let base = tbl.contents() as *mut u64;
             for (i, b) in bufs.iter().enumerate() {
                 unsafe {
-                    *base.add(i) = b.contents() as usize as u64;
+                    let ga: u64 = msg_send![b.as_ref(), gpuAddress];
+                    *base.add(i) = ga;
                 }
             }
             bufs.push(tbl);
@@ -516,6 +520,7 @@ impl GpuRuntime {
             half_slots,
             ptrs_i,
             last_ms: 0.0,
+            last_wall_ms: 0.0,
             per_kernel: std::env::var_os("CYO_PKT").is_some(),
             last_kernels: Vec::new(),
         })
@@ -606,6 +611,12 @@ impl GpuRuntime {
             let e: f64 = msg_send![cb, GPUEndTime];
             (e - s) * 1000.0
         };
+        // No `use_resources` residency calls: every buffer here is
+        // StorageModeShared — unified memory the GPU addresses directly
+        // through the pointer table's gpuAddresses. Marking the whole
+        // ~6k-buffer set resident per encoder is what exhausted
+        // IOGPUDeviceShmem (kIOGPUCommandBufferCallbackErrorOutOfMemory)
+        // on own4b.
         if self.per_kernel {
             // CYO_PKT — one command buffer per kernel so each pipeline
             // carries its own GPU timestamps. Costs a commit+wait per
@@ -629,24 +640,50 @@ impl GpuRuntime {
                 self.last_kernels.push((name.clone(), ms));
             }
         } else {
-            let cb = self.queue.new_command_buffer();
-            // one encoder per dispatch — encoders serialize, so update
-            // kernels fully complete before the out kernel reads params.
-            for (pipe, disp, _, uses) in &self.pipes {
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(pipe);
-                for (li, &gi) in uses.iter().enumerate() {
-                    let bi = if gi == u32::MAX { self.ptrs_i } else { gi as usize };
-                    enc.set_buffer(li as u64, Some(&self.bufs[bi]), 0);
+            // chunk dispatches across command buffers (512 encoders
+            // per cb) so argument-buffer residency (`use_resources`)
+            // never exhausts IOGPUDeviceShmem on 6,700-kernel programs.
+            self.last_ms = 0.0;
+            self.last_wall_ms = 0.0;
+            for (ci, chunk) in self.pipes.chunks(512).enumerate() {
+                let cb = self.queue.new_command_buffer();
+                for (pipe, disp, _, uses) in chunk {
+                    let enc = cb.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(pipe);
+                    for (li, &gi) in uses.iter().enumerate() {
+                        let bi = if gi == u32::MAX { self.ptrs_i } else { gi as usize };
+                        enc.set_buffer(li as u64, Some(&self.bufs[bi]), 0);
+                    }
+                    dispatch(enc, pipe, disp);
+                    enc.end_encoding();
                 }
-                dispatch(enc, pipe, disp);
-                enc.end_encoding();
+                let t0 = std::time::Instant::now();
+                cb.commit();
+                cb.wait_until_completed();
+                self.last_wall_ms += t0.elapsed().as_secs_f64() * 1000.0;
+                let ms = gpu_ms(cb);
+                self.last_ms += ms;
+                // diagnostics: a faulted chunk reports ~0 GPU time while
+                // the host still paid the encode cost — surface the
+                // Metal error instead of silently trusting the clock.
+                let status: usize = unsafe { msg_send![&*cb, status] };
+                if status != 4 {
+                    // MTLCommandBufferStatusCompleted == 4
+                    let err: *mut objc::runtime::Object = unsafe { msg_send![&*cb, error] };
+                    eprintln!(
+                        "gpu_rt: chunk {ci} cb status {status} err {:?}",
+                        if err.is_null() {
+                            None
+                        } else {
+                            Some(unsafe {
+                                let d: *const std::ffi::c_char =
+                                    msg_send![err, UTF8String];
+                                std::ffi::CStr::from_ptr(d).to_string_lossy().into_owned()
+                            })
+                        }
+                    );
+                }
             }
-            cb.commit();
-            cb.wait_until_completed();
-            // device-side kernel time: MTLCommandBuffer's own GPU
-            // timestamps — the profiler's ground truth, not host wall.
-            self.last_ms = gpu_ms(cb);
         }
         let out = unsafe {
             std::slice::from_raw_parts(self.bufs[0].contents() as *const f32, self.out_n).to_vec()
@@ -686,7 +723,13 @@ impl coyote::backend::BackendExec for GpuRuntime {
         GpuRuntime::run(self, writes)
     }
     fn device_ms(&self) -> Option<f64> {
-        Some(self.last_ms)
+        // prefer the commit→completed wall clock: GPUStart/End report
+        // ~0 on multi-chunk command buffers even while kernels run.
+        if self.last_wall_ms > 0.0 {
+            Some(self.last_wall_ms)
+        } else {
+            Some(self.last_ms)
+        }
     }
     fn read(&self, port: &str) -> Option<Vec<f32>> {
         self.read_buf(port)

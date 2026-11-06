@@ -76,6 +76,7 @@ fn prof_ext(
     dir: &PathBuf,
     runs: usize,
     dump: bool,
+    no_cpu: bool,
 ) -> Result<Stats, String> {
     let be = coyote::backend::backend_for(prog.target)?;
     let t0 = Instant::now();
@@ -190,7 +191,15 @@ fn prof_ext(
             println!("  dump    n/a — backend exposes no buffer readback");
         }
     }
-    let (cpu_min, cpu_avg) = prof_cpu(prog, &inputs, runs);
+    // `--no-cpu` skips the reference-evaluator parity pass — at
+    // organism scale the scalar eval materializes the whole tape and
+    // gets jetsam-killed before the device numbers can print.
+    let (cpu_min, cpu_avg, parity) = if no_cpu {
+        (0.0f64, 0.0f64, f32::NAN)
+    } else {
+        let (cmin, cavg) = prof_cpu(prog, &inputs, runs);
+        (cmin, cavg, eval_parity(prog, &inputs, &first))
+    };
     Ok(Stats {
         emit_ms,
         host_min,
@@ -200,7 +209,7 @@ fn prof_ext(
         kernels: kmins,
         cpu_min,
         cpu_avg,
-        parity: eval_parity(prog, &inputs, &first),
+        parity,
         outs: out.output.1.numel() as usize,
     })
 }
@@ -273,11 +282,19 @@ fn prof_ane(src: &str, prog: &TProgram, dir: &PathBuf, runs: usize) -> Result<St
 
 pub fn run(args: &[String]) -> Result<(), i32> {
     let Some(file) = args.iter().find(|a| !a.starts_with('-')) else {
-        eprintln!("usage: coyote-apple prof <file.cy> [--runs N] [--json]");
+        eprintln!("usage: coyote-apple prof <file.cy> [--runs N] [--json] [--no-cpu]");
         return Err(2);
     };
     let json = args.iter().any(|a| a == "--json");
     let dump = args.iter().any(|a| a == "--dump");
+    let no_cpu = args.iter().any(|a| a == "--no-cpu");
+    // `--only <name>` profiles a single tensor program — big files
+    // (own4b: forward + 9 blocks + head) OOM/jetsam when every program
+    // emits and loads in one process.
+    let only: Option<String> = args
+        .windows(2)
+        .find(|w| w[0] == "--only")
+        .map(|w| w[1].clone());
     let runs: usize = args
         .windows(2)
         .find(|w| w[0] == "--runs")
@@ -301,11 +318,16 @@ pub fn run(args: &[String]) -> Result<(), i32> {
         // that carries `fn` + `gpu fn` for the same math prints the
         // same-source comparison across ane, gpu and the cpu evaluator.
         for (name, prog) in checked.ane.iter() {
+            if let Some(o) = &only {
+                if name != o {
+                    continue;
+                }
+            }
             let pdir = dir.join(name);
             std::fs::create_dir_all(&pdir).ok();
             let s = match prog.target {
                 coyote::ast::Target::Ane => prof_ane(&src, prog, &pdir, runs),
-                _ => prof_ext(&src, prog, &pdir, runs, dump),
+                _ => prof_ext(&src, prog, &pdir, runs, dump, no_cpu),
             }?;
             if json {
                 println!(

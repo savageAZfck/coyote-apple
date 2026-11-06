@@ -1176,41 +1176,114 @@ impl Ge {
                 self.lines.push("}".into());
                 self.lines
                     .push("threadgroup_barrier(mem_flags::mem_device);".into());
-                // the sum is order-sensitive — serial, eval order.
-                self.lines.push(format!(
-                    "if (lid == 0) {{ float s = 0.0f; for (uint i = 0; i < {n}; ++i) s += float({eb}[i]); ts = s; }}"
-                ));
-                self.lines
-                    .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+                if std::env::var_os("CYO_SERIAL_REDUCE").is_some() {
+                    // the sum is order-sensitive — serial, eval order.
+                    self.lines.push(format!(
+                        "if (lid == 0) {{ float s = 0.0f; for (uint i = 0; i < {n}; ++i) s += float({eb}[i]); ts = s; }}"
+                    ));
+                    self.lines.push(
+                        "threadgroup_barrier(mem_flags::mem_threadgroup);".into(),
+                    );
+                } else {
+                    // parallel tree sum — strided partials per thread,
+                    // log-step combine in threadgroup memory. Same
+                    // rounding class as the f16-scratch and simdgroup
+                    // paths (parity ~1e-7, not bit-exact); the serial
+                    // eval-order pass stays available for parity runs.
+                    self.lines
+                        .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+                    self.lines.push("part = 0.0f;".into());
+                    self.lines
+                        .push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
+                    let ebp = if self.half_scratch.contains(&eb) {
+                        format!("float({eb}[i])")
+                    } else {
+                        format!("{eb}[i]")
+                    };
+                    self.lines.push(format!("part += {ebp};"));
+                    self.lines.push("}".into());
+                    self.lines.push("tr[lid] = part;".into());
+                    self.lines
+                        .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+                    self.lines
+                        .push(format!("for (uint s = {}; s > 0; s >>= 1) {{", T / 2));
+                    self.lines
+                        .push("if (lid < s) tr[lid] += tr[lid + s];".into());
+                    self.lines
+                        .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+                    self.lines.push("}".into());
+                }
                 let ebv = if self.half_scratch.contains(&eb) {
                     format!("float({eb}[i])")
                 } else {
                     format!("{eb}[i]")
                 };
-                let st = self.st_any(out_buf, "i", "=", &format!("{ebv} / ts"));
+                let denom = if std::env::var_os("CYO_SERIAL_REDUCE").is_some() {
+                    "ts".to_string()
+                } else {
+                    "tr[0]".to_string()
+                };
+                let st = self.st_any(out_buf, "i", "=", &format!("{ebv} / {denom}"));
                 self.lines
                     .push(format!("for (uint i = lid; i < {n}; i += {T}) {st}"));
             }
             _ => {
-                self.lines.push("threadgroup float tv;".into());
-                self.lines.push("if (lid == 0) {".into());
-                self.lines.push("float acc = 0.0f;".into());
-                self.lines
-                    .push(format!("for (uint i = 0; i < {n}; ++i) {{"));
-                let v = self.gen(x, &cs)?;
-                self.lines.push(format!("acc += ({v}) * ({v});"));
-                self.lines.push("}".into());
-                self.lines
-                    .push(format!("tv = rsqrt(acc / float({n}) + 1e-5f);"));
-                self.lines.push("}".into());
-                self.lines
-                    .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
-                let wv = self.gen(&args[1], &cs)?;
-                self.lines.push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
-                let v = self.gen(x, &cs)?;
-                let st = self.st_any(out_buf, "i", "=", &format!("({v}) * tv * ({wv})"));
-                self.lines.push(st);
-                self.lines.push("}".into());
+                if std::env::var_os("CYO_SERIAL_REDUCE").is_some() {
+                    self.lines.push("threadgroup float tv;".into());
+                    self.lines.push("if (lid == 0) {".into());
+                    self.lines.push("float acc = 0.0f;".into());
+                    self.lines
+                        .push(format!("for (uint i = 0; i < {n}; ++i) {{"));
+                    let v = self.gen(x, &cs)?;
+                    self.lines.push(format!("acc += ({v}) * ({v});"));
+                    self.lines.push("}".into());
+                    self.lines
+                        .push(format!("tv = rsqrt(acc / float({n}) + 1e-5f);"));
+                    self.lines.push("}".into());
+                    self.lines
+                        .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+                    let wv = self.gen(&args[1], &cs)?;
+                    self.lines.push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
+                    let v = self.gen(x, &cs)?;
+                    let st = self.st_any(out_buf, "i", "=", &format!("({v}) * tv * ({wv})"));
+                    self.lines.push(st);
+                    self.lines.push("}".into());
+                } else {
+                    // parallel tree sum — strided partials per thread,
+                    // log-step combine. At n=2560 the serial eval-order
+                    // pass ran on ONE thread while 255 idled (~140ms
+                    // per norm × 73 per forward); the tree does the
+                    // same math in ~microseconds. Rounding differs
+                    // from eval order — same class as f16 scratch and
+                    // the simdgroup path; CYO_SERIAL_REDUCE=1 keeps
+                    // the bit-exact pass for parity runs.
+                    self.lines.push(format!("threadgroup float tr[{T}];"));
+                    self.lines.push("float part = 0.0f;".into());
+                    self.lines
+                        .push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
+                    let v = self.gen(x, &cs)?;
+                    self.lines.push(format!("part += ({v}) * ({v});"));
+                    self.lines.push("}".into());
+                    self.lines.push("tr[lid] = part;".into());
+                    self.lines
+                        .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+                    self.lines
+                        .push(format!("for (uint s = {}; s > 0; s >>= 1) {{", T / 2));
+                    self.lines
+                        .push("if (lid < s) tr[lid] += tr[lid + s];".into());
+                    self.lines
+                        .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
+                    self.lines.push("}".into());
+                    let wv = self.gen(&args[1], &cs)?;
+                    self.lines.push(format!(
+                        "float tv = rsqrt(tr[0] / float({n}) + 1e-5f);"
+                    ));
+                    self.lines.push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
+                    let v = self.gen(x, &cs)?;
+                    let st = self.st_any(out_buf, "i", "=", &format!("({v}) * tv * ({wv})"));
+                    self.lines.push(st);
+                    self.lines.push("}".into());
+                }
             }
         }
         let body = std::mem::replace(&mut self.lines, saved);

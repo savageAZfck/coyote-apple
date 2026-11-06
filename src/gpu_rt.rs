@@ -14,6 +14,114 @@ use metal::{CompileOptions, MTLResourceOptions, MTLSize};
 use objc::{msg_send, sel, sel_impl};
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::Mutex;
+
+/// Shared device-resident parameter storage across every `GpuRuntime`
+/// loaded through one `MetalBackend`. Programs whose declared param
+/// set is identical (same fingerprint) share a single f32 pool buffer
+/// and one f16 buffer per param — an optimizer update landing in
+/// `train_l0`'s buffers is the same bytes `forward` and `train_l1`
+/// read, with no host round-trip and no per-runtime weight copies.
+/// Unified memory makes this an alias, not a copy: `StorageModeShared`
+/// buffers are system DRAM both the CPU staging path and every GPU
+/// dispatch already address directly.
+///
+/// Programs with different param universes get separate arena states
+/// — name collisions across unrelated models can never alias.
+pub struct GpuArena {
+    inner: Mutex<HashMap<u64, ArenaState>>,
+}
+
+struct ArenaState {
+    /// shared `__params_pool` buffer + capacity in f32 elements.
+    pool: Option<(metal::Buffer, usize)>,
+    /// param name → shared f16 buffer (+ element count).
+    half: HashMap<String, (metal::Buffer, usize)>,
+}
+
+impl GpuArena {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// identity of a program's whole param universe — every gpu fn of
+    /// one model declares the same top-level params in the same order,
+    /// so all of them hash identically and share one arena state.
+    fn fingerprint(p: &TProgram) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for t in &p.params {
+            t.name.hash(&mut h);
+            t.ty.dims.hash(&mut h);
+            format!("{:?}", t.ty.dt).hash(&mut h);
+            t.src.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// the shared pool buffer for this param universe, allocating on
+    /// first use. Capacity is the caller's `pool_total` — identical
+    /// fingerprints imply identical totals.
+    fn pool_buf(
+        &self,
+        f: u64,
+        cap_elems: usize,
+        dev: &metal::Device,
+    ) -> Result<metal::Buffer, String> {
+        let mut g = self.inner.lock().map_err(|_| "gpu arena poisoned")?;
+        let st = g.entry(f).or_insert_with(|| ArenaState {
+            pool: None,
+            half: HashMap::new(),
+        });
+        if let Some((b, cap)) = &st.pool {
+            if *cap < cap_elems {
+                return Err(format!(
+                    "gpu arena pool: {} elems shared, program wants {}",
+                    cap, cap_elems
+                ));
+            }
+            return Ok(b.clone());
+        }
+        let b = dev.new_buffer(
+            (cap_elems * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        st.pool = Some((b.clone(), cap_elems));
+        Ok(b)
+    }
+
+    /// the shared f16 buffer for `name`, allocating + filling on first
+    /// use. A later program with the same param universe reuses the
+    /// resident bytes — including values a trainer already updated.
+    fn half_buf(
+        &self,
+        f: u64,
+        name: &str,
+        data: &[f32],
+        dev: &metal::Device,
+    ) -> Result<metal::Buffer, String> {
+        let mut g = self.inner.lock().map_err(|_| "gpu arena poisoned")?;
+        let st = g.entry(f).or_insert_with(|| ArenaState {
+            pool: None,
+            half: HashMap::new(),
+        });
+        if let Some((b, n)) = st.half.get(name) {
+            if *n != data.len() {
+                return Err(format!(
+                    "gpu arena {name}: {} elems shared, program wants {}",
+                    n,
+                    data.len()
+                ));
+            }
+            return Ok(b.clone());
+        }
+        let b = buf_f16(dev, data);
+        st.half.insert(name.to_string(), (b.clone(), data.len()));
+        Ok(b)
+    }
+}
 
 pub struct GpuRuntime {
     _dev: metal::Device,
@@ -80,7 +188,14 @@ impl GpuRuntime {
     /// compile the emitted MSL and allocate resident buffers. Params
     /// resolve exactly like the CPU evaluator's — `[N, K]` storage for
     /// 2-D, `param_fallback` deterministic init when no `@ src`.
-    pub fn load(p: &TProgram, name: &str, out: &crate::gpu_emit::GpuOut) -> Result<Self, String> {
+    /// `arena` shares param storage across runtimes of the same model
+    /// — pass `None` for a private, self-contained runtime.
+    pub fn load(
+        p: &TProgram,
+        name: &str,
+        out: &crate::gpu_emit::GpuOut,
+        arena: Option<&GpuArena>,
+    ) -> Result<Self, String> {
         let dev = metal::Device::system_default().ok_or("gpu: no Metal device on this host")?;
         let lib = dev
             .new_library_with_source(&out.msl, &CompileOptions::new())
@@ -118,7 +233,11 @@ impl GpuRuntime {
         // pooled f32 params share one device buffer sized up front —
         // 16-element-aligned slots, the same rule gpu_emit's
         // `param_off` uses, so host offsets match kernel indices.
+        // With an arena the pool is shared across every runtime of the
+        // same param universe — offsets are canonical because emit
+        // assigns them by declaration order over the same `p.params`.
         let pool_mode = out.param_pool;
+        let fprint = arena.map(|_| GpuArena::fingerprint(p));
         let mut pool_total = 0usize;
         if pool_mode {
             for a in &out.args {
@@ -132,6 +251,10 @@ impl GpuRuntime {
                 }
             }
         }
+        let shared_pool = match (arena, fprint, pool_mode) {
+            (Some(a), Some(f), true) => Some(a.pool_buf(f, pool_total, &dev)?),
+            _ => None,
+        };
         let mut pool_idx = usize::MAX;
         let mut pool_cursor = 0usize;
         for (a_i, a) in out.args.iter().enumerate() {
@@ -185,7 +308,10 @@ impl GpuRuntime {
                     if pool_mode {
                         if pool_idx == usize::MAX {
                             pool_idx = bufs.len();
-                            bufs.push(buf_f32(&dev, &vec![0.0; pool_total]));
+                            match &shared_pool {
+                                Some(b) => bufs.push(b.clone()),
+                                None => bufs.push(buf_f32(&dev, &vec![0.0; pool_total])),
+                            }
                         } else {
                             // alignment placeholder — `uses` never
                             // binds this position (dedup keeps the
@@ -228,7 +354,18 @@ impl GpuRuntime {
                     if t.ty.dt == coyote::ast::DType::Q4 {
                         data = coyote::lower::q4_quantize(&data);
                     }
-                    bufs.push(buf_f16(&dev, &data));
+                    // shared f16 params alias the arena buffer — the
+                    // first runtime of this param universe filled it;
+                    // every later one (forward, other trainers) reads
+                    // the same resident bytes, updates included.
+                    let hb = match (arena, fprint) {
+                        (Some(a), Some(f)) => Some(a.half_buf(f, pname, &data, &dev)?),
+                        _ => None,
+                    };
+                    match hb {
+                        Some(b) => bufs.push(b),
+                        None => bufs.push(buf_f16(&dev, &data)),
+                    }
                     half_slots.insert(i);
                     sizes.insert(pname.clone(), data.len());
                 }

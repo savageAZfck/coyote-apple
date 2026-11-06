@@ -97,7 +97,7 @@ fn main() {
     // `gpu fn` but only this distribution can lower and run it.
     coyote::backend::register_backend(
         coyote::ast::Target::Gpu,
-        std::sync::Arc::new(backend_metal::MetalBackend),
+        std::sync::Arc::new(backend_metal::MetalBackend::new()),
     );
     // the `enc` stratum's engine — encrypted circuits, private to
     // this distribution the same way Metal is.

@@ -7,7 +7,19 @@ use coyote::backend::{Backend, BackendEmit, BackendExec};
 use coyote::typeck::{CTy, TProgram};
 use std::path::Path;
 
-pub struct MetalBackend;
+pub struct MetalBackend {
+    /// param storage shared by every runtime this backend loads —
+    /// one model's gpu fns see each other's weight updates on-device.
+    arena: std::sync::Arc<gpu_rt::GpuArena>,
+}
+
+impl MetalBackend {
+    pub fn new() -> Self {
+        Self {
+            arena: std::sync::Arc::new(gpu_rt::GpuArena::new()),
+        }
+    }
+}
 
 impl Backend for MetalBackend {
     /// Emit `net.msl` + `coyote_build.json` — same artifact layout as
@@ -59,6 +71,11 @@ impl Backend for MetalBackend {
             .opaque
             .downcast_ref::<gpu_emit::GpuOut>()
             .ok_or("metal backend: wrong emit payload")?;
-        Ok(Box::new(gpu_rt::GpuRuntime::load(tp, name, out)?))
+        Ok(Box::new(gpu_rt::GpuRuntime::load(
+            tp,
+            name,
+            out,
+            Some(&self.arena),
+        )?))
     }
 }

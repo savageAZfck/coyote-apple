@@ -108,7 +108,7 @@ fn prof_ext(
         }
     }
     let mut rt = if let Some(g) = out.opaque.downcast_ref::<crate::gpu_emit::GpuOut>() {
-        Rt::Gpu(crate::gpu_rt::GpuRuntime::load(prog, "main", g)?)
+        Rt::Gpu(crate::gpu_rt::GpuRuntime::load(prog, "main", g, None)?)
     } else {
         Rt::Other(
             be.load(prog, "main", &out, dir)

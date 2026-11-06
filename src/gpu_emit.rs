@@ -671,12 +671,69 @@ impl Ge {
         }
     }
 
+    /// transitive expression size THROUGH let bindings — `gen`
+    /// expands `Ident → bound expr → Ident → …` recursively, so a
+    /// chain of individually-small lets (the residual stream is
+    /// `h + f(h)` per layer) inlines into one giant expr: own4b
+    /// emitted kernels whose serial loop re-evaluated ~1,200 buffer
+    /// reads per element. Materializing one link collapses the cost
+    /// of everything downstream, so a modest cap suffices. Saturates
+    /// at `cap`.
+    /// transitive inlining cap — lets whose expanded size through
+    /// prior bindings exceeds this materialize even without a
+    /// reduction. One cut collapses every downstream chain, so 256
+    /// bounds kernel exprs to hundreds of reads, not thousands.
+    const TCTX_MAX: usize = 256;
+
+    fn tcost(&self, e: &Typed, cap: usize) -> usize {
+        let mut n = 0usize;
+        self.tcost_walk(e, &mut n, cap);
+        n
+    }
+
+    fn tcost_walk(&self, e: &Typed, n: &mut usize, cap: usize) {
+        if *n >= cap {
+            return;
+        }
+        *n += 1;
+        match &e.e {
+            TExpr::Ident(s) => {
+                if let Some((_, _, b)) = self.pos_of(s) {
+                    self.tcost_walk(b, n, cap);
+                }
+            }
+            TExpr::Unary(_, a) | TExpr::Transpose(a) | TExpr::Index(a, _) => {
+                self.tcost_walk(a, n, cap)
+            }
+            TExpr::Bin(_, a, b) => {
+                self.tcost_walk(a, n, cap);
+                self.tcost_walk(b, n, cap);
+            }
+            TExpr::Call(_, args, _) => {
+                for a in args {
+                    self.tcost_walk(a, n, cap);
+                }
+            }
+            TExpr::Block(stmts, ret) => {
+                for s in stmts {
+                    if let TStmt::Let { expr, .. } = s {
+                        self.tcost_walk(expr, n, cap);
+                    }
+                }
+                self.tcost_walk(ret, n, cap);
+            }
+            _ => {}
+        }
+    }
+
     /// element-read entry: non-scalar subexprs containing reductions
     /// materialize to a scratch buffer (one prelude kernel, dispatched
     /// in discovery order) instead of recomputing per read. Kernel
     /// roots call `gen_raw` — they ARE the computation.
     fn gen(&mut self, e: &Typed, coords: &[String]) -> Result<String, String> {
-        if e.ty.numel() > 1 && Self::needs_scratch(e) {
+        if e.ty.numel() > 1
+            && (Self::needs_scratch(e) || self.tcost(e, Self::TCTX_MAX + 1) > Self::TCTX_MAX)
+        {
             let buf = self.scratch_of(e)?;
             let f = Self::flat(&e.ty.dims, coords, &Kind::Row);
             // half scratch reads widen explicitly — bare `half` values
@@ -2843,7 +2900,10 @@ impl Ge {
                     .last_mut()
                     .unwrap()
                     .push((name.clone(), expr.clone()));
-                if expr.ty.numel() > 1 && Self::needs_scratch(expr) {
+                if expr.ty.numel() > 1
+                    && (Self::needs_scratch(expr)
+                        || self.tcost(expr, Self::TCTX_MAX + 1) > Self::TCTX_MAX)
+                {
                     // persistent dedup: the backward walk re-enters
                     // inlined bodies and re-binds the same lets — a
                     // name+rhs+ver match means the buffer already holds

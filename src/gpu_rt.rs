@@ -645,6 +645,7 @@ impl GpuRuntime {
             // never exhausts IOGPUDeviceShmem on 6,700-kernel programs.
             self.last_ms = 0.0;
             self.last_wall_ms = 0.0;
+            self.last_kernels.clear();
             for (ci, chunk) in self.pipes.chunks(512).enumerate() {
                 let cb = self.queue.new_command_buffer();
                 for (pipe, disp, _, uses) in chunk {
@@ -660,9 +661,15 @@ impl GpuRuntime {
                 let t0 = std::time::Instant::now();
                 cb.commit();
                 cb.wait_until_completed();
-                self.last_wall_ms += t0.elapsed().as_secs_f64() * 1000.0;
+                let wall = t0.elapsed().as_secs_f64() * 1000.0;
+                self.last_wall_ms += wall;
                 let ms = gpu_ms(cb);
                 self.last_ms += ms;
+                // coarse per-chunk breakdown — 512-kernel granularity
+                // is enough to locate hot regions in 6k-kernel programs
+                // without CYO_PKT's per-kernel commit+wait cost.
+                self.last_kernels
+                    .push((format!("chunk_{ci}"), wall.max(ms)));
                 // diagnostics: a faulted chunk reports ~0 GPU time while
                 // the host still paid the encode cost — surface the
                 // Metal error instead of silently trusting the clock.

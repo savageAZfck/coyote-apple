@@ -64,16 +64,64 @@ pub fn run(args: &[String]) -> Result<(), i32> {
             );
         }
         if let Some(ep) = &export {
-            // checkpoint export — every declared `param` global lands
-            // in one safetensors, in the layout `param @ "src"` loads,
-            // ready for `milc convert`. Deferred params resolve
-            // per-param inside the snapshot: device-trained values
-            // read back through the owning runtime, untouched params
-            // materialize to init — the host store never holds it all.
-            let snap = vm.params_snapshot()?;
-            let bytes = crate::stfile::safetensors_multi(&snap);
-            std::fs::write(ep, &bytes).map_err(|e| e.to_string())?;
-            println!("  exported {} tensors → {}", snap.len(), ep.display());
+            // streaming checkpoint export — the plan carries only
+            // metadata (name/dims/dtype/source) so the header's
+            // data_offsets are computable up front; tensors then
+            // stream one param at a time straight into the file.
+            // Peak host memory is one param (~30MB for lmh), not
+            // 3× the whole model as f32 — `params_snapshot`'s
+            // accumulate-then-write path needed ~45GB and wedged.
+            let plan = vm.param_export_plan()?;
+            let mut hdr = String::from("{");
+            let mut off = 0u64;
+            for (i, it) in plan.iter().enumerate() {
+                if i > 0 {
+                    hdr.push(',');
+                }
+                let esz = if it.f16 { 2u64 } else { 4u64 };
+                let nb = it.dims.iter().product::<usize>() as u64 * esz;
+                let shape_s = it
+                    .dims
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                hdr.push_str(&format!(
+                    "\"{}\":{{\"dtype\":\"{}\",\"shape\":[{}],\"data_offsets\":[{}, {}]}}",
+                    it.name,
+                    if it.f16 { "F16" } else { "F32" },
+                    shape_s,
+                    off,
+                    off + nb
+                ));
+                off += nb;
+            }
+            hdr.push('}');
+            let pad = (8 - (hdr.len() % 8)) % 8;
+            hdr.push_str(&" ".repeat(pad));
+            let mut file = std::io::BufWriter::new(
+                std::fs::File::create(ep).map_err(|e| e.to_string())?,
+            );
+            use std::io::Write;
+            file.write_all(&(hdr.len() as u64).to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            file.write_all(hdr.as_bytes()).map_err(|e| e.to_string())?;
+            let n_tensors = plan.len();
+            vm.param_export_emit(&plan, |_, _, data, f16| {
+                if f16 {
+                    for v in data {
+                        file.write_all(&half::f16::from_f32(*v).to_le_bytes())
+                            .map_err(|e| e.to_string())?;
+                    }
+                } else {
+                    for v in data {
+                        file.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
+                    }
+                }
+                Ok(())
+            })?;
+            file.flush().map_err(|e| e.to_string())?;
+            println!("  exported {} tensors → {}", n_tensors, ep.display());
         }
         Ok(())
     })();

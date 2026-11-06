@@ -2512,8 +2512,116 @@ impl Ge {
                     }
                 }
                 // dx[br,i] = Σ_j adj[br,j] · w[j,i]
+                // fast path: the contraction is a matvec — emit it as
+                // j-chunked partial sums (C×numel(a) threads) plus a
+                // cross-thread reduce into a materialized `dadj`
+                // buffer, then walk `a` reading that buffer. The serial
+                // fallback below gives every output element its own
+                // nn-iteration loop — fine for small nn, quadratic
+                // dispatch overhead at own4b scale.
                 let b2 = (**b).clone();
                 let batched = a.ty.dims.len() == 2;
+                let adims = a.ty.dims.clone();
+                let rhs_buf = {
+                    let tgt = match &b2.e {
+                        TExpr::Transpose(i) => &**i,
+                        _ => &b2,
+                    };
+                    match &tgt.e {
+                        TExpr::Ident(_) => self.resolve_buf(tgt).is_some(),
+                        TExpr::Field(bx, f) => matches!(
+                            &bx.e,
+                            TExpr::Ident(s) if self.bufs.contains_key(&format!("{s}.{f}"))
+                        ),
+                        _ => false,
+                    }
+                };
+                let (m_dim, kd_dim, m_out) = if matches!(adims.len(), 1 | 2) {
+                    let md = if adims.len() == 2 { adims[0] as usize } else { 1 };
+                    let kd = *adims.last().unwrap() as usize;
+                    (md, kd, md * kd)
+                } else {
+                    (1, 1, 0)
+                };
+                let c_num = if rhs_buf && m_out > 0 && nn >= 256 {
+                    ((32768 / m_out).clamp(1, 32)).min(nn)
+                } else {
+                    0
+                };
+                if c_num > 1 {
+                    let cs = nn.div_ceil(c_num);
+                    let part = format!("b__dxp{}", self.scratch_args.len());
+                    let dadj = format!("b__dxa{}", self.scratch_args.len());
+                    self.scratch_args.push((part.clone(), c_num * m_out));
+                    self.scratch_args.push((dadj.clone(), m_out));
+                    self.bufs
+                        .insert(dadj.clone(), (dadj.clone(), a.ty.clone(), Kind::Row));
+                    // partials: thread gid ↦ (chunk c, batch br, output k)
+                    // computes Σ_{j∈chunk c} adj · rhs[k,j]. gid order
+                    // keeps k fastest so rhs reads stay coalesced and
+                    // part[gid] needs no index math.
+                    let saved = std::mem::take(&mut self.lines);
+                    {
+                        let adj_p = &mut *adj;
+                        if batched {
+                            self.lines.push(format!("uint pk = gid % {kd_dim};"));
+                            self.lines.push(format!("uint pr = gid / {kd_dim};"));
+                            self.lines.push(format!("uint pbr = pr % {m_dim};"));
+                            self.lines.push(format!("uint pc = pr / {m_dim};"));
+                        } else {
+                            self.lines.push(format!("uint pk = gid % {kd_dim};"));
+                            self.lines.push(format!("uint pc = gid / {kd_dim};"));
+                        }
+                        self.lines.push(format!("uint pj0 = pc * {cs}u;"));
+                        self.lines.push(format!(
+                            "uint pj1 = min(pj0 + {cs}u, {nn}u);"
+                        ));
+                        self.lines.push("float acc = 0.0f;".into());
+                        self.lines.push("for (uint pj = pj0; pj < pj1; ++pj) {".into());
+                        let acoords: Vec<String> = if batched {
+                            vec!["pbr".into(), "pj".into()]
+                        } else {
+                            vec!["pj".into()]
+                        };
+                        let av = adj_p(self, &acoords)?;
+                        let wv = self.rhs_read(&b2, &["pk".into(), "pj".into()], kd as i64)?;
+                        self.lines.push(format!("acc += ({av}) * ({wv});"));
+                        self.lines.push("}".into());
+                        let st = self.st_any(&part, "gid", "=", "acc");
+                        self.lines.push(st);
+                    }
+                    let pbody = std::mem::take(&mut self.lines);
+                    self.lines = saved;
+                    self.scratch.push(EK {
+                        name: format!("dxp_{}", self.scratch.len()),
+                        dispatch: Dispatch::Linear(c_num * m_out),
+                        body: pbody,
+                        writable: None,
+                    });
+                    // reduce: dadj[i] = Σ_c part[c·m_out + i]
+                    let saved = std::mem::take(&mut self.lines);
+                    self.lines.push("float acc = 0.0f;".into());
+                    self.lines.push(format!("for (uint pc = 0; pc < {c_num}; ++pc) {{"));
+                    let pv = self.ld(&part, &format!("pc * {m_out} + gid"));
+                    self.lines.push(format!("acc += {pv};"));
+                    self.lines.push("}".into());
+                    let st = self.st_any(&dadj, "gid", "=", "acc");
+                    self.lines.push(st);
+                    let rbody = std::mem::take(&mut self.lines);
+                    self.lines = saved;
+                    self.scratch.push(EK {
+                        name: format!("dxr_{}", self.scratch.len()),
+                        dispatch: Dispatch::Linear(m_out),
+                        body: rbody,
+                        writable: None,
+                    });
+                    let dadj_r = dadj.clone();
+                    let adims_r = adims.clone();
+                    return self.back_tape(a, &mut |em: &mut Ge, c: &[String]| {
+                        let f = Self::flat(&adims_r, c, &Kind::Row);
+                        Ok(em.ld(&dadj_r, &f))
+                    });
+                }
                 let adj3 = &mut *adj;
                 self.back_tape(a, &mut |em: &mut Ge, c: &[String]| {
                     let acc = em.tmp();

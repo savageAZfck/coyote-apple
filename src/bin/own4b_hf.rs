@@ -8,11 +8,17 @@
 //!
 //! Streaming in both directions — the param export is ~7.5GB and the
 //! HF checkpoint ~7.6GB; nothing gets slurped. own-4B stores matmul
-//! weights `[in, out]` row-major with per-head `lo`/`hi` RoPE halves
-//! and two summed FFN blocks; HF wants `[out, in]` with concatenated
-//! heads/blocks. Every transform below is a transpose+concat that
-//! preserves the exact function own4b.cy computes, with TWO known
-//! deltas:
+//! weights with per-head `lo`/`hi` RoPE halves and two summed FFN
+//! blocks; HF wants concatenated heads/blocks.
+//!
+//! LAYOUT (verified empirically against a live gpu export): coyote
+//! param buffers are STORAGE order `[out, in]` row-major — the
+//! snapshot writes reversed dims and flat storage-order data, which
+//! is exactly HF's `[out, in]` convention. So every repack below is a
+//! block copy, never a transpose: q/k/v/o head-halves concatenate,
+//! FFN blocks merge into one wide SwiGLU, `lmh` copies verbatim.
+//! The transforms preserve the exact function own4b.cy computes, with
+//! TWO known deltas:
 //!
 //! 1. `qk-norm` — own-4B rmsnorms each 64-dim RoPE half separately
 //!    (`qnl`/`qnh`), HF qwen3 applies one norm over the full 128-dim
@@ -180,24 +186,22 @@ impl St {
     }
 }
 
-/// own-4B `[in, out]` row-major param → HF `[out, in]` transpose.
-fn transpose(src: &[f32], inn: usize, out: usize) -> Vec<f32> {
-    let mut dst = vec![0f32; src.len()];
-    for i in 0..inn {
-        for j in 0..out {
-            dst[j * inn + i] = src[i * out + j];
-        }
-    }
-    dst
+/// place a storage-order `[out,in]` param block into `dst` at row `r0`
+/// of a `[rows, cols]` row-major tensor — contiguous copy, both sides
+/// already `[out,in]`.
+fn block_rows(src: &[f32], dst: &mut [f32], r0: usize, cols: usize) {
+    let n = src.len();
+    dst[r0 * cols..r0 * cols + n].copy_from_slice(src);
 }
 
-/// own-4B `[in, out]` → placed transposed into `dst` columns
-/// `[col0, col0+out)` — for o_proj/down_proj column-block assembly.
-fn transpose_into(src: &[f32], inn: usize, out: usize, dst: &mut [f32], col0: usize, rown: usize) {
-    for i in 0..inn {
-        for j in 0..out {
-            dst[j * rown + col0 + i] = src[i * out + j];
-        }
+/// scatter a storage-order `[out,in]` param into `dst` columns
+/// `[c0, c0+in)` of a `[out_rows, cols]` row-major tensor — dst row q
+/// gets src row q verbatim (both `[out,in]`).
+fn block_cols(src: &[f32], dst: &mut [f32], c0: usize, in_dim: usize, cols: usize) {
+    let out_rows = src.len() / in_dim;
+    for q in 0..out_rows {
+        dst[q * cols + c0..q * cols + c0 + in_dim]
+            .copy_from_slice(&src[q * in_dim..(q + 1) * in_dim]);
     }
 }
 
@@ -232,8 +236,8 @@ fn layer_tensors(st: &St, l: usize) -> Result<Vec<(String, Vec<usize>, Vec<f32>)
         }
         out.push((format!("{pre}.{dst}"), vec![FHD], v));
     }
-    // q/k/v projections — per-head lo/hi halves concatenated.
-    // own4b param [d,64] per half → HF [out,in] rows h*128+half*64+i.
+    // q/k/v projections — param storage is already [64,2560] =
+    // [head_dim, in]; each (head,half) block lands as contiguous rows.
     for (proj, heads, pr) in [
         ("q_proj", QH, "q"),
         ("k_proj", KVH, "k"),
@@ -244,13 +248,7 @@ fn layer_tensors(st: &St, l: usize) -> Result<Vec<(String, Vec<usize>, Vec<f32>)
         for h in 0..heads {
             for (hi, hf) in ["lo", "hi"].iter().enumerate() {
                 let src = st.tensor_f32(&format!("{}{}{}{}", p(pr), h, hf, ""))?;
-                // src is [D,64] → transpose → [64,D] into rows
-                let base = (h * FHD + hi * HD) * D;
-                for i in 0..HD {
-                    for j in 0..D {
-                        w[base + i * D + j] = src[j * HD + i];
-                    }
-                }
+                block_rows(&src, &mut w, h * FHD + hi * HD, D);
             }
         }
         out.push((
@@ -259,14 +257,14 @@ fn layer_tensors(st: &St, l: usize) -> Result<Vec<(String, Vec<usize>, Vec<f32>)
             w,
         ));
     }
-    // o_proj [D, QH*FHD] — column blocks per (head, half)
+    // o_proj [D, QH*FHD] — param storage [2560,64] scatters into column
+    // blocks (out_dim=2560 rows × 64 in-cols per head-half).
     {
         let mut w = vec![0f32; D * QH * FHD];
         for h in 0..QH {
             for (hi, hf) in ["lo", "hi"].iter().enumerate() {
                 let src = st.tensor_f32(&format!("{}o{}{}", p(""), h, hf))?;
-                // src [64,D] = [in,out] → dst col block, transposed
-                transpose_into(&src, HD, D, &mut w, h * FHD + hi * HD, QH * FHD);
+                block_cols(&src, &mut w, h * FHD + hi * HD, HD, QH * FHD);
             }
         }
         out.push((
@@ -275,8 +273,8 @@ fn layer_tensors(st: &St, l: usize) -> Result<Vec<(String, Vec<usize>, Vec<f32>)
             w,
         ));
     }
-    // FFN — two summed blocks ≡ one wide SwiGLU: gate/up rows are
-    // per-block transposes; down columns are per-block transposes.
+    // FFN — two summed blocks ≡ one wide SwiGLU: gate/up row blocks,
+    // down column blocks. wg/wu storage [5120,2560], wd [2560,5120].
     {
         let mut gate = vec![0f32; FB * FD * D];
         let mut up = vec![0f32; FB * FD * D];
@@ -285,15 +283,9 @@ fn layer_tensors(st: &St, l: usize) -> Result<Vec<(String, Vec<usize>, Vec<f32>)
             let wg = st.tensor_f32(&format!("{}wg{}", p(""), b))?;
             let wu = st.tensor_f32(&format!("{}wu{}", p(""), b))?;
             let wd = st.tensor_f32(&format!("{}wd{}", p(""), b))?;
-            // wg/wu [D,FD] → transpose → [FD,D] rows b*FD..
-            for i in 0..FD {
-                for j in 0..D {
-                    gate[(b * FD + i) * D + j] = wg[j * FD + i];
-                    up[(b * FD + i) * D + j] = wu[j * FD + i];
-                }
-            }
-            // wd [FD,D] = [in,out] → columns b*FD.. of down [D, FB*FD]
-            transpose_into(&wd, FD, D, &mut down, b * FD, FB * FD);
+            block_rows(&wg, &mut gate, b * FD, D);
+            block_rows(&wu, &mut up, b * FD, D);
+            block_cols(&wd, &mut down, b * FD, FD, FB * FD);
         }
         out.push((
             format!("{pre}.mlp.gate_proj.weight"),
@@ -409,8 +401,12 @@ fn run(args: &[String]) -> Result<(), String> {
         "F16",
         &lnf,
     )?;
-    let lmh = st.tensor_f32("lmh")?; // [D,V] own4b → transpose → [V,D]
-    let lmh_t = transpose(&lmh, D, V);
+    // lmh [2560,3103] stores as [3103,2560] — already HF layout,
+    // verbatim copy.
+    let lmh = st.tensor_f32("lmh")?;
+    if lmh.len() != V * D {
+        return Err(format!("lmh: {} elems, want {}", lmh.len(), V * D));
+    }
     emit(
         &mut w,
         &mut meta,
@@ -418,7 +414,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "lm_head.weight".into(),
         vec![V, D],
         "F16",
-        &lmh_t,
+        &lmh,
     )?;
 
     // header — JSON padded with spaces to exactly HREG.

@@ -457,7 +457,7 @@ impl GpuRuntime {
         // in the kernel indexes it. Unified memory means
         // `contents()` IS the device-visible address.
         let ptrs_i = if out.ptrs {
-            const PTRS_SLOTS: usize = 65536;
+            const PTRS_SLOTS: usize = 131072;
             let n = bufs.len();
             let tbl = dev.new_buffer(
                 (PTRS_SLOTS * 8) as u64,

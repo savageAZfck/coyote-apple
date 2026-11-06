@@ -3863,7 +3863,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(28);
-    const PTRS_SLOTS: usize = 65536;
+    const PTRS_SLOTS: usize = 131072;
     // kernel dedup: structurally identical kernels (every layer and
     // head of a transformer emits the same op shapes) share one
     // compiled function — per-dispatch constants move into a tiny

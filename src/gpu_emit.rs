@@ -667,6 +667,11 @@ impl Ge {
         if e.ty.numel() > 1 && Self::needs_scratch(e) {
             let buf = self.scratch_of(e)?;
             let f = Self::flat(&e.ty.dims, coords, &Kind::Row);
+            // half scratch reads widen explicitly — bare `half` values
+            // make overloaded math calls (`fmax`, `exp`, …) ambiguous.
+            if self.half_scratch.contains(&buf) {
+                return Ok(format!("float({buf}[{f}])"));
+            }
             return Ok(format!("{buf}[{f}]"));
         }
         self.gen_raw(e, coords)
@@ -1161,11 +1166,16 @@ impl Ge {
                     .push("threadgroup_barrier(mem_flags::mem_device);".into());
                 // the sum is order-sensitive — serial, eval order.
                 self.lines.push(format!(
-                    "if (lid == 0) {{ float s = 0.0f; for (uint i = 0; i < {n}; ++i) s += {eb}[i]; ts = s; }}"
+                    "if (lid == 0) {{ float s = 0.0f; for (uint i = 0; i < {n}; ++i) s += float({eb}[i]); ts = s; }}"
                 ));
                 self.lines
                     .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
-                let st = self.st_any(out_buf, "i", "=", &format!("{eb}[i] / ts"));
+                let ebv = if self.half_scratch.contains(&eb) {
+                    format!("float({eb}[i])")
+                } else {
+                    format!("{eb}[i]")
+                };
+                let st = self.st_any(out_buf, "i", "=", &format!("{ebv} / ts"));
                 self.lines
                     .push(format!("for (uint i = lid; i < {n}; i += {T}) {st}"));
             }
@@ -2208,8 +2218,15 @@ impl Ge {
 
     /// tape-node adjoint read: `adjb[flat(coords)]` — the seed every
     /// backward walk starts from once a node's adjoint is materialized.
+    /// Half adjoints widen to float — bare `half` r-values make
+    /// overloaded math calls ambiguous in generated exprs.
     fn adj_rd(&self, buf: &str, ty: &CTy, c: &[String]) -> String {
-        format!("{}[{}]", buf, Self::flat(&ty.dims, c, &Kind::Row))
+        let f = Self::flat(&ty.dims, c, &Kind::Row);
+        if self.half_scratch.contains(buf) {
+            format!("float({buf}[{f}])")
+        } else {
+            format!("{buf}[{f}]")
+        }
     }
 
     /// reverse-mode walk over one tape def — `adj` yields the expr

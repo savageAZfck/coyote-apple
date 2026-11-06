@@ -446,8 +446,13 @@ fn main() {
     // compile-time wall past ~2 layers; per-layer programs keep each
     // graph at ~1 layer's params. Host dispatches round-robin —
     // block coordinate descent, a real technique.
+    //
+    // The forward is hoisted into a let: eval binds it once, every
+    // grad(mse(logits, tgt), p) backward-walks the same DAG reading
+    // the materialized activations — one forward emit instead of one
+    // per param. Without the hoist each adam re-inlines the whole
+    // forward+backward and Metal compile time goes superlinear.
     w!("// teacher-forced step: forward + adam on this layer's params.");
-    let fw = "forward(x, pos, mask, cos, sin)";
     for l in 0..l_n {
         w!(&format!("{} train_l{l}(", kw(&format!("train_l{l}"))));
         w!(&format!(
@@ -455,29 +460,30 @@ fn main() {
         ));
         w!(&format!("    cos: f16[{hd}], sin: f16[{hd}], tgt: f16[{v}]"));
         w!(&format!(") -> f16[{v}] {{"));
+        w!("    let logits = forward(x, pos, mask, cos, sin);");
         for nm in ["ln1", "ln2", "qnl", "qnh"] {
             w!(&format!(
-                "    adam(l{l}_{nm}, grad(mse({fw}, tgt), l{l}_{nm}), 0.01);"
+                "    adam(l{l}_{nm}, grad(mse(logits, tgt), l{l}_{nm}), 0.01);"
             ));
         }
         for h in 0..q {
             for hf in ["lo", "hi"] {
                 w!(&format!(
-                    "    adam(l{l}_q{h}{hf}, grad(mse({fw}, tgt), l{l}_q{h}{hf}), 0.05);"
+                    "    adam(l{l}_q{h}{hf}, grad(mse(logits, tgt), l{l}_q{h}{hf}), 0.05);"
                 ));
                 w!(&format!(
-                    "    adam(l{l}_o{h}{hf}, grad(mse({fw}, tgt), l{l}_o{h}{hf}), 0.05);"
+                    "    adam(l{l}_o{h}{hf}, grad(mse(logits, tgt), l{l}_o{h}{hf}), 0.05);"
                 ));
             }
         }
         for bc in 0..fb {
             for pr in ["wg", "wu", "wd"] {
                 w!(&format!(
-                    "    adam(l{l}_{pr}{bc}, grad(mse({fw}, tgt), l{l}_{pr}{bc}), 0.05);"
+                    "    adam(l{l}_{pr}{bc}, grad(mse(logits, tgt), l{l}_{pr}{bc}), 0.05);"
                 ));
             }
         }
-        w!(&format!("    {fw}"));
+        w!("    logits");
         w!("}");
         w!("");
     }
@@ -488,9 +494,10 @@ fn main() {
     ));
     w!(&format!("    cos: f16[{hd}], sin: f16[{hd}], tgt: f16[{v}]"));
     w!(&format!(") -> f16[{v}] {{"));
-    w!(&format!("    adam(lnf, grad(mse({fw}, tgt), lnf), 0.01);"));
-    w!(&format!("    adam(lmh, grad(mse({fw}, tgt), lmh), 0.05);"));
-    w!(&format!("    {fw}"));
+    w!("    let logits = forward(x, pos, mask, cos, sin);");
+    w!(&format!("    adam(lnf, grad(mse(logits, tgt), lnf), 0.01);"));
+    w!(&format!("    adam(lmh, grad(mse(logits, tgt), lmh), 0.05);"));
+    w!("    logits");
     w!("}");
     w!("");
 

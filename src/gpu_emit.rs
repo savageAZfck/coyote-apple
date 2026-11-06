@@ -207,8 +207,108 @@ struct Ge {
     /// arg names (`b_w`) backed by `half` storage under `CYO_HALF` —
     /// every read site wraps `float(...)`, every write wraps `half(...)`.
     half_args: std::collections::HashSet<String>,
+    /// let name → (rhs structural key, storage version, buffer).
+    /// Survives scope pops: the backward walk re-enters inlined fn
+    /// bodies whose lets were already emitted at forward position —
+    /// without this each `grad` re-emits the whole forward as fresh
+    /// scratch (the per-param compile explosion). Same name + same
+    /// rhs + same `ver` ⇒ same value ⇒ reuse the buffer; a param or
+    /// state write bumps `ver` so post-update lets can't go stale.
+    persistent: HashMap<String, (u64, u64, String)>,
+    /// bumped on every device-visible mutation (param/state writes) —
+    /// invalidates `persistent` entries recorded before it.
+    ver: u64,
+    /// true while `grad_elem`/`back` re-walk inlined bodies — those
+    /// re-bindings must reuse forward-time buffers (Jacobi: every grad
+    /// sees the same activations, matching eval where params freeze
+    /// for the whole call), so `persistent` hits ignore `ver` here.
+    in_backward: bool,
+    /// (hits, misses) on `persistent` — emit diagnostics.
+    pstats: (u64, u64),
     lines: Vec<String>,
     tmp: usize,
+}
+
+/// structural hash of a typed expr — the dedup key for `persistent`.
+/// Hashes the node variant, leaf payloads, child exprs, and result
+/// dims; two textually different but structurally identical rhs's
+/// collide correctly, different ones don't.
+fn expr_key(e: &Typed) -> u64 {
+    use std::hash::{Hash, Hasher};
+    fn h<T: Hash>(v: &T, s: &mut std::collections::hash_map::DefaultHasher) {
+        v.hash(s);
+    }
+    let mut s = std::collections::hash_map::DefaultHasher::new();
+    fn walk(e: &Typed, s: &mut std::collections::hash_map::DefaultHasher) {
+        match &e.e {
+            TExpr::Lit(v) => {
+                h(&0u8, s);
+                v.to_bits().hash(s);
+            }
+            TExpr::Int(i) => {
+                h(&1u8, s);
+                i.hash(s);
+            }
+            TExpr::Ident(n) => {
+                h(&2u8, s);
+                n.hash(s);
+            }
+            TExpr::Field(b, n) => {
+                h(&3u8, s);
+                n.hash(s);
+                walk(b, s);
+            }
+            TExpr::Unary(op, a) => {
+                h(&4u8, s);
+                format!("{op:?}").hash(s);
+                walk(a, s);
+            }
+            TExpr::Bin(op, a, b) => {
+                h(&5u8, s);
+                format!("{op:?}").hash(s);
+                walk(a, s);
+                walk(b, s);
+            }
+            TExpr::Transpose(a) => {
+                h(&6u8, s);
+                walk(a, s);
+            }
+            TExpr::Index(b, is) => {
+                h(&7u8, s);
+                walk(b, s);
+                for i in is {
+                    format!("{i:?}").hash(s);
+                }
+            }
+            TExpr::Call(n, args, named) => {
+                h(&8u8, s);
+                n.hash(s);
+                for a in args {
+                    walk(a, s);
+                }
+                for (nn, a) in named {
+                    nn.hash(s);
+                    walk(a, s);
+                }
+            }
+            TExpr::Block(stmts, ret) => {
+                h(&9u8, s);
+                for st in stmts {
+                    format!("{st:?}").hash(s);
+                }
+                walk(ret, s);
+            }
+            TExpr::Grad { loss, wrt } => {
+                h(&10u8, s);
+                wrt.hash(s);
+                walk(loss, s);
+            }
+        }
+        e.ty.dims.hash(s);
+        format!("{:?}", e.ty.dt).hash(s);
+    }
+    walk(e, &mut s);
+    s.finish()
 }
 
 /// a queued kernel: msl function name, dispatch shape, body lines,
@@ -1451,6 +1551,7 @@ impl Ge {
     fn grad_elem(&mut self, loss: &Typed, wrt: &str, f: &str) -> Result<Option<String>, String> {
         self.scopes.push(Vec::new());
         self.orig_scopes.push(Vec::new());
+        let saved_bw = std::mem::replace(&mut self.in_backward, true);
         let r = (|| {
             let terminal = match &loss.e {
                 TExpr::Block(stmts, ret) => {
@@ -1486,6 +1587,7 @@ impl Ge {
                 _ => Err("gpu emit: grad v1 losses must end in mse".into()),
             }
         })();
+        self.in_backward = saved_bw;
         self.scopes.pop();
         self.orig_scopes.pop();
         r
@@ -1919,8 +2021,28 @@ impl Ge {
                     .unwrap()
                     .push((name.clone(), expr.clone()));
                 if expr.ty.numel() > 1 && Self::needs_scratch(expr) {
-                    let buf = self.scratch_of(expr)?;
-                    self.emit_q.extend(self.scratch.drain(..));
+                    // persistent dedup: the backward walk re-enters
+                    // inlined bodies and re-binds the same lets — a
+                    // name+rhs+ver match means the buffer already holds
+                    // this exact value, so skip re-emitting the whole
+                    // forward per grad.
+                    let key = expr_key(expr);
+                    let hit = matches!(
+                        self.persistent.get(name),
+                        Some((k, v, _))
+                            if *k == key && (self.in_backward || *v == self.ver)
+                    );
+                    let buf = if hit {
+                        self.pstats.0 += 1;
+                        self.persistent.get(name).unwrap().2.clone()
+                    } else {
+                        self.pstats.1 += 1;
+                        let b = self.scratch_of(expr)?;
+                        self.emit_q.extend(self.scratch.drain(..));
+                        self.persistent
+                            .insert(name.clone(), (key, self.ver, b.clone()));
+                        b
+                    };
                     let e = Typed {
                         e: TExpr::Ident(buf),
                         ty: expr.ty.clone(),
@@ -1959,6 +2081,7 @@ impl Ge {
                         body,
                         writable: Some(param.clone()),
                     });
+                    self.ver += 1;
                     Ok(())
                 }
                 _ => Err("gpu emit: param updates expect `grad(loss, param)` on a param".into()),
@@ -2039,6 +2162,7 @@ impl Ge {
                         body: vec![format!("at_{param}[0] += 1.0f;")],
                         writable: None,
                     });
+                    self.ver += 1;
                     Ok(())
                 }
                 _ => Err("gpu emit: adam expects `adam(param, grad(loss, param) [, lr])`".into()),
@@ -2082,6 +2206,7 @@ impl Ge {
                     body,
                     writable: None, // state args are device float* in every sig
                 });
+                self.ver += 1;
                 Ok(())
             }
             TStmt::Assign { name, op, expr } => {
@@ -2133,6 +2258,7 @@ impl Ge {
                         body,
                         writable: Some(name.clone()),
                     });
+                    self.ver += 1;
                     return Ok(());
                 }
                 // let-name assign — eval's env.insert: shadow-bind in
@@ -2197,6 +2323,10 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
             .map(|t| (t.name.clone(), t.ty.numel() as usize))
             .collect(),
         param_off: HashMap::new(),
+        persistent: HashMap::new(),
+        ver: 0,
+        in_backward: false,
+        pstats: (0, 0),
         lines: Vec::new(),
         tmp: 0,
     };
@@ -2706,6 +2836,14 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         .filter(|t| t.qual == Qual::Trainable)
         .map(|t| (t.name.clone(), t.name.clone(), t.ty.clone(), t.src.clone()))
         .collect();
+    if std::env::var("COYOTE_GPU_DEBUG").is_ok() {
+        eprintln!(
+            "gpu emit ({name}): persistent hits={} misses={} emit_q={}",
+            ge.pstats.0,
+            ge.pstats.1,
+            ge.emit_q.len()
+        );
+    }
     Ok(GpuOut {
         msl,
         msl_sha,

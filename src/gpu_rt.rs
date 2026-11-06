@@ -30,11 +30,18 @@ use std::sync::Mutex;
 /// — name collisions across unrelated models can never alias.
 pub struct GpuArena {
     inner: Mutex<HashMap<u64, ArenaState>>,
+    /// compiled `MTLLibrary`s keyed by emit sha — evicted-then-reloaded
+    /// programs reuse the compiled source instead of paying the Metal
+    /// compile again.
+    libs: Mutex<HashMap<String, metal::Library>>,
 }
 
 struct ArenaState {
     /// shared `__params_pool` buffer + capacity in f32 elements.
     pool: Option<(metal::Buffer, usize)>,
+    /// param names already staged into the pool — reloads after
+    /// eviction must not memcpy init values over trained weights.
+    pool_filled: std::collections::HashSet<String>,
     /// param name → shared f16 buffer (+ element count).
     half: HashMap<String, (metal::Buffer, usize)>,
 }
@@ -43,7 +50,76 @@ impl GpuArena {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            libs: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// the compiled library for `msl`, compiling once per sha.
+    pub fn library(
+        &self,
+        sha: &str,
+        msl: &str,
+        dev: &metal::Device,
+    ) -> Result<metal::Library, String> {
+        let mut g = self.libs.lock().map_err(|_| "gpu arena poisoned")?;
+        if let Some(l) = g.get(sha) {
+            return Ok(l.clone());
+        }
+        let l = dev
+            .new_library_with_source(msl, &metal::CompileOptions::new())
+            .map_err(|e| format!("msl compile: {}", String::from_utf8_lossy(e.as_bytes())))?;
+        g.insert(sha.to_string(), l.clone());
+        Ok(l)
+    }
+
+    /// Ensure the shared pool exists for this param universe and stage
+    /// `data` at `off` — but only the first runtime writes; later
+    /// loads (post-eviction reloads) keep the resident trained bytes.
+    /// Returns the pool buffer.
+    fn pool_stage(
+        &self,
+        f: u64,
+        cap_elems: usize,
+        name: &str,
+        off: usize,
+        data: &[f32],
+        dev: &metal::Device,
+    ) -> Result<metal::Buffer, String> {
+        let mut g = self.inner.lock().map_err(|_| "gpu arena poisoned")?;
+        let st = g.entry(f).or_insert_with(|| ArenaState {
+            pool: None,
+            pool_filled: std::collections::HashSet::new(),
+            half: HashMap::new(),
+        });
+        let b = match &st.pool {
+            Some((b, cap)) => {
+                if *cap < cap_elems {
+                    return Err(format!(
+                        "gpu arena pool: {} elems shared, program wants {}",
+                        cap, cap_elems
+                    ));
+                }
+                b.clone()
+            }
+            None => {
+                let nb = dev.new_buffer(
+                    (cap_elems * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                st.pool = Some((nb.clone(), cap_elems));
+                nb
+            }
+        };
+        if st.pool_filled.insert(name.to_string()) {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    (b.contents() as *mut f32).add(off),
+                    data.len(),
+                );
+            }
+        }
+        Ok(b)
     }
 
     /// identity of a program's whole param universe — every gpu fn of
@@ -61,37 +137,6 @@ impl GpuArena {
         h.finish()
     }
 
-    /// the shared pool buffer for this param universe, allocating on
-    /// first use. Capacity is the caller's `pool_total` — identical
-    /// fingerprints imply identical totals.
-    fn pool_buf(
-        &self,
-        f: u64,
-        cap_elems: usize,
-        dev: &metal::Device,
-    ) -> Result<metal::Buffer, String> {
-        let mut g = self.inner.lock().map_err(|_| "gpu arena poisoned")?;
-        let st = g.entry(f).or_insert_with(|| ArenaState {
-            pool: None,
-            half: HashMap::new(),
-        });
-        if let Some((b, cap)) = &st.pool {
-            if *cap < cap_elems {
-                return Err(format!(
-                    "gpu arena pool: {} elems shared, program wants {}",
-                    cap, cap_elems
-                ));
-            }
-            return Ok(b.clone());
-        }
-        let b = dev.new_buffer(
-            (cap_elems * 4) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        st.pool = Some((b.clone(), cap_elems));
-        Ok(b)
-    }
-
     /// the shared f16 buffer for `name`, allocating + filling on first
     /// use. A later program with the same param universe reuses the
     /// resident bytes — including values a trainer already updated.
@@ -105,6 +150,7 @@ impl GpuArena {
         let mut g = self.inner.lock().map_err(|_| "gpu arena poisoned")?;
         let st = g.entry(f).or_insert_with(|| ArenaState {
             pool: None,
+            pool_filled: std::collections::HashSet::new(),
             half: HashMap::new(),
         });
         if let Some((b, n)) = st.half.get(name) {
@@ -197,14 +243,20 @@ impl GpuRuntime {
         arena: Option<&GpuArena>,
     ) -> Result<Self, String> {
         let dev = metal::Device::system_default().ok_or("gpu: no Metal device on this host")?;
-        let lib = dev
-            .new_library_with_source(&out.msl, &CompileOptions::new())
-            .map_err(|e| {
-                format!(
-                    "msl compile ({name}): {}",
-                    String::from_utf8_lossy(e.as_bytes())
-                )
-            })?;
+        // arena-backed runtimes share compiled libraries — a program
+        // evicted under residency pressure reloads without paying the
+        // Metal compile again.
+        let lib = match arena {
+            Some(a) => a.library(&out.msl_sha, &out.msl, &dev)?,
+            None => dev
+                .new_library_with_source(&out.msl, &CompileOptions::new())
+                .map_err(|e| {
+                    format!(
+                        "msl compile ({name}): {}",
+                        String::from_utf8_lossy(e.as_bytes())
+                    )
+                })?,
+        };
         let mut pipes = Vec::new();
         for (k_i, (kname, disp)) in out.kernels.iter().enumerate() {
             let f = lib
@@ -251,8 +303,11 @@ impl GpuRuntime {
                 }
             }
         }
-        let shared_pool = match (arena, fprint, pool_mode) {
-            (Some(a), Some(f), true) => Some(a.pool_buf(f, pool_total, &dev)?),
+        // arena-backed pools stage each param once per universe —
+        // eviction reloads keep trained weights instead of memcpy'ing
+        // init values over them.
+        let shared_arena = match (arena, fprint, pool_mode) {
+            (Some(a), Some(f), true) => Some((f, a)),
             _ => None,
         };
         let mut pool_idx = usize::MAX;
@@ -306,29 +361,38 @@ impl GpuRuntime {
                         data = coyote::lower::q4_quantize(&data);
                     }
                     if pool_mode {
-                        if pool_idx == usize::MAX {
-                            pool_idx = bufs.len();
-                            match &shared_pool {
-                                Some(b) => bufs.push(b.clone()),
-                                None => bufs.push(buf_f32(&dev, &vec![0.0; pool_total])),
-                            }
-                        } else {
-                            // alignment placeholder — `uses` never
-                            // binds this position (dedup keeps the
-                            // first `__params_pool` entry).
-                            bufs.push(buf_f32(&dev, &[0.0; 4]));
-                        }
                         let off = pool_cursor;
                         pool_cursor += (t.ty.numel() as usize + 15) & !15;
+                        match shared_arena {
+                            Some((f, a)) => {
+                                let b = a.pool_stage(f, pool_total, pname, off, &data, &dev)?;
+                                if pool_idx == usize::MAX {
+                                    pool_idx = bufs.len();
+                                    bufs.push(b);
+                                } else {
+                                    // alignment placeholder — `uses`
+                                    // never binds this position.
+                                    bufs.push(buf_f32(&dev, &[0.0; 4]));
+                                }
+                            }
+                            None => {
+                                if pool_idx == usize::MAX {
+                                    pool_idx = bufs.len();
+                                    bufs.push(buf_f32(&dev, &vec![0.0; pool_total]));
+                                } else {
+                                    bufs.push(buf_f32(&dev, &[0.0; 4]));
+                                }
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        data.as_ptr(),
+                                        (bufs[pool_idx].contents() as *mut f32).add(off),
+                                        data.len(),
+                                    );
+                                }
+                            }
+                        }
                         slot.insert(pname.clone(), (pool_idx, off));
                         sizes.insert(pname.clone(), data.len());
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                data.as_ptr(),
-                                (bufs[pool_idx].contents() as *mut f32).add(off),
-                                data.len(),
-                            );
-                        }
                     } else {
                         bufs.push(buf_f32(&dev, &data));
                         sizes.insert(pname.clone(), data.len());

@@ -248,6 +248,18 @@ struct Ge {
     adj_n: usize,
     /// tape name → materialized adjoint buffer.
     adj_bufs: HashMap<String, String>,
+    /// `b__a*` adjoint buffers that already received a contrib this
+    /// emit — the first contrib writes `=` so the old per-buffer
+    /// zero-fill kernel is dead code. Never reset within an emit:
+    /// a second sweep's contribs accumulate onto the first sweep's
+    /// exactly like the old zero-once-per-dispatch + `+=` chain did.
+    contrib_seen: std::collections::HashSet<String>,
+    /// bumped once per top-level tape-node backward — contribs
+    /// sharing a batch may fuse into one kernel (they only read the
+    /// node's own adjoint + primals and write distinct input
+    /// adjoints); a batch boundary preserves the kernel-level sync a
+    /// producer's contrib needs before its consumer-side reader.
+    contrib_batch: u64,
     /// param name → declared type (for grad buffer shapes).
     param_tys: HashMap<String, CTy>,
     /// grad(_, p) wrt → param type, pre-scanned so one sweep covers
@@ -2147,10 +2159,12 @@ impl Ge {
     // `adam`/`param update` then reads a ready grad buffer.
 
     /// adjoint buffer for tape node `name` — allocated lazily, zero-init.
-    /// Contrib kernels accumulate with `+=` and runtime buffers persist
-    /// across `run()` calls, so every fresh adjoint buffer gets a zero
-    /// kernel queued ahead of the first contrib that can target it —
-    /// without it step 2+ would read step 1's adjoints.
+    /// Contrib kernels accumulate with `+=`/`=` and runtime buffers
+    /// persist across `run()` calls. The first contrib to each adjoint
+    /// buffer writes `=` (tracked in `contrib_seen`), overwriting the
+    /// previous dispatch's leftovers — no separate zero-fill kernel
+    /// needed. `ag_` param grads keep their per-sweep `agz_` zeros:
+    /// a param with no contrib in a later sweep must still read 0.
     fn adj_buf(&mut self, name: &str, ty: &CTy) -> String {
         if let Some(b) = self.adj_bufs.get(name) {
             return b.clone();
@@ -2165,13 +2179,6 @@ impl Ge {
         self.bufs
             .insert(b.clone(), (b.clone(), ty.clone(), Kind::Row));
         self.adj_bufs.insert(name.to_string(), b.clone());
-        let z = self.st_any(&b, "gid", "=", "0.0f");
-        self.scratch.push(EK {
-            name: format!("zero_{b}"),
-            dispatch: Dispatch::Linear(numel),
-            body: vec![z],
-            writable: None,
-        });
         b
     }
 
@@ -2203,12 +2210,38 @@ impl Ge {
         let saved = std::mem::take(&mut self.lines);
         let coords = Self::coords_of("gid", &ty.dims);
         let v = adj(self, &coords)?;
-        let line = self.st_any(tgt, "gid", "+=", &v);
+        // first contrib to an adjoint buffer overwrites the previous
+        // dispatch's leftovers; `ag_` grads always `+=` onto the
+        // per-sweep `agz_` zero.
+        let op = if tgt.starts_with("b__a") && self.contrib_seen.insert(tgt.to_string()) {
+            "="
+        } else {
+            "+="
+        };
+        let line = self.st_any(tgt, "gid", op, &v);
         self.lines.push(line);
         let body = std::mem::take(&mut self.lines);
         self.lines = saved;
+        // fuse: an immediately-preceding contrib from the same
+        // tape-node backward with the same dispatch appends its store
+        // lines instead of launching another kernel. The `{ }` wrap
+        // scopes any decls the closure emitted. Anything else queued
+        // since (nested scratch kernels, another batch) breaks the
+        // run — kernel boundaries are the sync points adjoint
+        // producer/consumer pairs rely on.
+        let tag = format!("adj_{}_", self.contrib_batch);
+        if let Some(last) = self.scratch.last_mut() {
+            if last.name.starts_with(&tag)
+                && matches!(last.dispatch, Dispatch::Linear(m) if m == numel)
+            {
+                last.body.push("{".into());
+                last.body.extend(body);
+                last.body.push("}".into());
+                return Ok(());
+            }
+        }
         self.scratch.push(EK {
-            name: format!("adj_{tgt}_{}", self.scratch.len()),
+            name: format!("{tag}{tgt}_{}", self.scratch.len()),
             dispatch: Dispatch::Linear(numel),
             body,
             writable: None,
@@ -2686,6 +2719,9 @@ impl Ge {
                         body: vec![sd],
                         writable: None,
                     });
+                    // the seed `=` write is this buffer's first store —
+                    // any later contrib must accumulate onto it.
+                    self.contrib_seen.insert(ab);
                     // drain tape in reverse def order — a let's adjoint
                     // is complete once every later def has contributed.
                     let order: Vec<String> = self.tape_order.iter().rev().cloned().collect();
@@ -2696,6 +2732,7 @@ impl Ge {
                         let def = self.tape_def[&name].clone();
                         let dty = def.ty.clone();
                         let adj_buf_name = abuf.clone();
+                        self.contrib_batch += 1;
                         self.back_tape(&def, &mut |em: &mut Ge, c: &[String]| {
                             Ok(em.adj_rd(&adj_buf_name, &dty, c))
                         })?;
@@ -3078,6 +3115,8 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         sweeps_done: std::collections::HashSet::new(),
         adj_n: 0,
         adj_bufs: HashMap::new(),
+        contrib_seen: std::collections::HashSet::new(),
+        contrib_batch: 0,
         param_tys: HashMap::new(),
         grad_param_tys: HashMap::new(),
         ag_hits: std::collections::HashSet::new(),

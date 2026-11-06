@@ -30,6 +30,7 @@ struct Spec {
     gpu_fns: Vec<String>,
     tokenizer: Option<String>,
     bpe_vocab: usize,
+    blocks: usize,
 }
 
 fn arg<T: std::str::FromStr>(args: &[String], flag: &str, cur: &mut T) {
@@ -79,6 +80,7 @@ fn main() {
         gpu_fns: Vec::new(),
         tokenizer: None,
         bpe_vocab: 0,
+        blocks: 0,
     };
     arg(&args, "--layers", &mut s.layers);
     arg(&args, "--dmodel", &mut s.dmodel);
@@ -105,6 +107,7 @@ fn main() {
         s.tokenizer = args.get(i + 1).cloned();
     }
     arg(&args, "--bpe-vocab", &mut s.bpe_vocab);
+    arg(&args, "--blocks", &mut s.blocks);
     let out = args
         .iter()
         .position(|a| a == "--out")
@@ -441,46 +444,66 @@ fn main() {
     }
     o.push_str(&format!("    rmsnorm({xin}, lnf) @ lmh\n}}\n\n"));
 
-    // Per-layer train fns + head fn. A joint train_step re-emits the
-    // forward once per param (~150 grads × full graph) and hits the
-    // compile-time wall past ~2 layers; per-layer programs keep each
-    // graph at ~1 layer's params. Host dispatches round-robin —
-    // block coordinate descent, a real technique.
+    // Per-group train fns + head fn. The tape sweep is wrt-agnostic:
+    // one sweep per fn fills ag_ for every grad param in the group,
+    // walking back only as deep as the group's lowest layer. `--blocks
+    // K` groups contiguous layers into K programs — K forwards plus
+    // ~L²/2K layer-backwards replace L forwards plus ~L²/2 (per-layer
+    // BCD recomputes every shared-path adjoint once per layer). The
+    // per-layer default remains for ANE residency, where program
+    // size — not dispatch count — is the binding constraint.
     //
     // The forward is hoisted into a let: eval binds it once, every
     // grad(mse(logits, tgt), p) backward-walks the same DAG reading
     // the materialized activations — one forward emit instead of one
     // per param. Without the hoist each adam re-inlines the whole
     // forward+backward and Metal compile time goes superlinear.
-    w!("// teacher-forced step: forward + adam on this layer's params.");
-    for l in 0..l_n {
-        w!(&format!("{} train_l{l}(", kw(&format!("train_l{l}"))));
+    let groups: Vec<(String, Vec<usize>)> = if s.blocks > 0 {
+        let per = (l_n + s.blocks - 1) / s.blocks;
+        (0..s.blocks)
+            .map(|b| {
+                let lo = b * per;
+                let hi = ((b + 1) * per).min(l_n);
+                (format!("train_blk{b}"), (lo..hi).collect::<Vec<_>>())
+            })
+            .filter(|(_, ls)| !ls.is_empty())
+            .collect()
+    } else {
+        (0..l_n)
+            .map(|l| (format!("train_l{l}"), vec![l]))
+            .collect()
+    };
+    w!("// teacher-forced step: forward + adam on this group's params.");
+    for (gname, layers) in &groups {
+        w!(&format!("{} {gname}(", kw(gname)));
         w!(&format!(
             "    x: f16[{d}], pos: f16[{sq}], mask: f16[{sq}],"
         ));
         w!(&format!("    cos: f16[{hd}], sin: f16[{hd}], tgt: f16[{v}]"));
         w!(&format!(") -> f16[{v}] {{"));
         w!("    let logits = forward(x, pos, mask, cos, sin);");
-        for nm in ["ln1", "ln2", "qnl", "qnh"] {
-            w!(&format!(
-                "    adam(l{l}_{nm}, grad(mse(logits, tgt), l{l}_{nm}), 0.01);"
-            ));
-        }
-        for h in 0..q {
-            for hf in ["lo", "hi"] {
+        for &l in layers {
+            for nm in ["ln1", "ln2", "qnl", "qnh"] {
                 w!(&format!(
-                    "    adam(l{l}_q{h}{hf}, grad(mse(logits, tgt), l{l}_q{h}{hf}), 0.05);"
-                ));
-                w!(&format!(
-                    "    adam(l{l}_o{h}{hf}, grad(mse(logits, tgt), l{l}_o{h}{hf}), 0.05);"
+                    "    adam(l{l}_{nm}, grad(mse(logits, tgt), l{l}_{nm}), 0.01);"
                 ));
             }
-        }
-        for bc in 0..fb {
-            for pr in ["wg", "wu", "wd"] {
-                w!(&format!(
-                    "    adam(l{l}_{pr}{bc}, grad(mse(logits, tgt), l{l}_{pr}{bc}), 0.05);"
-                ));
+            for h in 0..q {
+                for hf in ["lo", "hi"] {
+                    w!(&format!(
+                        "    adam(l{l}_q{h}{hf}, grad(mse(logits, tgt), l{l}_q{h}{hf}), 0.05);"
+                    ));
+                    w!(&format!(
+                        "    adam(l{l}_o{h}{hf}, grad(mse(logits, tgt), l{l}_o{h}{hf}), 0.05);"
+                    ));
+                }
+            }
+            for bc in 0..fb {
+                for pr in ["wg", "wu", "wd"] {
+                    w!(&format!(
+                        "    adam(l{l}_{pr}{bc}, grad(mse(logits, tgt), l{l}_{pr}{bc}), 0.05);"
+                    ));
+                }
             }
         }
         w!("    logits");
@@ -516,7 +539,7 @@ fn main() {
     w!("    var round = 0;");
     w!(&format!("    while round < {rounds} {{"));
     w!("        var phase = 0;");
-    w!(&format!("        while phase < {} {{", l_n + 1));
+    w!(&format!("        while phase < {} {{", groups.len() + 1));
     w!(&format!("            var ep = round * {chunk};"));
     w!(&format!("            var emax = ep + {chunk};"));
     w!("            while ep < emax {");
@@ -538,10 +561,10 @@ fn main() {
     // each phase branch is self-contained: exactly one trainer runs
     // per step, so the host never touches a second ANE program inside
     // a streak and residency survives the whole streak.
-    for l in 0..l_n {
-        w!(&format!("                    if phase == {l} {{"));
+    for (pi, (gname, _)) in groups.iter().enumerate() {
+        w!(&format!("                    if phase == {pi} {{"));
         w!(&format!(
-            "                        let lg = train_l{l}(x, p, m, c, s, tgt);"
+            "                        let lg = {gname}(x, p, m, c, s, tgt);"
         ));
         w!("                        let pred = argmax(lg);");
         if toks.is_some() {
@@ -552,7 +575,7 @@ fn main() {
         w!("                        witness(\"train_pred\", pred);");
         w!("                    }");
     }
-    w!(&format!("                    if phase == {l_n} {{"));
+    w!(&format!("                    if phase == {} {{", groups.len()));
     w!("                        let lg = train_head(x, p, m, c, s, tgt);");
     w!("                        let pred = argmax(lg);");
     if toks.is_some() {

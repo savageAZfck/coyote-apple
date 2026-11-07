@@ -791,6 +791,21 @@ impl GpuRuntime {
         let out = unsafe {
             std::slice::from_raw_parts(self.bufs[0].contents() as *const f32, self.out_n).to_vec()
         };
+        if std::env::var_os("CYO_DBG_OUT").is_some() {
+            let (mut mn, mut mx, mut nan, mut inf) =
+                (f32::INFINITY, f32::NEG_INFINITY, 0usize, 0usize);
+            for &v in &out {
+                if v.is_nan() {
+                    nan += 1;
+                } else if v.is_infinite() {
+                    inf += 1;
+                } else {
+                    mn = mn.min(v);
+                    mx = mx.max(v);
+                }
+            }
+            eprintln!("gpu out: n={} min={mn} max={mx} nan={nan} inf={inf}", out.len());
+        }
         Ok(out)
     }
 

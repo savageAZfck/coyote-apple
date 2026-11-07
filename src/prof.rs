@@ -8,7 +8,7 @@
 //! A parity diff against the CPU evaluator rides along — timing
 //! without correctness is noise.
 
-use coyote::lower::init_weight_pub;
+use coyote::lower::{init_weight_dims, init_weight_pub};
 use coyote::typeck::TProgram;
 use coyote::{eval::Evaluator, vm};
 use std::path::PathBuf;
@@ -172,7 +172,7 @@ fn prof_ext(
                     vec![ty.numel() as usize]
                 };
                 let init =
-                    coyote::weights::resolve(pname, Some(&expect), src.as_deref(), init_weight_pub)
+                    coyote::weights::resolve(pname, Some(&expect), src.as_deref(), init_weight_dims)
                         .unwrap_or_default();
                 if let Some(got) = g.read_buf(pname) {
                     let drift = got
@@ -235,7 +235,7 @@ fn prof_ane(src: &str, prog: &TProgram, dir: &PathBuf, runs: usize) -> Result<St
     }
     for (pname, port, cty, src) in &out.trainable {
         let (n, k) = (cty.dims[1] as usize, cty.dims[0] as usize);
-        let w = coyote::weights::resolve(pname, Some(&[n, k]), src.as_deref(), init_weight_pub)
+        let w = coyote::weights::resolve(pname, Some(&[n, k]), src.as_deref(), init_weight_dims)
             .map_err(|e| e.to_string())?;
         vm::write_surface(&mut rt, port, &[n, k], &w);
     }

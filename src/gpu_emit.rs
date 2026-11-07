@@ -76,6 +76,14 @@ pub struct GpuOut {
     /// layer/head of a transformer) collapse to one MSL function.
     /// Empty for kernels on the direct-binding path.
     pub desc_templates: Vec<Vec<u32>>,
+    /// per-kernel buffer indices reached through `__ptrs->p[...]` —
+    /// parallel to `kernels`. Metal only makes `set_buffer`-bound
+    /// resources resident; gpuAddress-indirect reads need an explicit
+    /// `useResources` declaration per encoder, so the runtime marks
+    /// exactly this set (a few buffers per dispatch) instead of the
+    /// whole table. Empty for direct-binding kernels, whose `uses`
+    /// bindings already cover residency.
+    pub kernel_indirect: Vec<Vec<u32>>,
 }
 
 /// how a kernel maps threads: flat elementwise (`Linear`) or a
@@ -3988,6 +3996,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
     let mut kernels = Vec::new();
     let mut kernel_uses = Vec::new();
     let mut desc_templates: Vec<Vec<u32>> = Vec::new();
+    let mut kernel_indirect: Vec<Vec<u32>> = Vec::new();
     if dedup {
         if entries.len() > PTRS_SLOTS {
             return Err(format!(
@@ -4045,6 +4054,41 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
             // resolves to the per-kernel desc buffer index.
             kernel_uses.push(vec![u32::MAX, u32::MAX - 1]);
             desc_templates.push(tpl);
+            // buffers this dispatch reaches through `__ptrs->p` —
+            // same idents∩entries computation as `uses` on the direct
+            // path: every entry name the body references, first
+            // occurrence wins (dedup by name matches `name_to_k`).
+            let idents = body_idents(&ek.body);
+            let mut seen = std::collections::HashSet::new();
+            let indirect: Vec<u32> = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, (n, _))| idents.contains(n) && seen.insert(n.clone()))
+                .map(|(i, _)| i as u32)
+                .collect();
+            kernel_indirect.push(indirect);
+            if std::env::var_os("CYO_DUMP_DESC").is_some() && ge.emit_q.len() < 10000 {
+                let maxslot = body_txt
+                    .match_indices("__desc[")
+                    .filter_map(|(p, _)| {
+                        body_txt[p + 7..]
+                            .split(']')
+                            .next()
+                            .and_then(|s| s.parse::<usize>().ok())
+                    })
+                    .max()
+                    .unwrap_or(0);
+                if maxslot as usize >= desc_templates.last().unwrap().len() {
+                    eprintln!(
+                        "DESC_MISMATCH dispatch={} group={} tpl_len={} max_slot={}\n{}",
+                        kernels.len() - 1,
+                        group_names[gi],
+                        desc_templates.last().unwrap().len(),
+                        maxslot,
+                        body_txt
+                    );
+                }
+            }
         }
     } else {
     for ek in &ge.emit_q {
@@ -4092,6 +4136,9 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
             ));
             kernels.push((kname, ek.dispatch));
             kernel_uses.push(vec![u32::MAX]); // sentinel → ptrs table
+            // every entry this kernel's body references is reached
+            // through `p[K]` — the residency set is `uses` itself.
+            kernel_indirect.push(uses);
             continue;
         }
         let ksig: Vec<String> = uses
@@ -4149,9 +4196,20 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         ));
         kernels.push((kname, ek.dispatch));
         kernel_uses.push(uses);
+        kernel_indirect.push(Vec::new()); // direct bindings self-resident
     }
     }
     desc_templates.resize(kernels.len(), Vec::new());
+    kernel_indirect.resize(kernels.len(), Vec::new());
+    if std::env::var_os("CYO_DUMP_DESC").is_some() {
+        eprintln!("desc entries ({}):", entries.len());
+        for (i, (n, _)) in entries.iter().enumerate() {
+            eprintln!("  [{i}] {n}");
+        }
+        for (i, ((kname, _), tpl)) in kernels.iter().zip(desc_templates.iter()).enumerate() {
+            eprintln!("desc[{i}] {kname} {tpl:?}");
+        }
+    }
 
     let msl = format!(
         "// coyote gpu emit — {name}\n#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n\nstruct __CoyotePtrs {{ device char* p[{PTRS_SLOTS}]; }};\n\n{}",
@@ -4200,5 +4258,6 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         kernels,
         kernel_uses,
         desc_templates,
+        kernel_indirect,
     })
 }

@@ -76,8 +76,16 @@ fn main() {
     let mut total = 0u64;
     for (name, dims) in &decls {
         let numel: usize = dims.iter().product();
+        // fallback wants storage-order dims ([N,K] — fan-in last);
+        // declared rank-2 dims are [K,N], so reverse to match the
+        // runtime's `expect` exactly.
+        let ed: Vec<usize> = if dims.len() == 2 {
+            vec![dims[1], dims[0]]
+        } else {
+            dims.clone()
+        };
         // param_fallback already f16-rounds — F16 store is exact.
-        let vals = coyote::weights::param_fallback(name, numel);
+        let vals = coyote::weights::param_fallback(name, &ed);
         debug_assert_eq!(vals.len(), numel);
         let nbytes = (numel * 2) as u64;
         meta.push((name.clone(), dims.clone(), cursor - (8 + HREG), nbytes));

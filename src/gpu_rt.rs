@@ -172,14 +172,18 @@ impl GpuArena {
 pub struct GpuRuntime {
     _dev: metal::Device,
     queue: metal::CommandQueue,
-    /// (pipeline, dispatch, name, buffer binds) per kernel — update
-    /// kernels first, the main out kernel last, matching eval's
-    /// stmt→ret order. Each kernel declares only the buffers it
-    /// references; `uses` maps signature slots → `bufs` indices.
+    /// (pipeline, dispatch, name, buffer binds, indirect-residency set)
+    /// per kernel — update kernels first, the main out kernel last,
+    /// matching eval's stmt→ret order. Each kernel declares only the
+    /// buffers it references; `uses` maps signature slots → `bufs`
+    /// indices. `indirect` lists the `bufs` indices the kernel reaches
+    /// only through `__ptrs->p[...]` — Metal requires an explicit
+    /// `useResources` declaration for those per encoder.
     pipes: Vec<(
         metal::ComputePipelineState,
         crate::gpu_emit::Dispatch,
         String,
+        Vec<u32>,
         Vec<u32>,
     )>,
     out_n: usize,
@@ -273,7 +277,17 @@ impl GpuRuntime {
                 .get(k_i)
                 .cloned()
                 .unwrap_or_else(|| (0..out.args.len() as u32 + 1).collect());
-            pipes.push((pipe, *disp, kname.clone(), uses));
+            let indirect = out.kernel_indirect.get(k_i).cloned().unwrap_or_else(|| {
+                // emit always populates this; if a hand-built GpuOut
+                // lacks it, a ptrs kernel gets the safe fallback —
+                // u32::MAX marks "every data buffer" at dispatch.
+                if uses.contains(&u32::MAX) {
+                    vec![u32::MAX]
+                } else {
+                    Vec::new()
+                }
+            });
+            pipes.push((pipe, *disp, kname.clone(), uses, indirect));
         }
         let queue = dev.new_command_queue();
 
@@ -606,24 +620,61 @@ impl GpuRuntime {
                 }
             }
         }
+        // Buffers reached only through `__ptrs->p[K]` (gpuAddress)
+        // are indirect accesses — Metal does not make them resident
+        // from the pointer table alone; each compute encoder must
+        // declare them via `useResources`. `set_buffer`-bound buffers
+        // are resident automatically, so only the per-kernel indirect
+        // set is marked — a handful of resources per encoder instead
+        // of the whole ~6k-buffer table that exhausted
+        // IOGPUDeviceShmem when marked indiscriminately.
+        fn mark_indirect(
+            enc: &metal::ComputeCommandEncoderRef,
+            bufs: &[metal::Buffer],
+            ptrs_i: usize,
+            indirect: &[u32],
+        ) {
+            if indirect.is_empty() {
+                return;
+            }
+            let all = indirect.contains(&u32::MAX);
+            let refs: Vec<&metal::ResourceRef> = if all {
+                (0..ptrs_i.min(bufs.len()))
+                    .map(|i| {
+                        let b = &bufs[i];
+                        &***b
+                    })
+                    .collect()
+            } else {
+                indirect
+                    .iter()
+                    .map(|&i| i as usize)
+                    .filter(|&i| i < bufs.len() && i != ptrs_i)
+                    .map(|i| {
+                        let b = &bufs[i];
+                        &***b
+                    })
+                    .collect()
+            };
+            if !refs.is_empty() {
+                enc.use_resources(
+                    &refs,
+                    metal::MTLResourceUsage::Read | metal::MTLResourceUsage::Write,
+                );
+            }
+        }
         let gpu_ms = |cb: &metal::CommandBufferRef| unsafe {
             let s: f64 = msg_send![cb, GPUStartTime];
             let e: f64 = msg_send![cb, GPUEndTime];
             (e - s) * 1000.0
         };
-        // No `use_resources` residency calls: every buffer here is
-        // StorageModeShared — unified memory the GPU addresses directly
-        // through the pointer table's gpuAddresses. Marking the whole
-        // ~6k-buffer set resident per encoder is what exhausted
-        // IOGPUDeviceShmem (kIOGPUCommandBufferCallbackErrorOutOfMemory)
-        // on own4b.
         if self.per_kernel {
             // CYO_PKT — one command buffer per kernel so each pipeline
             // carries its own GPU timestamps. Costs a commit+wait per
             // kernel; the breakdown is the point, not the total.
             self.last_kernels.clear();
             self.last_ms = 0.0;
-            for (pipe, disp, name, uses) in &self.pipes {
+            for (pipe, disp, name, uses, indirect) in &self.pipes {
                 let cb = self.queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(pipe);
@@ -631,6 +682,7 @@ impl GpuRuntime {
                     let bi = if gi == u32::MAX { self.ptrs_i } else { gi as usize };
                     enc.set_buffer(li as u64, Some(&self.bufs[bi]), 0);
                 }
+                mark_indirect(enc, &self.bufs, self.ptrs_i, indirect);
                 dispatch(enc, pipe, disp);
                 enc.end_encoding();
                 cb.commit();
@@ -648,13 +700,14 @@ impl GpuRuntime {
             self.last_kernels.clear();
             for (ci, chunk) in self.pipes.chunks(512).enumerate() {
                 let cb = self.queue.new_command_buffer();
-                for (pipe, disp, _, uses) in chunk {
+                for (pipe, disp, _, uses, indirect) in chunk {
                     let enc = cb.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(pipe);
                     for (li, &gi) in uses.iter().enumerate() {
                         let bi = if gi == u32::MAX { self.ptrs_i } else { gi as usize };
                         enc.set_buffer(li as u64, Some(&self.bufs[bi]), 0);
                     }
+                    mark_indirect(enc, &self.bufs, self.ptrs_i, indirect);
                     dispatch(enc, pipe, disp);
                     enc.end_encoding();
                 }

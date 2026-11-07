@@ -36,6 +36,7 @@ use coyote::typeck::{CTy, TExpr, TIndex, TProgram, TStmt, Typed};
 use std::collections::HashMap;
 
 /// What the runtime needs to bind buffers and run the kernel.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GpuOut {
     pub msl: String,
     pub msl_sha: String,
@@ -89,7 +90,7 @@ pub struct GpuOut {
 /// how a kernel maps threads: flat elementwise (`Linear`) or a
 /// threadgroup-cooperative tiled matmul over a `t×t` tile
 /// (`Tiled` — grid is n×m threads in t×t threadgroups).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum Dispatch {
     Linear(usize),
     /// one threadgroup of N threads — kernels that need threadgroup
@@ -114,7 +115,7 @@ pub enum Dispatch {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Arg {
     In(String),
     Param(String),

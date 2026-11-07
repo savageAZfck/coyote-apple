@@ -634,13 +634,10 @@ fn main() {
     // Deterministic per (spec, text) so a given invocation regrows the
     // identical organism.
     let mut tensors: Vec<(&str, Vec<usize>, Vec<u8>)> = Vec::new();
+    // cemb is seeded from the model spec alone — never the token
+    // stream — so the input embedding space stays fixed while the
+    // corpus text grows or rotates across continuation campaigns.
     let mut st = fnv1a(format!("gen_brain seq L{l_n} D{d} Q{q} S{sq}").as_bytes());
-    if let Some(t) = &toks {
-        for &b in t {
-            st ^= b as u64;
-            st = st.wrapping_mul(0x100000001b3);
-        }
-    }
     if let Some(t) = &toks {
         // cemb [v, d]
         let v = s.vocab;

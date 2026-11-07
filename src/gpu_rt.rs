@@ -253,6 +253,7 @@ impl GpuRuntime {
         // arena-backed runtimes share compiled libraries — a program
         // evicted under residency pressure reloads without paying the
         // Metal compile again.
+        eprintln!("gpu load {name}: msl={}B kernels={}", out.msl.len(), out.kernels.len());
         let lib = match arena {
             Some(a) => a.library(&out.msl_sha, &out.msl, &dev)?,
             None => dev
@@ -264,6 +265,7 @@ impl GpuRuntime {
                     )
                 })?,
         };
+        eprintln!("gpu load {name}: lib done");
         let mut pipes = Vec::new();
         for (k_i, (kname, disp)) in out.kernels.iter().enumerate() {
             let f = lib
@@ -289,6 +291,7 @@ impl GpuRuntime {
             });
             pipes.push((pipe, *disp, kname.clone(), uses, indirect));
         }
+        eprintln!("gpu load {name}: pipes done={}", pipes.len());
         let queue = dev.new_command_queue();
 
         let mut bufs = Vec::new();
@@ -329,6 +332,45 @@ impl GpuRuntime {
         };
         let mut pool_idx = usize::MAX;
         let mut pool_cursor = 0usize;
+        // allocation forecast — printed before any buffer is created so
+        // oversized programs report their footprint even when the load
+        // is killed mid-allocation.
+        {
+            let (mut p16, mut s16, mut s32, mut io, mut st) = (0usize, 0usize, 0usize, 0usize, 0usize);
+            for a in &out.args {
+                match a {
+                    Arg::ParamHalf(pn) => {
+                        if let Some(t) = p.params.iter().find(|t| &t.name == pn) {
+                            p16 += t.ty.numel() as usize;
+                        }
+                    }
+                    Arg::Param(_) => {}
+                    Arg::ScratchHalf(_, n) => s16 += *n,
+                    Arg::Scratch(_, n) => s32 += *n,
+                    Arg::In(pt) => {
+                        if let Some((_, ty, _)) = out.inputs.iter().find(|(n, _, _)| n == pt) {
+                            io += ty.numel() as usize;
+                        }
+                    }
+                    Arg::State(pt) => {
+                        if let Some((_, _, ty)) = out.states.iter().find(|(_, p, _)| p == pt) {
+                            st += ty.numel() as usize;
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "gpu load {name}: args={} out={} pool_f32={} p16={:.1}MB s16={:.1}MB s32={:.1}MB io={:.1}MB st={:.1}MB",
+                out.args.len(),
+                out_n,
+                pool_total,
+                p16 as f64 * 2.0 / 1e6,
+                s16 as f64 * 2.0 / 1e6,
+                s32 as f64 * 4.0 / 1e6,
+                io as f64 * 4.0 / 1e6,
+                st as f64 * 4.0 / 1e6,
+            );
+        }
         for (a_i, a) in out.args.iter().enumerate() {
             let i = a_i + 1;
             slot.insert(a.port().to_string(), (i, 0));
@@ -523,6 +565,7 @@ impl GpuRuntime {
                 }
             }
         }
+        eprintln!("gpu load {name}: args done bufs={}", bufs.len());
         Ok(Self {
             _dev: dev,
             queue,

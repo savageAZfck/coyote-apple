@@ -3860,6 +3860,43 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         (out_lines, tpl)
     }
 
+    /// canonicalize kernel-local `tNNN` temp names to per-kernel
+    /// sequential names. The temp counter is global across the whole
+    /// emit, so structurally identical kernels differ only in temp
+    /// numbering and miss dedup — a 36-layer backward emitted 4,203
+    /// unique groups instead of ~100. Temps are function-local, so
+    /// renaming is semantics-preserving.
+    fn canon_temps(lines: &[String]) -> Vec<String> {
+        let mut map: HashMap<String, u32> = HashMap::new();
+        lines
+            .iter()
+            .map(|line| {
+                let mut out = String::with_capacity(line.len());
+                let mut cur = String::new();
+                for ch in line.chars().chain(std::iter::once(' ')) {
+                    if ch.is_alphanumeric() || ch == '_' {
+                        cur.push(ch);
+                    } else {
+                        let id = cur.as_str();
+                        let is_tmp = id.len() > 1
+                            && id.starts_with('t')
+                            && id[1..].bytes().all(|b| b.is_ascii_digit());
+                        if is_tmp {
+                            let n = map.len() as u32;
+                            let c = *map.entry(id.to_string()).or_insert(n);
+                            out.push_str(&format!("t{c}"));
+                        } else {
+                            out.push_str(id);
+                        }
+                        cur.clear();
+                        out.push(ch);
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
     // format every queued kernel with its own minimal signature;
     // update kernels re-declare their param arg writable. Kernels
     // whose live-buffer count would exceed Metal's 31-slot cap are
@@ -4016,6 +4053,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
         let mut group_names: Vec<String> = Vec::new();
         for ek in &ge.emit_q {
             let (lines, tpl) = desc_body(&ek.body, &name_to_k, &half_all);
+            let lines = canon_temps(&lines);
             let body_txt = lines
                 .iter()
                 .map(|l| format!("    {l}"))

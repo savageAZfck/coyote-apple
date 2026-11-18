@@ -137,6 +137,31 @@ impl GpuArena {
         h.finish()
     }
 
+    /// Probe whether `name` is already resident in the shared f16 arena
+    /// so post-eviction reloads skip `weights::resolve` (and avoid
+    /// re-reading a 7.5GB safetensors file just to discard the vec).
+    fn half_existing(
+        &self,
+        f: u64,
+        name: &str,
+        want_len: usize,
+    ) -> Result<Option<metal::Buffer>, String> {
+        let g = self.inner.lock().map_err(|_| "gpu arena poisoned")?;
+        let Some(st) = g.get(&f) else {
+            return Ok(None);
+        };
+        let Some((b, n)) = st.half.get(name) else {
+            return Ok(None);
+        };
+        if *n != want_len {
+            return Err(format!(
+                "gpu arena {name}: {} elems shared, program wants {}",
+                n, want_len
+            ));
+        }
+        Ok(Some(b.clone()))
+    }
+
     /// the shared f16 buffer for `name`, allocating + filling on first
     /// use. A later program with the same param universe reuses the
     /// resident bytes — including values a trainer already updated.
@@ -267,29 +292,31 @@ impl GpuRuntime {
         };
         eprintln!("gpu load {name}: lib done");
         let mut pipes = Vec::new();
-        for (k_i, (kname, disp)) in out.kernels.iter().enumerate() {
-            let f = lib
-                .get_function(kname, None)
-                .map_err(|e| format!("msl kernel ({name}:{kname}): {e:?}"))?;
-            let pipe = dev
-                .new_compute_pipeline_state_with_function(&f)
-                .map_err(|e| format!("msl pipeline ({name}:{kname}): {e:?}"))?;
-            let uses = out
-                .kernel_uses
-                .get(k_i)
-                .cloned()
-                .unwrap_or_else(|| (0..out.args.len() as u32 + 1).collect());
-            let indirect = out.kernel_indirect.get(k_i).cloned().unwrap_or_else(|| {
-                // emit always populates this; if a hand-built GpuOut
-                // lacks it, a ptrs kernel gets the safe fallback —
-                // u32::MAX marks "every data buffer" at dispatch.
-                if uses.contains(&u32::MAX) {
-                    vec![u32::MAX]
-                } else {
-                    Vec::new()
+        for chunk in out.kernels.iter().enumerate().collect::<Vec<_>>().chunks(512) {
+            objc::rc::autoreleasepool(|| -> Result<(), String> {
+                for &(k_i, (kname, disp)) in chunk {
+                    let f = lib
+                        .get_function(kname, None)
+                        .map_err(|e| format!("msl kernel ({name}:{kname}): {e:?}"))?;
+                    let pipe = dev
+                        .new_compute_pipeline_state_with_function(&f)
+                        .map_err(|e| format!("msl pipeline ({name}:{kname}): {e:?}"))?;
+                    let uses = out
+                        .kernel_uses
+                        .get(k_i)
+                        .cloned()
+                        .unwrap_or_else(|| (0..out.args.len() as u32 + 1).collect());
+                    let indirect = out.kernel_indirect.get(k_i).cloned().unwrap_or_else(|| {
+                        if uses.contains(&u32::MAX) {
+                            vec![u32::MAX]
+                        } else {
+                            Vec::new()
+                        }
+                    });
+                    pipes.push((pipe, *disp, kname.clone(), uses, indirect));
                 }
-            });
-            pipes.push((pipe, *disp, kname.clone(), uses, indirect));
+                Ok(())
+            })?;
         }
         eprintln!("gpu load {name}: pipes done={}", pipes.len());
         let queue = dev.new_command_queue();
@@ -468,6 +495,19 @@ impl GpuRuntime {
                     } else {
                         vec![t.ty.numel() as usize]
                     };
+                    let want_len: usize = expect.iter().product();
+                    // Check the shared arena BEFORE calling `weights::resolve`
+                    // so subsequent programs (`train_blk1..8`, `forward`) reuse
+                    // the resident f16 buffer in O(1) without re-reading a 7.5GB
+                    // checkpoint file into host RAM.
+                    if let (Some(a), Some(f)) = (arena, fprint) {
+                        if let Some(b) = a.half_existing(f, pname, want_len)? {
+                            bufs.push(b);
+                            half_slots.insert(i);
+                            sizes.insert(pname.clone(), want_len);
+                            continue;
+                        }
+                    }
                     let mut data = coyote::weights::resolve(
                         pname,
                         Some(&expect),
@@ -477,10 +517,6 @@ impl GpuRuntime {
                     if t.ty.dt == coyote::ast::DType::Q4 {
                         data = coyote::lower::q4_quantize(&data);
                     }
-                    // shared f16 params alias the arena buffer — the
-                    // first runtime of this param universe filled it;
-                    // every later one (forward, other trainers) reads
-                    // the same resident bytes, updates included.
                     let hb = match (arena, fprint) {
                         (Some(a), Some(f)) => Some(a.half_buf(f, pname, &data, &dev)?),
                         _ => None,
@@ -493,10 +529,12 @@ impl GpuRuntime {
                     sizes.insert(pname.clone(), data.len());
                 }
                 Arg::Scratch(name, numel) => {
+                    coyote::weights::clear_cache();
                     bufs.push(buf_f32(&dev, &vec![0.0; *numel]));
                     sizes.insert(name.clone(), *numel);
                 }
                 Arg::ScratchHalf(name, numel) => {
+                    coyote::weights::clear_cache();
                     // f16 scratch (`CYO_F16_SCRATCH`) — activations and
                     // tape adjoints; half the footprint of f32. Zeroed
                     // like every scratch: contrib kernels accumulate
@@ -508,6 +546,7 @@ impl GpuRuntime {
                 }
             }
         }
+        coyote::weights::clear_cache();
         // pointer table for oversized kernels — one device buffer
         // holding every resident buffer's address; `__ptrs->p[K]`
         // in the kernel indexes it. Unified memory means
@@ -718,32 +757,8 @@ impl GpuRuntime {
             self.last_kernels.clear();
             self.last_ms = 0.0;
             for (pipe, disp, name, uses, indirect) in &self.pipes {
-                let cb = self.queue.new_command_buffer();
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(pipe);
-                for (li, &gi) in uses.iter().enumerate() {
-                    let bi = if gi == u32::MAX { self.ptrs_i } else { gi as usize };
-                    enc.set_buffer(li as u64, Some(&self.bufs[bi]), 0);
-                }
-                mark_indirect(enc, &self.bufs, self.ptrs_i, indirect);
-                dispatch(enc, pipe, disp);
-                enc.end_encoding();
-                cb.commit();
-                cb.wait_until_completed();
-                let ms = gpu_ms(cb);
-                self.last_ms += ms;
-                self.last_kernels.push((name.clone(), ms));
-            }
-        } else {
-            // chunk dispatches across command buffers (512 encoders
-            // per cb) so argument-buffer residency (`use_resources`)
-            // never exhausts IOGPUDeviceShmem on 6,700-kernel programs.
-            self.last_ms = 0.0;
-            self.last_wall_ms = 0.0;
-            self.last_kernels.clear();
-            for (ci, chunk) in self.pipes.chunks(512).enumerate() {
-                let cb = self.queue.new_command_buffer();
-                for (pipe, disp, _, uses, indirect) in chunk {
+                objc::rc::autoreleasepool(|| {
+                    let cb = self.queue.new_command_buffer();
                     let enc = cb.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(pipe);
                     for (li, &gi) in uses.iter().enumerate() {
@@ -753,39 +768,64 @@ impl GpuRuntime {
                     mark_indirect(enc, &self.bufs, self.ptrs_i, indirect);
                     dispatch(enc, pipe, disp);
                     enc.end_encoding();
-                }
-                let t0 = std::time::Instant::now();
-                cb.commit();
-                cb.wait_until_completed();
-                let wall = t0.elapsed().as_secs_f64() * 1000.0;
-                self.last_wall_ms += wall;
-                let ms = gpu_ms(cb);
-                self.last_ms += ms;
-                // coarse per-chunk breakdown — 512-kernel granularity
-                // is enough to locate hot regions in 6k-kernel programs
-                // without CYO_PKT's per-kernel commit+wait cost.
-                self.last_kernels
-                    .push((format!("chunk_{ci}"), wall.max(ms)));
-                // diagnostics: a faulted chunk reports ~0 GPU time while
-                // the host still paid the encode cost — surface the
-                // Metal error instead of silently trusting the clock.
-                let status: usize = unsafe { msg_send![&*cb, status] };
-                if status != 4 {
-                    // MTLCommandBufferStatusCompleted == 4
-                    let err: *mut objc::runtime::Object = unsafe { msg_send![&*cb, error] };
-                    eprintln!(
-                        "gpu_rt: chunk {ci} cb status {status} err {:?}",
-                        if err.is_null() {
-                            None
-                        } else {
-                            Some(unsafe {
-                                let d: *const std::ffi::c_char =
-                                    msg_send![err, UTF8String];
-                                std::ffi::CStr::from_ptr(d).to_string_lossy().into_owned()
-                            })
+                    cb.commit();
+                    cb.wait_until_completed();
+                    let ms = gpu_ms(cb);
+                    self.last_ms += ms;
+                    self.last_kernels.push((name.clone(), ms));
+                });
+            }
+        } else {
+            // chunk dispatches across command buffers (512 encoders
+            // per cb) so argument-buffer residency (`use_resources`)
+            // never exhausts IOGPUDeviceShmem on 6,700-kernel programs.
+            // Wrap each chunk in an Objective-C autoreleasepool so the
+            // 512 autoreleased encoders + command buffer are released
+            // immediately on completion instead of accumulating across
+            // thousands of calls.
+            self.last_ms = 0.0;
+            self.last_wall_ms = 0.0;
+            self.last_kernels.clear();
+            for (ci, chunk) in self.pipes.chunks(512).enumerate() {
+                objc::rc::autoreleasepool(|| {
+                    let cb = self.queue.new_command_buffer();
+                    for (pipe, disp, _, uses, indirect) in chunk {
+                        let enc = cb.new_compute_command_encoder();
+                        enc.set_compute_pipeline_state(pipe);
+                        for (li, &gi) in uses.iter().enumerate() {
+                            let bi = if gi == u32::MAX { self.ptrs_i } else { gi as usize };
+                            enc.set_buffer(li as u64, Some(&self.bufs[bi]), 0);
                         }
-                    );
-                }
+                        mark_indirect(enc, &self.bufs, self.ptrs_i, indirect);
+                        dispatch(enc, pipe, disp);
+                        enc.end_encoding();
+                    }
+                    let t0 = std::time::Instant::now();
+                    cb.commit();
+                    cb.wait_until_completed();
+                    let wall = t0.elapsed().as_secs_f64() * 1000.0;
+                    self.last_wall_ms += wall;
+                    let ms = gpu_ms(cb);
+                    self.last_ms += ms;
+                    self.last_kernels
+                        .push((format!("chunk_{ci}"), wall.max(ms)));
+                    let status: usize = unsafe { msg_send![&*cb, status] };
+                    if status != 4 {
+                        let err: *mut objc::runtime::Object = unsafe { msg_send![&*cb, error] };
+                        eprintln!(
+                            "gpu_rt: chunk {ci} cb status {status} err {:?}",
+                            if err.is_null() {
+                                None
+                            } else {
+                                Some(unsafe {
+                                    let d: *const std::ffi::c_char =
+                                        msg_send![err, UTF8String];
+                                    std::ffi::CStr::from_ptr(d).to_string_lossy().into_owned()
+                                })
+                            }
+                        );
+                    }
+                });
             }
         }
         let out = unsafe {

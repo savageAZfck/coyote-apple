@@ -205,7 +205,7 @@ struct Ge {
     scratch: Vec<EK>,
     /// expr pointer → scratch buffer name, dedup for non-named
     /// subexprs read repeatedly (let binds get buffer idents instead).
-    mat_ptr: HashMap<usize, String>,
+    mat_ptr: HashMap<u64, String>,
     /// scratch buffer creation order — sig/arg indices follow it.
     scratch_args: Vec<(String, usize)>,
     /// param name → numel, for update-kernel dispatch sizes.
@@ -743,6 +743,15 @@ impl Ge {
         if e.ty.numel() > 1
             && (Self::needs_scratch(e) || self.tcost(e, Self::TCTX_MAX + 1) > Self::TCTX_MAX)
         {
+            if std::env::var_os("CYO_GEN_TRACE").is_some() {
+                eprintln!(
+                    "GENT {} mat n={} ns={} tc={}",
+                    expr_key(e),
+                    e.ty.numel(),
+                    Self::needs_scratch(e),
+                    self.tcost(e, Self::TCTX_MAX + 1)
+                );
+            }
             let buf = self.scratch_of(e)?;
             let f = Self::flat(&e.ty.dims, coords, &Kind::Row);
             // half scratch reads widen explicitly — bare `half` values
@@ -760,7 +769,35 @@ impl Ge {
     /// scratchable subexprs register their own kernels first — the
     /// `scratch` queue's push order IS dependency order.
     fn scratch_of(&mut self, e: &Typed) -> Result<String, String> {
-        let key = e as *const Typed as usize;
+        // memo key: forward nodes are stable `p.body` addresses, but
+        // backward exprs are per-node clones whose heap addresses
+        // recycle across tape iterations — a raw pointer key produced
+        // process-dependent stale hits (wrong buffer bound, broken
+        // kernels). Backward keys on structure + the `gen_limit`
+        // context that decides binding resolution instead: identical
+        // subexprs under identical scope context dedup correctly and
+        // deterministically. The map is cleared at each backward
+        // entry so scope-context changes can't leak across calls.
+        let key = if self.in_backward {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            expr_key(e).hash(&mut h);
+            for &(si, p) in &self.gen_limit {
+                si.hash(&mut h);
+                p.hash(&mut h);
+            }
+            h.finish()
+        } else {
+            e as *const Typed as usize as u64
+        };
+        if std::env::var_os("CYO_GEN_TRACE").is_some() {
+            eprintln!(
+                "GENT scratch_of ek={} key={:#x} hit={}",
+                expr_key(e),
+                key,
+                self.mat_ptr.contains_key(&key)
+            );
+        }
         if let Some(b) = self.mat_ptr.get(&key) {
             return Ok(b.clone());
         }
@@ -1833,6 +1870,7 @@ impl Ge {
         self.scopes.push(Vec::new());
         self.orig_scopes.push(Vec::new());
         let saved_bw = std::mem::replace(&mut self.in_backward, true);
+        self.mat_ptr.clear();
         let r = (|| {
             let terminal = match &loss.e {
                 TExpr::Block(stmts, ret) => {
@@ -3055,7 +3093,13 @@ impl Ge {
         // can't be corrupted by partial `+=` writes landing later.
         let scratch_mark = self.scratch.len();
         // zero + allocate ag_ for every grad param up front.
-        for (p, ty) in self.grad_param_tys.clone() {
+        // sorted: HashMap iteration order is per-process random — an
+        // unstable order here renames scratch buffers and reshuffles
+        // kernel fusion/dedup, so identical sources emitted different
+        // (sometimes broken) kernels run to run.
+        let mut gps: Vec<(String, CTy)> = self.grad_param_tys.iter().map(|(p, t)| (p.clone(), t.clone())).collect();
+        gps.sort_by(|a, b| a.0.cmp(&b.0));
+        for (p, ty) in gps {
             let ag = self.ag_buf(&p, &ty);
             let n = ty.numel().max(1) as usize;
             let z = self.st_any(&ag, "gid", "=", "0.0f");
@@ -3071,6 +3115,7 @@ impl Ge {
         self.scopes.push(Vec::new());
         self.orig_scopes.push(Vec::new());
         let saved_bw = std::mem::replace(&mut self.in_backward, true);
+        self.mat_ptr.clear();
         for name in self.tape_order.clone() {
             let def = self.tape_def[&name].clone();
             match self.persistent.get(&name) {
@@ -3926,6 +3971,25 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
     // chains — the tape's dominant shape). Anything else keeps its
     // kernel boundary: that boundary IS the global sync a
     // producer/consumer adjoint pair relies on. `CYO_FUSE=0` off.
+    if std::env::var_os("CYO_EMIT_TRACE").is_some() {
+        use std::hash::{Hash, Hasher};
+        for (i, ek) in ge.emit_q.iter().enumerate() {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            ek.name.hash(&mut h);
+            format!("{:?}", ek.dispatch).hash(&mut h);
+            for l in &ek.body {
+                l.hash(&mut h);
+            }
+            eprintln!(
+                "TRACEQ {} pre {} {} {:x} {}",
+                name,
+                i,
+                ek.name,
+                h.finish(),
+                ek.body.len()
+            );
+        }
+    }
     if std::env::var_os("CYO_FUSE").is_none() {
         let numels: HashMap<&str, usize> = ge
             .scratch_args
@@ -4022,6 +4086,25 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
             }
         }
         ge.emit_q = fused;
+    }
+    if std::env::var_os("CYO_EMIT_TRACE").is_some() {
+        use std::hash::{Hash, Hasher};
+        for (i, ek) in ge.emit_q.iter().enumerate() {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            ek.name.hash(&mut h);
+            format!("{:?}", ek.dispatch).hash(&mut h);
+            for l in &ek.body {
+                l.hash(&mut h);
+            }
+            eprintln!(
+                "TRACEQ {} post {} {} {:x} {}",
+                name,
+                i,
+                ek.name,
+                h.finish(),
+                ek.body.len()
+            );
+        }
     }
 
     let dedup = match std::env::var("CYO_DEDUP").as_deref() {

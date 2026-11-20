@@ -616,6 +616,7 @@ dependencies = [
 [[package]]
 name = "mil_compile"
 version = "0.2.0"
+source = "git+https://github.com/savageAZfck/mil_spec#6d4f1f62ccfac75c9ba79f09ed9abf4184d85f5d"
 dependencies = [
  "mil_spec",
 ]
@@ -623,17 +624,20 @@ dependencies = [
 [[package]]
 name = "mil_infer"
 version = "0.6.0"
+source = "git+https://github.com/savageAZfck/mil_spec#6d4f1f62ccfac75c9ba79f09ed9abf4184d85f5d"
 dependencies = [
  "half",
  "libc",
  "mil_compile",
  "mil_spec",
+ "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "mil_spec"
 version = "0.4.2"
+source = "git+https://github.com/savageAZfck/mil_spec#6d4f1f62ccfac75c9ba79f09ed9abf4184d85f5d"
 dependencies = [
  "half",
 ]

@@ -12,9 +12,11 @@
 //! lanes multiplex inside that stream.
 
 use crate::wire::{self, Frame, SessionCipher};
+use mil_infer::ane_decode::Decoder;
 use mil_infer::ane_pipeline::Pipeline;
 use mil_infer::e5rt::DeviceMask;
 use serde::Deserialize;
+use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
@@ -328,6 +330,12 @@ pub fn ranknode(args: &[String]) -> Result<(), String> {
     let get = |flag: &str| -> Option<String> {
         args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
     };
+    if args.iter().any(|a| a == "--cy4b") {
+        return ranknode_cy4b(args);
+    }
+    if args.iter().any(|a| a == "--cy") {
+        return ranknode_cy(args);
+    }
     let dir = PathBuf::from(
         get("--shard").ok_or("usage: coyote-apple ranknode --shard <dir> [--listen h:p] [--lanes N] [--eos id] [--device ane|gpu|cpu|auto]")?,
     );
@@ -831,4 +839,390 @@ fn serve_conn(
             }
         }
     }
+}
+
+// ------------------------------------------------------------------
+// `ranknode --cy4b <st.safetensors>` — the fused int8 CY4B seat.
+//
+// `cy4b_decode serve` (mil_spec) owns the resident ANE programs and
+// speaks a stdin line protocol; this bridge speaks the mesh wire on
+// the front so the game's `offline-kernel brain` client connects
+// unchanged. Single decode process, single connection at a time —
+// the substrate proposes, the character's council disposes.
+// ------------------------------------------------------------------
+
+fn cy4b_decode_bin() -> PathBuf {
+    std::env::var_os("CY4B_DECODE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(
+                "/Users/savag3/mil_spec/target/release/examples/cy4b_decode",
+            )
+        })
+}
+
+/// One resident `cy4b_decode serve` child: stdin commands, stdout
+/// line protocol. Jobs run to completion before the next command is
+/// read, so a `gen` blocks until exactly `n` `tok` lines (or eos/err).
+struct Cy4bDecode {
+    stdin: std::process::ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+    child: std::process::Child,
+}
+
+impl Cy4bDecode {
+    fn spawn(st: &Path) -> Result<Self, String> {
+        let bin = cy4b_decode_bin();
+        let mut child = std::process::Command::new(&bin)
+            .arg(st)
+            .arg("serve")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("spawn {}: {e}", bin.display()))?;
+        let stdin = child.stdin.take().ok_or("decode stdin")?;
+        let stdout_raw = child.stdout.take().ok_or("decode stdout")?;
+        let mut stdout = BufReader::new(stdout_raw);
+        // The resident load takes real seconds — wait for "ready".
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = stdout
+                .read_line(&mut line)
+                .map_err(|e| format!("decode ready: {e}"))?;
+            if n == 0 {
+                return Err("decode exited before ready".into());
+            }
+            if line.trim() == "ready" {
+                break;
+            }
+        }
+        Ok(Cy4bDecode {
+            stdin,
+            stdout,
+            child,
+        })
+    }
+
+    fn cmd(&mut self, line: &str) -> Result<(), String> {
+        use std::io::Write;
+        writeln!(self.stdin, "{line}").map_err(|e| format!("decode cmd: {e}"))?;
+        self.stdin
+            .flush()
+            .map_err(|e| format!("decode flush: {e}"))
+    }
+
+    /// One `gen` job to completion — returns the generated token ids
+    /// in emission order. Prompt-position "pre" lines are ignored.
+    fn generate(&mut self, max: usize, ids: &[i64]) -> Result<Vec<i64>, String> {
+        let mut cmd = format!("gen {max}");
+        for id in ids {
+            cmd.push_str(&format!(" {id}"));
+        }
+        self.cmd(&cmd)?;
+        let mut out = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self
+                .stdout
+                .read_line(&mut line)
+                .map_err(|e| format!("decode read: {e}"))?;
+            if n == 0 {
+                return Err("decode exited mid-job".into());
+            }
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("tok ") {
+                if let Some(id) = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
+                    out.push(id);
+                    if out.len() >= max {
+                        return Ok(out);
+                    }
+                    continue;
+                }
+            }
+            if t == "eos" || t.starts_with("err") || t == "stop" {
+                return Ok(out);
+            }
+        }
+    }
+}
+
+impl Drop for Cy4bDecode {
+    fn drop(&mut self) {
+        let _ = self.cmd("quit");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn ranknode_cy4b(args: &[String]) -> Result<(), String> {
+    let get = |flag: &str| -> Option<String> {
+        args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+    };
+    let st = get("--cy4b").ok_or("ranknode --cy4b <st.safetensors>")?;
+    let listen = get("--listen").unwrap_or_else(|| "127.0.0.1:9710".into());
+    let tok = get("--tokenizer").and_then(|p| {
+        Tokenizer::from_file(&p)
+            .map_err(|e| eprintln!("tokenizer {p}: {e}"))
+            .ok()
+    });
+    if tok.is_some() {
+        eprintln!("  tokenizer: {}", get("--tokenizer").unwrap_or_default());
+    }
+    let mut dec = Cy4bDecode::spawn(Path::new(&st))?;
+
+    // The world's action grammar — constrain generated tokens to
+    // these verbs (bare + leading-space BPE variants), exactly the
+    // trie cy4b_decode's `verbs` command builds.
+    if let (Some(verbs), Some(t)) = (std::env::var("CY4B_VERBS").ok(), &tok) {
+        if !verbs.is_empty() {
+            let mut groups: Vec<String> = Vec::new();
+            for v in verbs.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                for form in [v.to_string(), format!(" {v}")] {
+                    if let Ok(enc) = t.encode(form.as_str(), false) {
+                        let ids: Vec<String> = enc
+                            .get_ids()
+                            .iter()
+                            .map(|i| i.to_string())
+                            .collect();
+                        if !ids.is_empty() {
+                            groups.push(ids.join(","));
+                        }
+                    }
+                }
+            }
+            if !groups.is_empty() {
+                let _ = dec.cmd(&format!("verbs {}", groups.join(";")));
+            }
+        }
+    }
+
+    let secret = wire::resolve_secret()?;
+    let enc = std::env::var("COYOTE_MESH_ENC").ok().as_deref() != Some("0");
+    let listener = TcpListener::bind(&listen).map_err(|e| format!("bind {listen}: {e}"))?;
+    println!("cy4b ranknode — {st} resident on {listen}");
+    for conn in listener.incoming() {
+        let mut s = match conn {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("accept: {e}");
+                continue;
+            }
+        };
+        let _ = s.set_nodelay(true);
+        let mut g = |max: usize, ids: &[i64]| dec.generate(max, ids);
+        if let Err(e) = serve_decode_conn(&mut s, &mut g, tok.as_ref(), &secret, enc) {
+            let mut f = Frame::new("error");
+            f.error = Some(e);
+            let _ = wire::write_frame(&mut s, &f);
+        }
+    }
+    Ok(())
+}
+
+fn serve_decode_conn(
+    s: &mut TcpStream,
+    gen_fn: &mut dyn FnMut(usize, &[i64]) -> Result<Vec<i64>, String>,
+    tok: Option<&Tokenizer>,
+    secret: &[u8],
+    enc: bool,
+) -> Result<(), String> {
+    wire::server_handshake(s, secret)?;
+    let cipher = enc.then(|| wire::SessionCipher::new(secret));
+    loop {
+        let (frame, payload) = match wire::read_packet(s, cipher.as_ref()) {
+            Ok(x) => x,
+            Err(_) => return Ok(()), // client closed
+        };
+        match frame.op.as_str() {
+            "generate" => {
+                let ids: Vec<i64> = if let Some(p) = frame.prompt.as_deref() {
+                    match tok.and_then(|t| t.encode(p, false).ok()) {
+                        Some(e) => e.get_ids().iter().map(|&i| i as i64).collect(),
+                        None => {
+                            let mut r = Frame::new("error");
+                            r.error =
+                                Some("prompt text needs a tokenizer (--tokenizer)".into());
+                            wire::write_packet(s, &r, &[], cipher.as_ref())?;
+                            continue;
+                        }
+                    }
+                } else {
+                    payload
+                        .chunks_exact(4)
+                        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
+                        .collect()
+                };
+                if ids.is_empty() {
+                    let mut r = Frame::new("error");
+                    r.error = Some("generate: empty prompt".into());
+                    wire::write_packet(s, &r, &[], cipher.as_ref())?;
+                    continue;
+                }
+                let max = frame.max_tokens.unwrap_or(32);
+                let gen = match gen_fn(max, &ids) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        let mut r = Frame::new("error");
+                        r.error = Some(e);
+                        wire::write_packet(s, &r, &[], cipher.as_ref())?;
+                        continue;
+                    }
+                };
+                let text = tok
+                    .and_then(|t| {
+                        t.decode(
+                            &gen.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+                            true,
+                        )
+                        .ok()
+                    })
+                    .unwrap_or_default();
+                for &id in &gen {
+                    let mut r = Frame::new("result");
+                    r.token = Some(id);
+                    r.lane = frame.lane;
+                    let p = (id as i32).to_le_bytes();
+                    wire::write_packet(s, &r, &p, cipher.as_ref())?;
+                }
+                let mut r = Frame::new("result");
+                r.token = gen.last().copied();
+                r.done = Some(true);
+                r.text = Some(text);
+                wire::write_packet(s, &r, &[], cipher.as_ref())?;
+            }
+            "ping" => {
+                let mut r = Frame::new("result");
+                r.done = Some(true);
+                r.text = Some("pong".into());
+                wire::write_packet(s, &r, &[], cipher.as_ref())?;
+            }
+            other => {
+                let mut r = Frame::new("error");
+                r.error = Some(format!("unsupported op {other}"));
+                wire::write_packet(s, &r, &[], cipher.as_ref())?;
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// `ranknode --cy <model.cy>` — the sovereign CY4B seat, native coyote.
+//
+// gen_cy4b's decode organism is compiled by coyote's own frontend into
+// resident ANE shards (`shardize`), cached beside the model and rebuilt
+// when the .cy or any safetensors it binds changes. Decode runs through
+// mil_infer::ane_decode::Decoder — one execute_sync per token, KV state
+// on-chip. No cy4b_decode subprocess in the loop: the seat is
+// coyote-apple end to end.
+// ------------------------------------------------------------------
+
+fn cy_shard_dir(cy: &Path) -> PathBuf {
+    let mut p = cy.as_os_str().to_os_string();
+    p.push(".shards");
+    PathBuf::from(p)
+}
+
+/// Every safetensors the organism binds (params + table emb), deduped.
+fn cy_bound_models(cy: &Path) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(cy) {
+        for tok in text.split('"') {
+            let path = tok.split("::").next().unwrap_or(tok);
+            if path.ends_with(".safetensors") {
+                let pb = PathBuf::from(path);
+                if seen.insert(pb.clone()) {
+                    out.push(pb);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn shards_fresh(cy: &Path, dir: &Path) -> bool {
+    let Ok(man) = std::fs::metadata(dir.join("conversion_manifest.json")) else {
+        return false;
+    };
+    let Ok(mtime) = man.modified() else { return false };
+    let newer = |p: &Path| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .map(|t| t > mtime)
+            .unwrap_or(false)
+    };
+    !newer(cy) && cy_bound_models(cy).iter().all(|m| !newer(m))
+}
+
+fn ensure_cy_shards(cy: &Path, force: bool) -> Result<PathBuf, String> {
+    let dir = cy_shard_dir(cy);
+    if !force && shards_fresh(cy, &dir) {
+        eprintln!("  shards: fresh {}", dir.display());
+        return Ok(dir);
+    }
+    eprintln!("  shards: shardize {} -> {}", cy.display(), dir.display());
+    crate::shardize::run(&[
+        cy.to_string_lossy().into(),
+        "-o".into(),
+        dir.to_string_lossy().into(),
+    ])
+    .map_err(|e| format!("shardize: exit {e}"))?;
+    Ok(dir)
+}
+
+fn ranknode_cy(args: &[String]) -> Result<(), String> {
+    let get = |flag: &str| -> Option<String> {
+        args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+    };
+    let cy = get("--cy").ok_or("ranknode --cy <model.cy>")?;
+    let listen = get("--listen").unwrap_or_else(|| "127.0.0.1:19710".into());
+    let tok = get("--tokenizer").and_then(|p| {
+        Tokenizer::from_file(&p)
+            .map_err(|e| eprintln!("tokenizer {p}: {e}"))
+            .ok()
+    });
+    if tok.is_some() {
+        eprintln!("  tokenizer: {}", get("--tokenizer").unwrap_or_default());
+    }
+    let force = args.iter().any(|a| a == "--reshardize");
+    let shards = ensure_cy_shards(Path::new(&cy), force)?;
+    eprintln!("  decoder: opening {}", shards.display());
+    let mut dec = Decoder::open_dir(&shards, DeviceMask::Ane)
+        .map_err(|e| format!("decoder open: {e}"))?;
+
+    let secret = wire::resolve_secret()?;
+    let enc = std::env::var("COYOTE_MESH_ENC").ok().as_deref() != Some("0");
+    let listener = TcpListener::bind(&listen).map_err(|e| format!("bind {listen}: {e}"))?;
+    println!("cy ranknode — {cy} resident on {listen}");
+    for conn in listener.incoming() {
+        let mut s = match conn {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("accept: {e}");
+                continue;
+            }
+        };
+        let _ = s.set_nodelay(true);
+        let mut g = |max: usize, ids: &[i64]| -> Result<Vec<i64>, String> {
+            dec.reset().map_err(|e| format!("decoder reset: {e}"))?;
+            let prompt: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
+            let out = dec
+                .generate(&prompt, max)
+                .map_err(|e| format!("decoder generate: {e}"))?;
+            Ok(out.into_iter().map(|t| t as i64).collect())
+        };
+        if let Err(e) = serve_decode_conn(&mut s, &mut g, tok.as_ref(), &secret, enc) {
+            let mut f = Frame::new("error");
+            f.error = Some(e);
+            let _ = wire::write_frame(&mut s, &f);
+        }
+    }
+    Ok(())
 }

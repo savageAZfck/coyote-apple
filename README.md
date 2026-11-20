@@ -149,10 +149,10 @@ coyote-apple ask "prompt" --to h:p [--session s] [--max-tokens n]
 `demo/five_strata.sh` runs the whole stack live: three nodes, one
 organism, five substrate×site strata, one witness chain.
 
-`lib/badapple/` carries the Bad Apple organ layer — 29 `.cy` ports
+`lib/badapple/` carries the Bad Apple organ layer — 30 `.cy` ports
 (mesh wire, p2p, cert, ledger, protocol, config, scavenger, the
-five-organ fusion `badapple_organs.cy`) — importable as
-`import "badapple/x.cy"`, check-clean under the fork. The organism's
+five-organ fusion `badapple_organs.cy`, `inspect.cy` dissection) —
+importable as `import "badapple/x.cy"`, check-clean. The organism's
 organs are library code now.
 
 plus the full distribution surface — `new doc test spec watch gold
@@ -228,11 +228,12 @@ chat template, per-op path fragile at this scale (that's the point of
 the resident path), GPU resident decode exceeds 8GB on this machine
 (~18 programs).
 
-The grammar lives in the local `~/coyote` checkout — a private fork that
-carries `enc fn`, `import "x" as m`, dtype generics (`fn f<D>`), and the
-`?` propagate operator, none of which exists upstream. The engines and
-the toolchain surface live here. `import "name"` resolves installed
-packages from `~/.coyote/pkg`.
+The grammar — `enc fn`, `import "x" as m`, dtype generics (`fn f<D>`),
+and the `?` propagate operator — lives upstream in public `coyote`
+(MIT). This repo carries the engines (Metal, MIL/Espresso, CKKS) and
+the toolchain surface. `import "name"` resolves installed packages
+from `~/.coyote/pkg`. Build with a sibling `coyote` checkout:
+`cargo build --release`.
 
 ## license
 

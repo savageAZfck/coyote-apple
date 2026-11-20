@@ -237,14 +237,17 @@ the witness chain against a `.cyproto` session spec.
 
 ```
 check build run repl test bench prof oracle gold diff spec audit
-package verify unpack weights doc watch emit shardize genmask
+package verify unpack weights doc watch emit shardize genmask inspect
 referee certify conform caps fmt pkg lsp new
+serve ask mind fleet fleetcheck ranknode meshnode pccnode peernode replay
 ```
 
 - `oracle` — semantic parity gate across strata
 - `prof` — per-op device timing
 - `gold`/`diff` — golden regression + build diffs
 - `audit`/`verify` — build provenance + package integrity
+- `inspect` — universal dissection: real parsers over dozens of
+  formats, dir/world audits, live URL targets; every call witnessed
 - `emit --swift` — Swift bridge generation
 - `shardize`/`weights` — safetensors → ANE-shard conversion
 - `fmt` — canonical formatter (idempotent, lossless)

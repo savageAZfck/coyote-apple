@@ -4,15 +4,14 @@ Coyote is the language: `.cy` source → typed HIR → MIL → HWX → resident
 VM → wasm. `coyote-apple` is the language *as a distribution* — one
 binary that owns the whole lifecycle: scaffold, write, check, test,
 verify, train, package, audit, ship. Shared verbs still pass through
-to `coyote::cli`, but the language itself now carries private grammar
-in the local `~/coyote` fork — `enc fn`, namespaced imports (`import
-"x" as m`), dtype generics (`fn f<D>(x: D[64])`), and `?` propagation —
-that upstream public coyote doesn't have. The apple verbs add the
-surface a language needs to be *used*, not just compiled.
+to `coyote::cli`. The grammar it builds on — `enc fn`, namespaced
+imports (`import "x" as m`), dtype generics (`fn f<D>(x: D[64])`), and
+`?` propagation — lives upstream in public `coyote`. The apple verbs
+add the surface a language needs to be *used*, not just compiled.
 
 This is a separate repo by design: the public language stays MIT and
-clean-room, the distribution carries the org surface — and it's the
-unit that becomes private the moment first-party interfaces exist.
+clean-room, the distribution carries the org surface — source-available
+under [LICENSE](LICENSE), the same terms as Bad Apple.
 
 ## verbs
 
@@ -36,12 +35,34 @@ coyote-apple audit    <build_dir>          hash-chained build provenance
 coyote-apple diff     <dirA> <dirB>        build-vs-build artifact delta
 coyote-apple bench    <file.cy> [--runs N] e2e + organism-exec timing
 coyote-apple prof     <file.cy> [--runs N] per-dispatch device timing (GPU kernel ms)
+coyote-apple inspect  <path|url>           evidence-grade dissection —
+                                           real parsers over dozens of
+                                           formats; --dir audits a tree,
+                                           --world audits a fleet plan,
+                                           URLs are fetched (bounded)
+                                           then dissected by the same engine
 
 ## distribution
 coyote-apple package  <file.cy> [-o pkg]   single-file .cypack distributable
 coyote-apple verify   <pkg.cypack>         integrity check a package
 coyote-apple unpack   <pkg.cypack> -o dir  extract a package
 coyote-apple emit     <file.cy> --swift    typed Swift bridge over libcoyote
+coyote-apple shardize <file.cy> -o <dir>   fn programs → resident ANE
+                                           pipeline shards (.mlmodelc)
+
+## fleet — sites, ranks, serving
+coyote-apple meshnode  --listen h:p        treaty'd peer execution site
+coyote-apple pccnode   --listen h:p        attested remote-compute site
+coyote-apple peernode  --listen h:p --treaty t.json [--programs d]
+                                           treaty-gated program peer
+coyote-apple ranknode  --shard <dir>       weight-carrying ANE-resident rank
+coyote-apple serve     [opts]              session-managed inference daemon
+coyote-apple ask       <prompt>            client into the serving tier
+coyote-apple mind                          mind_* extern bindings/status
+coyote-apple fleet     up|down|status --world <w>   fleet lifecycle
+coyote-apple fleetcheck --world <w>        plan-vs-live-ranks conformance
+coyote-apple replay    --journal <f>       re-execute committed witness
+                                           entries (serve-request receipts)
 
 # verification layer — refereed delegation as toolchain verbs
 coyote-apple referee  <file.cy> [--replay] RDoC bisection over the committed
@@ -71,9 +92,10 @@ coyote-apple <any coyote verb>             passthrough — check/build (run/repl
 here. The crate exposes a backend seam —
 `coyote::backend::register_backend(target, impl Backend)` — and this
 distribution registers `MetalBackend` (and `EncBackend` for `enc fn`)
-at startup. Strata are grammar; engines are this repo's private
-property — `enc`, `?`, `import as`, and dtype generics all live in the
-local `~/coyote` fork, never pushed.
+at startup. Strata are grammar in upstream `coyote` (`enc fn`, `?`,
+`import "x" as m`, dtype generics `fn f<D>` all parse in the public
+crate); engines are this repo's property — `enc`, the Metal backend,
+and the mesh/pcc execution sites live only here.
 
 ```
 gpu fn block(x: f16[64]) -> f16[64] {
@@ -356,8 +378,9 @@ lanes, LRU lane reaping, admission `busy` on true exhaustion.
 
 ## the organ library — `lib/badapple/`
 
-Bad Apple's organ layer, in the language: 29 `.cy` ports folded in from
-the organism repo — `mesh_brain.cy` (wire client + shard tools),
+Bad Apple's organ layer, in the language: 30 `.cy` ports folded in from
+the organism repo — `inspect.cy` (the dissection primitives as
+organism calls), `mesh_brain.cy` (wire client + shard tools),
 `p2p.cy`, `cert.cy`, `ledger.cy`, `protocol.cy`, `config.cy`,
 `scavenger.cy`, `slicks.cy`, `vault.cy`, `ify.cy`, `firewall.cy`,
 `cage.cy`, `sentinel.cy`, `watcher.cy`, `mcp.cy`, `cli.cy`, `sys.cy`,

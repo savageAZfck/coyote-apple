@@ -42,6 +42,7 @@ mod genmask;
 mod gold;
 mod gpu_emit;
 mod gpu_rt;
+mod inspect;
 mod lsp;
 mod mesh;
 mod mind;
@@ -71,6 +72,7 @@ fn usage() {
     eprintln!("coyote-apple — internal profile of the coyote toolchain");
     eprintln!("  spec     <file.cy>");
     eprintln!("  audit    <build_dir> [--verify]");
+    eprintln!("  inspect  <path|url> [--dir d] [--world w.json]   evidence-grade dissection");
     eprintln!("  package  <file.cy> [-o pkg.cypack]");
     eprintln!("  verify   <pkg.cypack>");
     eprintln!("  unpack   <pkg.cypack> -o <dir>");
@@ -142,6 +144,7 @@ fn main() {
     let r = match cmd {
         "spec" => spec::run(&args[2..]),
         "audit" => audit::run(&args[2..]),
+        "inspect" => inspect::run(&args[2..]),
         "package" | "pack" => package::run(&args[2..]),
         "verify" => package::verify(&args[2..]),
         "unpack" => package::unpack(&args[2..]),

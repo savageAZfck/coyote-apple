@@ -2,7 +2,7 @@
 name = "coyote-apple"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license-file = "LICENSE"
 description = "coyote, internal profile — org-grade provenance, packaging, introspection, and benchmarking on the same source-to-silicon pipeline"
 
 [[bin]]
@@ -21,3 +21,4 @@ hmac = "0.12"
 sha2 = "0.10"
 aes-gcm = "0.10"
 tokenizers = "0.22"
+ureq = "3.4"

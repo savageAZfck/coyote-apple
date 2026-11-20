@@ -229,7 +229,12 @@ pub fn unpack(args: &[String]) -> Result<(), i32> {
         for m in &members {
             let start = m.offset as usize;
             let end = (start + m.len as usize).min(data.len());
-            std::fs::write(out.join(&m.name), &data[start..end])
+            let dest = out.join(&m.name);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("{}: {e}", parent.display()))?;
+            }
+            std::fs::write(&dest, &data[start..end])
                 .map_err(|e| format!("{}: {e}", m.name))?;
             println!("  ✓ {:<24} {} B", m.name, m.len);
         }

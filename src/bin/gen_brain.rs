@@ -130,54 +130,46 @@ fn main() {
     // tokenizer's size and cemb/seq/tgts are built over ids the same
     // way bytes were.
     let mut tok_vocab = 0usize;
-    let bpe_tok: Option<tokenizers::Tokenizer> =
-        if s.tokenizer.is_some() || s.bpe_vocab > 0 {
-            let p = s
-                .text
-                .as_deref()
-                .expect("--tokenizer/--bpe-vocab require --text");
-            if let Some(tp) = &s.tokenizer {
-                let t = tokenizers::Tokenizer::from_file(tp)
-                    .unwrap_or_else(|e| panic!("load tokenizer {tp}: {e}"));
-                tok_vocab = t.get_vocab_size(true);
-                Some(t)
-            } else {
-                use tokenizers::models::bpe::{BpeTrainerBuilder, BPE};
-                use tokenizers::pre_tokenizers::byte_level::ByteLevel;
-                use tokenizers::TokenizerBuilder;
-                let mut trainer = BpeTrainerBuilder::new()
-                    .vocab_size(s.bpe_vocab.max(256))
-                    .min_frequency(2)
-                    .show_progress(false)
-                    .build();
-                let mut t = TokenizerBuilder::new()
-                    .with_model(BPE::default())
-                    .with_normalizer(Some(tokenizers::normalizers::Sequence::new(
-                        vec![],
-                    )))
-                    .with_pre_tokenizer(Some(ByteLevel::default()))
-                    .with_post_processor(Some(
-                        tokenizers::processors::byte_level::ByteLevel::default(),
-                    ))
-                    .with_decoder(Some(
-                        tokenizers::decoders::byte_level::ByteLevel::default(),
-                    ))
-                    .build()
-                    .expect("build bpe tokenizer");
-                t.train_from_files(&mut trainer, vec![p.to_string()])
-                    .expect("train bpe");
-                tok_vocab = t.get_vocab_size(true);
-                let tp = format!(
-                    "{}.tokenizer.json",
-                    out.strip_suffix(".cy").unwrap_or(&out)
-                );
-                t.save(&tp, false).expect("save tokenizer");
-                eprintln!("trained own BPE vocab {tok_vocab} → {tp}");
-                Some(t.into())
-            }
+    let bpe_tok: Option<tokenizers::Tokenizer> = if s.tokenizer.is_some() || s.bpe_vocab > 0 {
+        let p = s
+            .text
+            .as_deref()
+            .expect("--tokenizer/--bpe-vocab require --text");
+        if let Some(tp) = &s.tokenizer {
+            let t = tokenizers::Tokenizer::from_file(tp)
+                .unwrap_or_else(|e| panic!("load tokenizer {tp}: {e}"));
+            tok_vocab = t.get_vocab_size(true);
+            Some(t)
         } else {
-            None
-        };
+            use tokenizers::models::bpe::{BpeTrainerBuilder, BPE};
+            use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+            use tokenizers::TokenizerBuilder;
+            let mut trainer = BpeTrainerBuilder::new()
+                .vocab_size(s.bpe_vocab.max(256))
+                .min_frequency(2)
+                .show_progress(false)
+                .build();
+            let mut t = TokenizerBuilder::new()
+                .with_model(BPE::default())
+                .with_normalizer(Some(tokenizers::normalizers::Sequence::new(vec![])))
+                .with_pre_tokenizer(Some(ByteLevel::default()))
+                .with_post_processor(Some(
+                    tokenizers::processors::byte_level::ByteLevel::default(),
+                ))
+                .with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()))
+                .build()
+                .expect("build bpe tokenizer");
+            t.train_from_files(&mut trainer, vec![p.to_string()])
+                .expect("train bpe");
+            tok_vocab = t.get_vocab_size(true);
+            let tp = format!("{}.tokenizer.json", out.strip_suffix(".cy").unwrap_or(&out));
+            t.save(&tp, false).expect("save tokenizer");
+            eprintln!("trained own BPE vocab {tok_vocab} → {tp}");
+            Some(t.into())
+        }
+    } else {
+        None
+    };
     let toks: Option<Vec<u32>> = if let Some(tk) = &bpe_tok {
         let p = s.text.as_deref().unwrap();
         let bytes = std::fs::read(p).unwrap_or_else(|e| panic!("read {p}: {e}"));
@@ -341,9 +333,7 @@ fn main() {
     // tables
     if toks.is_some() {
         let n = toks.as_ref().unwrap().len() - 1;
-        w!(&format!(
-            "table seq: f16[{n}, {d}] @ \"{corpus_abs}::seq\""
-        ));
+        w!(&format!("table seq: f16[{n}, {d}] @ \"{corpus_abs}::seq\""));
         w!("");
         w!(&format!(
             "table tgts: f16[{n}, {v}] @ \"{corpus_abs}::tgts\""
@@ -469,9 +459,7 @@ fn main() {
             .filter(|(_, ls)| !ls.is_empty())
             .collect()
     } else {
-        (0..l_n)
-            .map(|l| (format!("train_l{l}"), vec![l]))
-            .collect()
+        (0..l_n).map(|l| (format!("train_l{l}"), vec![l])).collect()
     };
     w!("// teacher-forced step: forward + adam on this group's params.");
     for (gname, layers) in &groups {
@@ -479,7 +467,9 @@ fn main() {
         w!(&format!(
             "    x: f16[{d}], pos: f16[{sq}], mask: f16[{sq}],"
         ));
-        w!(&format!("    cos: f16[{hd}], sin: f16[{hd}], tgt: f16[{v}]"));
+        w!(&format!(
+            "    cos: f16[{hd}], sin: f16[{hd}], tgt: f16[{v}]"
+        ));
         w!(&format!(") -> f16[{v}] {{"));
         w!("    let logits = forward(x, pos, mask, cos, sin);");
         for &l in layers {
@@ -515,11 +505,17 @@ fn main() {
     w!(&format!(
         "    x: f16[{d}], pos: f16[{sq}], mask: f16[{sq}],"
     ));
-    w!(&format!("    cos: f16[{hd}], sin: f16[{hd}], tgt: f16[{v}]"));
+    w!(&format!(
+        "    cos: f16[{hd}], sin: f16[{hd}], tgt: f16[{v}]"
+    ));
     w!(&format!(") -> f16[{v}] {{"));
     w!("    let logits = forward(x, pos, mask, cos, sin);");
-    w!(&format!("    adam(lnf, grad(mse(logits, tgt), lnf), 0.01);"));
-    w!(&format!("    adam(lmh, grad(mse(logits, tgt), lmh), 0.05);"));
+    w!(&format!(
+        "    adam(lnf, grad(mse(logits, tgt), lnf), 0.01);"
+    ));
+    w!(&format!(
+        "    adam(lmh, grad(mse(logits, tgt), lmh), 0.05);"
+    ));
     w!("    logits");
     w!("}");
     w!("");
@@ -543,7 +539,9 @@ fn main() {
     w!(&format!("            var ep = round * {chunk};"));
     w!(&format!("            var emax = ep + {chunk};"));
     w!("            while ep < emax {");
-    w!(&format!("                var i = 0;\n                while i < {pos} {{"));
+    w!(&format!(
+        "                var i = 0;\n                while i < {pos} {{"
+    ));
     if toks.is_some() {
         w!(&format!(
             "                    let ci = (ep * {pos} + i) % {n_corpus};"
@@ -552,7 +550,9 @@ fn main() {
         w!("                    let tgt = tgts[ci];");
     } else {
         w!("                    let x = seq[i];");
-        w!(&format!("                    let tgt = onehot(i + 1, {v});"));
+        w!(&format!(
+            "                    let tgt = onehot(i + 1, {v});"
+        ));
     }
     w!(&format!("                    let p = onehot(i, {sq});"));
     w!(&format!("                    let m = causal(i, {sq});"));
@@ -575,7 +575,10 @@ fn main() {
         w!("                        witness(\"train_pred\", pred);");
         w!("                    }");
     }
-    w!(&format!("                    if phase == {} {{", groups.len()));
+    w!(&format!(
+        "                    if phase == {} {{",
+        groups.len()
+    ));
     w!("                        let lg = train_head(x, p, m, c, s, tgt);");
     w!("                        let pred = argmax(lg);");
     if toks.is_some() {
@@ -657,9 +660,8 @@ fn main() {
         for j in 0..n {
             tg[j * v + t[j + 1] as usize] = 1.0;
         }
-        let f32b = |vals: &[f32]| -> Vec<u8> {
-            vals.iter().flat_map(|x| x.to_le_bytes()).collect()
-        };
+        let f32b =
+            |vals: &[f32]| -> Vec<u8> { vals.iter().flat_map(|x| x.to_le_bytes()).collect() };
         tensors.push(("cemb", vec![v, d], f32b(&cemb)));
         tensors.push(("seq", vec![n, d], f32b(&seqb)));
         tensors.push(("tgts", vec![n, v], f32b(&tg)));

@@ -855,9 +855,7 @@ fn cy4b_decode_bin() -> PathBuf {
     std::env::var_os("CY4B_DECODE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(
-                "/Users/savag3/mil_spec/target/release/examples/cy4b_decode",
-            )
+            PathBuf::from("/Users/savag3/mil_spec/target/release/examples/cy4b_decode")
         })
 }
 
@@ -908,9 +906,7 @@ impl Cy4bDecode {
     fn cmd(&mut self, line: &str) -> Result<(), String> {
         use std::io::Write;
         writeln!(self.stdin, "{line}").map_err(|e| format!("decode cmd: {e}"))?;
-        self.stdin
-            .flush()
-            .map_err(|e| format!("decode flush: {e}"))
+        self.stdin.flush().map_err(|e| format!("decode flush: {e}"))
     }
 
     /// One `gen` job to completion — returns the generated token ids
@@ -986,11 +982,8 @@ fn ranknode_cy4b(args: &[String]) -> Result<(), String> {
             for v in verbs.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
                 for form in [v.to_string(), format!(" {v}")] {
                     if let Ok(enc) = t.encode(form.as_str(), false) {
-                        let ids: Vec<String> = enc
-                            .get_ids()
-                            .iter()
-                            .map(|i| i.to_string())
-                            .collect();
+                        let ids: Vec<String> =
+                            enc.get_ids().iter().map(|i| i.to_string()).collect();
                         if !ids.is_empty() {
                             groups.push(ids.join(","));
                         }
@@ -1047,8 +1040,7 @@ fn serve_decode_conn(
                         Some(e) => e.get_ids().iter().map(|&i| i as i64).collect(),
                         None => {
                             let mut r = Frame::new("error");
-                            r.error =
-                                Some("prompt text needs a tokenizer (--tokenizer)".into());
+                            r.error = Some("prompt text needs a tokenizer (--tokenizer)".into());
                             wire::write_packet(s, &r, &[], cipher.as_ref())?;
                             continue;
                         }
@@ -1077,11 +1069,8 @@ fn serve_decode_conn(
                 };
                 let text = tok
                     .and_then(|t| {
-                        t.decode(
-                            &gen.iter().map(|&i| i as u32).collect::<Vec<_>>(),
-                            true,
-                        )
-                        .ok()
+                        t.decode(&gen.iter().map(|&i| i as u32).collect::<Vec<_>>(), true)
+                            .ok()
                     })
                     .unwrap_or_default();
                 for &id in &gen {
@@ -1151,7 +1140,9 @@ fn shards_fresh(cy: &Path, dir: &Path) -> bool {
     let Ok(man) = std::fs::metadata(dir.join("conversion_manifest.json")) else {
         return false;
     };
-    let Ok(mtime) = man.modified() else { return false };
+    let Ok(mtime) = man.modified() else {
+        return false;
+    };
     let newer = |p: &Path| {
         std::fs::metadata(p)
             .and_then(|m| m.modified())
@@ -1194,8 +1185,8 @@ fn ranknode_cy(args: &[String]) -> Result<(), String> {
     let force = args.iter().any(|a| a == "--reshardize");
     let shards = ensure_cy_shards(Path::new(&cy), force)?;
     eprintln!("  decoder: opening {}", shards.display());
-    let mut dec = Decoder::open_dir(&shards, DeviceMask::Ane)
-        .map_err(|e| format!("decoder open: {e}"))?;
+    let mut dec =
+        Decoder::open_dir(&shards, DeviceMask::Ane).map_err(|e| format!("decoder open: {e}"))?;
 
     let secret = wire::resolve_secret()?;
     let enc = std::env::var("COYOTE_MESH_ENC").ok().as_deref() != Some("0");

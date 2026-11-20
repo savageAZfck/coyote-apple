@@ -278,7 +278,11 @@ impl GpuRuntime {
         // arena-backed runtimes share compiled libraries — a program
         // evicted under residency pressure reloads without paying the
         // Metal compile again.
-        eprintln!("gpu load {name}: msl={}B kernels={}", out.msl.len(), out.kernels.len());
+        eprintln!(
+            "gpu load {name}: msl={}B kernels={}",
+            out.msl.len(),
+            out.kernels.len()
+        );
         let lib = match arena {
             Some(a) => a.library(&out.msl_sha, &out.msl, &dev)?,
             None => dev
@@ -292,7 +296,13 @@ impl GpuRuntime {
         };
         eprintln!("gpu load {name}: lib done");
         let mut pipes = Vec::new();
-        for chunk in out.kernels.iter().enumerate().collect::<Vec<_>>().chunks(512) {
+        for chunk in out
+            .kernels
+            .iter()
+            .enumerate()
+            .collect::<Vec<_>>()
+            .chunks(512)
+        {
             objc::rc::autoreleasepool(|| -> Result<(), String> {
                 for &(k_i, (kname, disp)) in chunk {
                     let f = lib
@@ -363,7 +373,8 @@ impl GpuRuntime {
         // oversized programs report their footprint even when the load
         // is killed mid-allocation.
         {
-            let (mut p16, mut s16, mut s32, mut io, mut st) = (0usize, 0usize, 0usize, 0usize, 0usize);
+            let (mut p16, mut s16, mut s32, mut io, mut st) =
+                (0usize, 0usize, 0usize, 0usize, 0usize);
             for a in &out.args {
                 match a {
                     Arg::ParamHalf(pn) => {
@@ -580,22 +591,14 @@ impl GpuRuntime {
             if !pipe.3.contains(&DESC_SENTINEL) {
                 continue;
             }
-            let tpl = out
-                .desc_templates
-                .get(i)
-                .cloned()
-                .unwrap_or_default();
+            let tpl = out.desc_templates.get(i).cloned().unwrap_or_default();
             let one = [0u32; 1];
             let (ptr, len) = if tpl.is_empty() {
                 (one.as_ptr() as *const c_void, 4u64)
             } else {
                 (tpl.as_ptr() as *const c_void, (tpl.len() * 4) as u64)
             };
-            let dbuf = dev.new_buffer_with_data(
-                ptr,
-                len,
-                MTLResourceOptions::StorageModeShared,
-            );
+            let dbuf = dev.new_buffer_with_data(ptr, len, MTLResourceOptions::StorageModeShared);
             bufs.push(dbuf);
             let idx = (bufs.len() - 1) as u32;
             for u in pipe.3.iter_mut() {
@@ -762,7 +765,11 @@ impl GpuRuntime {
                     let enc = cb.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(pipe);
                     for (li, &gi) in uses.iter().enumerate() {
-                        let bi = if gi == u32::MAX { self.ptrs_i } else { gi as usize };
+                        let bi = if gi == u32::MAX {
+                            self.ptrs_i
+                        } else {
+                            gi as usize
+                        };
                         enc.set_buffer(li as u64, Some(&self.bufs[bi]), 0);
                     }
                     mark_indirect(enc, &self.bufs, self.ptrs_i, indirect);
@@ -793,7 +800,11 @@ impl GpuRuntime {
                         let enc = cb.new_compute_command_encoder();
                         enc.set_compute_pipeline_state(pipe);
                         for (li, &gi) in uses.iter().enumerate() {
-                            let bi = if gi == u32::MAX { self.ptrs_i } else { gi as usize };
+                            let bi = if gi == u32::MAX {
+                                self.ptrs_i
+                            } else {
+                                gi as usize
+                            };
                             enc.set_buffer(li as u64, Some(&self.bufs[bi]), 0);
                         }
                         mark_indirect(enc, &self.bufs, self.ptrs_i, indirect);
@@ -818,8 +829,7 @@ impl GpuRuntime {
                                 None
                             } else {
                                 Some(unsafe {
-                                    let d: *const std::ffi::c_char =
-                                        msg_send![err, UTF8String];
+                                    let d: *const std::ffi::c_char = msg_send![err, UTF8String];
                                     std::ffi::CStr::from_ptr(d).to_string_lossy().into_owned()
                                 })
                             }
@@ -844,7 +854,10 @@ impl GpuRuntime {
                     mx = mx.max(v);
                 }
             }
-            eprintln!("gpu out: n={} min={mn} max={mx} nan={nan} inf={inf}", out.len());
+            eprintln!(
+                "gpu out: n={} min={mn} max={mx} nan={nan} inf={inf}",
+                out.len()
+            );
         }
         Ok(out)
     }
@@ -866,11 +879,8 @@ impl GpuRuntime {
             })
         } else {
             Some(unsafe {
-                std::slice::from_raw_parts(
-                    (self.bufs[bi].contents() as *const f32).add(off),
-                    n,
-                )
-                .to_vec()
+                std::slice::from_raw_parts((self.bufs[bi].contents() as *const f32).add(off), n)
+                    .to_vec()
             })
         }
     }

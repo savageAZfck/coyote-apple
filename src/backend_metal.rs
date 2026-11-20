@@ -33,18 +33,10 @@ impl MetalBackend {
                     .map(|s| s.starts_with("CYO_") || s.starts_with("COYOTE_"))
                     .unwrap_or(false)
             })
-            .map(|(k, v)| {
-                format!(
-                    "{}={}",
-                    k.to_string_lossy(),
-                    v.to_string_lossy()
-                )
-            })
+            .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
             .collect();
         envs.sort();
-        coyote::lower::sha256_hex(
-            format!("{tp:?}\n{}", envs.join("\n")).as_bytes(),
-        )
+        coyote::lower::sha256_hex(format!("{tp:?}\n{}", envs.join("\n")).as_bytes())
     }
 
     fn emit_to_backend(out: gpu_emit::GpuOut) -> BackendEmit {
@@ -108,9 +100,7 @@ impl Backend for MetalBackend {
         // (tmp then rename so a torn write never reads as a hit).
         if let Ok(bin) = serde_json::to_vec(&out) {
             let tmp = dir.join("gpuout.cache.tmp");
-            if std::fs::write(&tmp, &bin).is_ok()
-                && std::fs::rename(&tmp, &cache_bin).is_ok()
-            {
+            if std::fs::write(&tmp, &bin).is_ok() && std::fs::rename(&tmp, &cache_bin).is_ok() {
                 let _ = std::fs::write(&cache_key, &key);
             }
         }

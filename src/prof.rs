@@ -171,9 +171,13 @@ fn prof_ext(
                 } else {
                     vec![ty.numel() as usize]
                 };
-                let init =
-                    coyote::weights::resolve(pname, Some(&expect), src.as_deref(), init_weight_dims)
-                        .unwrap_or_default();
+                let init = coyote::weights::resolve(
+                    pname,
+                    Some(&expect),
+                    src.as_deref(),
+                    init_weight_dims,
+                )
+                .unwrap_or_default();
                 if let Some(got) = g.read_buf(pname) {
                     let drift = got
                         .iter()

@@ -47,9 +47,8 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(S)
         .min(S);
-    let model = get("--model").unwrap_or_else(|| {
-        "/Users/savag3/cy4b/cy4b_model/model.safetensors".to_string()
-    });
+    let model = get("--model")
+        .unwrap_or_else(|| "/Users/savag3/cy4b/cy4b_model/model.safetensors".to_string());
     let out = get("--out").unwrap_or_else(|| "cy4b.cy".to_string());
     let m = &model;
 
@@ -171,9 +170,7 @@ fn main() {
         w!("    let r{l} = x + att{l};");
         w!("    let n{l} = rmsnorm(r{l}, l{l}_ln2);");
         for b in 0..FB {
-            w!(
-                "    let f{l}_{b} = (silu(n{l} @ l{l}_wg{b}) * (n{l} @ l{l}_wu{b})) @ l{l}_wd{b};"
-            );
+            w!("    let f{l}_{b} = (silu(n{l} @ l{l}_wg{b}) * (n{l} @ l{l}_wu{b})) @ l{l}_wd{b};");
         }
         let fsum: Vec<String> = (0..FB).map(|b| format!("f{l}_{b}")).collect();
         w!("    r{l} + {}", fsum.join(" + "));
@@ -216,8 +213,5 @@ fn main() {
     w!("}}");
 
     std::fs::write(&out, &o).expect("write output");
-    eprintln!(
-        "wrote {out} ({} lines, {layers} layers)",
-        o.lines().count()
-    );
+    eprintln!("wrote {out} ({} lines, {layers} layers)", o.lines().count());
 }

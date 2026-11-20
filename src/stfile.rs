@@ -36,7 +36,11 @@ pub fn safetensors_multi(tensors: &[(String, Vec<usize>, Vec<f32>, bool)]) -> Ve
         if i > 0 {
             header.push(',');
         }
-        let (dtype, esz) = if *f16 { ("F16", 2usize) } else { ("F32", 4usize) };
+        let (dtype, esz) = if *f16 {
+            ("F16", 2usize)
+        } else {
+            ("F32", 4usize)
+        };
         let start = data.len();
         let end = start + vals.len() * esz;
         let shape_s = shape

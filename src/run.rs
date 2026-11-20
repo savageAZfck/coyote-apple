@@ -99,9 +99,8 @@ pub fn run(args: &[String]) -> Result<(), i32> {
             hdr.push('}');
             let pad = (8 - (hdr.len() % 8)) % 8;
             hdr.push_str(&" ".repeat(pad));
-            let mut file = std::io::BufWriter::new(
-                std::fs::File::create(ep).map_err(|e| e.to_string())?,
-            );
+            let mut file =
+                std::io::BufWriter::new(std::fs::File::create(ep).map_err(|e| e.to_string())?);
             use std::io::Write;
             file.write_all(&(hdr.len() as u64).to_le_bytes())
                 .map_err(|e| e.to_string())?;
@@ -115,7 +114,8 @@ pub fn run(args: &[String]) -> Result<(), i32> {
                     }
                 } else {
                     for v in data {
-                        file.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
+                        file.write_all(&v.to_le_bytes())
+                            .map_err(|e| e.to_string())?;
                     }
                 }
                 Ok(())

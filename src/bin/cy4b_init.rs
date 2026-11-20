@@ -97,7 +97,12 @@ fn main() {
         cursor += nbytes;
         total += nbytes;
         if meta.len() % 500 == 0 {
-            eprintln!("  {}/{} params ({:.1} GiB)", meta.len(), decls.len(), total as f64 / (1u64 << 30) as f64);
+            eprintln!(
+                "  {}/{} params ({:.1} GiB)",
+                meta.len(),
+                decls.len(),
+                total as f64 / (1u64 << 30) as f64
+            );
         }
     }
 

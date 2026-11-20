@@ -167,7 +167,8 @@ impl St {
             .ok_or_else(|| format!("safetensors: missing {name}"))?;
         let mut buf = vec![0u8; loc.len as usize];
         let mut f = self.file.try_clone().map_err(|e| e.to_string())?;
-        f.seek(SeekFrom::Start(loc.off)).map_err(|e| e.to_string())?;
+        f.seek(SeekFrom::Start(loc.off))
+            .map_err(|e| e.to_string())?;
         f.read_exact(&mut buf).map_err(|e| e.to_string())?;
         let n: usize = loc.shape.iter().product();
         match loc.dtype.as_str() {
@@ -224,7 +225,12 @@ fn layer_tensors(st: &St, l: usize) -> Result<Vec<(String, Vec<usize>, Vec<f32>)
     // while HF applies 1/sqrt(128); the post-norm gain is the only
     // weight-space lever that survives scale-invariant rmsnorm.
     for (dst, a, b, qscale) in [
-        ("self_attn.q_norm.weight", "qnl", "qnh", std::f32::consts::SQRT_2),
+        (
+            "self_attn.q_norm.weight",
+            "qnl",
+            "qnh",
+            std::f32::consts::SQRT_2,
+        ),
         ("self_attn.k_norm.weight", "knl", "knh", 1.0f32),
     ] {
         let mut v = st.tensor_f32(&p(a))?;
@@ -251,11 +257,7 @@ fn layer_tensors(st: &St, l: usize) -> Result<Vec<(String, Vec<usize>, Vec<f32>)
                 block_rows(&src, &mut w, h * FHD + hi * HD, D);
             }
         }
-        out.push((
-            format!("{pre}.self_attn.{proj}.weight"),
-            vec![rows, D],
-            w,
-        ));
+        out.push((format!("{pre}.self_attn.{proj}.weight"), vec![rows, D], w));
     }
     // o_proj [D, QH*FHD] — param storage [2560,64] scatters into column
     // blocks (out_dim=2560 rows × 64 in-cols per head-half).
@@ -292,11 +294,7 @@ fn layer_tensors(st: &St, l: usize) -> Result<Vec<(String, Vec<usize>, Vec<f32>)
             vec![FB * FD, D],
             gate,
         ));
-        out.push((
-            format!("{pre}.mlp.up_proj.weight"),
-            vec![FB * FD, D],
-            up,
-        ));
+        out.push((format!("{pre}.mlp.up_proj.weight"), vec![FB * FD, D], up));
         out.push((
             format!("{pre}.mlp.down_proj.weight"),
             vec![D, FB * FD],
@@ -336,7 +334,8 @@ fn run(args: &[String]) -> Result<(), String> {
 
     // header region reserved up front — JSON + space padding must fit.
     const HREG: u64 = 1 << 16;
-    w.seek(SeekFrom::Start(8 + HREG)).map_err(|e| e.to_string())?;
+    w.seek(SeekFrom::Start(8 + HREG))
+        .map_err(|e| e.to_string())?;
 
     // (name, shape, dtype, data_offset, nbytes) recorded as we stream.
     let mut meta: Vec<(String, Vec<usize>, String, u64, u64)> = Vec::new();

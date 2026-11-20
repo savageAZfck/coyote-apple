@@ -330,9 +330,7 @@ fn scan_grads_s(s: &TStmt, out: &mut std::collections::HashSet<String>) {
         | TStmt::Assign { expr, .. }
         | TStmt::StateUpdate { expr, .. }
         | TStmt::Expr(expr) => scan_grads_e(expr, out),
-        TStmt::ParamUpdate { grad, .. } | TStmt::AdamUpdate { grad, .. } => {
-            scan_grads_e(grad, out)
-        }
+        TStmt::ParamUpdate { grad, .. } | TStmt::AdamUpdate { grad, .. } => scan_grads_e(grad, out),
     }
 }
 
@@ -476,11 +474,7 @@ impl Ge {
 
     /// find `name` among let bindings, innermost scope first, honoring
     /// `resolve_limit` per scope. Returns (scope, position, expr).
-    fn pos_in(
-        &self,
-        name: &str,
-        limits: &[(usize, usize)],
-    ) -> Option<(usize, usize, &Typed)> {
+    fn pos_in(&self, name: &str, limits: &[(usize, usize)]) -> Option<(usize, usize, &Typed)> {
         for (si, s) in self.scopes.iter().enumerate().rev() {
             let lim = limits
                 .iter()
@@ -508,10 +502,7 @@ impl Ge {
     /// `scopes`, so the (si, pos) found indexes `orig_scopes`.
     fn pos_of_orig(&self, name: &str) -> Option<(usize, usize, &Typed)> {
         let (si, p, _) = self.pos_in(name, &self.resolve_limit)?;
-        self.orig_scopes
-            .get(si)?
-            .get(p)
-            .map(|(_, t)| (si, p, t))
+        self.orig_scopes.get(si)?.get(p).map(|(_, t)| (si, p, t))
     }
 
     /// flat buffer index for node dims `dims` at logical coords `c`,
@@ -1110,11 +1101,7 @@ impl Ge {
 
         let mut l = Vec::new();
         match shape {
-            Shape::Rows {
-                buf,
-                stride,
-                off,
-            } => {
+            Shape::Rows { buf, stride, off } => {
                 // one thread per output, serial-k accumulator —
                 // eval's exact order — but the row is consumed as
                 // float4s so each thread issues a quarter of the
@@ -1150,7 +1137,10 @@ impl Ge {
                         .into(),
                 );
                 l.push("}".into());
-                l.push(format!("if (j < {n}) {}", self.st_any(out_buf, "j", "=", "acc")));
+                l.push(format!(
+                    "if (j < {n}) {}",
+                    self.st_any(out_buf, "j", "=", "acc")
+                ));
                 Some((l, Dispatch::Gemv(n)))
             }
             Shape::Cols {
@@ -1222,7 +1212,8 @@ impl Ge {
                 .push(format!("for (uint j = 0; j < {cols}; ++j) {{"));
             let v = self.gen(x, &cs)?;
             let st = self.st_any(out_buf, &format!("gid*{cols}+j"), "=", "ex");
-            self.lines.push(format!("float ex = exp({v} - m); {st} s += ex;"));
+            self.lines
+                .push(format!("float ex = exp({v} - m); {st} s += ex;"));
             self.lines.push("}".into());
             let st = self.st_any(out_buf, &format!("gid*{cols}+j"), "/=", "s");
             self.lines
@@ -1284,9 +1275,8 @@ impl Ge {
                     self.lines.push(format!(
                         "if (lid == 0) {{ float s = 0.0f; for (uint i = 0; i < {n}; ++i) s += float({eb}[i]); ts = s; }}"
                     ));
-                    self.lines.push(
-                        "threadgroup_barrier(mem_flags::mem_threadgroup);".into(),
-                    );
+                    self.lines
+                        .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
                 } else {
                     // parallel tree sum — strided partials per thread,
                     // log-step combine in threadgroup memory. Same
@@ -1346,7 +1336,8 @@ impl Ge {
                     self.lines
                         .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
                     let wv = self.gen(&args[1], &cs)?;
-                    self.lines.push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
+                    self.lines
+                        .push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
                     let v = self.gen(x, &cs)?;
                     let st = self.st_any(out_buf, "i", "=", &format!("({v}) * tv * ({wv})"));
                     self.lines.push(st);
@@ -1378,10 +1369,10 @@ impl Ge {
                         .push("threadgroup_barrier(mem_flags::mem_threadgroup);".into());
                     self.lines.push("}".into());
                     let wv = self.gen(&args[1], &cs)?;
-                    self.lines.push(format!(
-                        "float tv = rsqrt(tr[0] / float({n}) + 1e-5f);"
-                    ));
-                    self.lines.push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
+                    self.lines
+                        .push(format!("float tv = rsqrt(tr[0] / float({n}) + 1e-5f);"));
+                    self.lines
+                        .push(format!("for (uint i = lid; i < {n}; i += {T}) {{"));
                     let v = self.gen(x, &cs)?;
                     let st = self.st_any(out_buf, "i", "=", &format!("({v}) * tv * ({wv})"));
                     self.lines.push(st);
@@ -1758,11 +1749,146 @@ impl Ge {
                 let bv = self.gen(&args[1], &coords[1..])?;
                 Ok(format!("(({av}) * ({bv}))"))
             }
+            "decide" => {
+                // pointer-head verdict — synthesize the composed tree
+                // and let gen materialize it: q = hq@wq, ks = hos@wk,
+                // s = (q @ ks.T)/sqrt(P), softmax. wq/wk follow the
+                // declared-[K,N]/storage-[N,K] rhs convention.
+                let k_ = args[1].ty.dims[0];
+                let p_ = args[2].ty.dims[1];
+                let d_ = args[0].ty.dims[0];
+                let dt = args[0].ty.dt;
+                let t = |dims: Vec<i64>| CTy { dt, dims };
+                let q = Typed {
+                    e: TExpr::Bin(
+                        BinOp::MatMul,
+                        Box::new(args[0].clone()),
+                        Box::new(args[2].clone()),
+                    ),
+                    ty: t(vec![p_]),
+                };
+                let ks = Typed {
+                    e: TExpr::Bin(
+                        BinOp::MatMul,
+                        Box::new(args[1].clone()),
+                        Box::new(args[3].clone()),
+                    ),
+                    ty: t(vec![k_, p_]),
+                };
+                let kst = Typed {
+                    e: TExpr::Transpose(Box::new(ks)),
+                    ty: t(vec![p_, k_]),
+                };
+                let sc = Typed {
+                    e: TExpr::Bin(BinOp::MatMul, Box::new(q), Box::new(kst)),
+                    ty: t(vec![k_]),
+                };
+                let lit = Typed {
+                    e: TExpr::Lit(1.0 / (p_ as f64).sqrt()),
+                    ty: CTy::scalar(DType::F32),
+                };
+                let scaled = Typed {
+                    e: TExpr::Bin(BinOp::Mul, Box::new(sc), Box::new(lit)),
+                    ty: t(vec![k_]),
+                };
+                let soft = Typed {
+                    e: TExpr::Call("softmax".into(), vec![scaled], vec![]),
+                    ty: t(vec![k_]),
+                };
+                let _ = d_;
+                self.gen_raw(&soft, coords)
+            }
             "grad" | "adam" => {
                 Err("gpu stratum: grad/adam not lowered — train on cpu or ane".into())
             }
             _ => Err(format!("gpu emit: builtin {name} not lowered")),
         }
+    }
+
+    /// storage-flat read of a decide weight at `[j, m]` — out-row j,
+    /// in-col m — the `w[j*K + i]` reinterpret eval applies to every
+    /// named rhs. `dd`/`pp` are the declared [K,N] dims.
+    fn decide_wread(
+        &mut self,
+        w: &Typed,
+        j: &str,
+        m: &str,
+        dd: i64,
+        pp: i64,
+    ) -> Result<String, String> {
+        let f = format!("({j})*{dd}+({m})");
+        match &w.e {
+            TExpr::Ident(s) if self.bufs.contains_key(s) => {
+                let (arg, _, _) = self.bufs.get(s).unwrap().clone();
+                Ok(self.ld(&arg, &self.poff(s, &f)))
+            }
+            _ => {
+                let cs = Self::coords_of(&f, &[dd, pp]);
+                self.gen(w, &cs)
+            }
+        }
+    }
+
+    /// shared decide adjoint precompute — one shot per kernel thread:
+    /// q[P], keys[K*P], then the softmax jacobian into dq[P], dk[K*P].
+    /// Returns (q, keys, dq, dk) thread-local array names.
+    fn decide_pre(
+        &mut self,
+        e: &Typed,
+        args: &[Typed],
+        adj: &mut dyn FnMut(&mut Ge, &[String]) -> Result<String, String>,
+    ) -> Result<(String, String, String, String), String> {
+        let d = args[0].ty.dims[0];
+        let k_ = args[1].ty.dims[0];
+        let p_ = args[2].ty.dims[1];
+        let scale = 1.0f64 / (p_ as f64).sqrt();
+        let (qn, kn, dqn, dkn, dda, dot) = (
+            self.tmp(),
+            self.tmp(),
+            self.tmp(),
+            self.tmp(),
+            self.tmp(),
+            self.tmp(),
+        );
+        self.lines.push(format!(
+            "float {qn}[{p_}]; float {kn}[{kp}]; float {dqn}[{p_}]; float {dkn}[{kp}]; float {dda}[{k_}]; float {dot} = 0.0f;",
+            kp = k_ * p_
+        ));
+        let (i, j, m) = (self.tmp(), self.tmp(), self.tmp());
+        self.lines.push(format!(
+            "for (int {j} = 0; {j} < {p_}; ++{j}) {{ float a__ = 0.0f; for (int {m} = 0; {m} < {d}; ++{m}) {{"
+        ));
+        let hv = self.gen(&args[0], &[m.clone()])?;
+        let wv = self.decide_wread(&args[2], &j, &m, d, p_)?;
+        self.lines
+            .push(format!("a__ += ({hv}) * ({wv}); }} {qn}[{j}] = a__; }}"));
+        self.lines.push(format!(
+            "for (int {i} = 0; {i} < {k_}; ++{i}) {{ for (int {j} = 0; {j} < {p_}; ++{j}) {{ float a__ = 0.0f; for (int {m} = 0; {m} < {d}; ++{m}) {{"
+        ));
+        let hv = self.gen(&args[1], &[i.clone(), m.clone()])?;
+        let wv = self.decide_wread(&args[3], &j, &m, d, p_)?;
+        self.lines.push(format!(
+            "a__ += ({hv}) * ({wv}); }} {kn}[({i})*{p_}+{j}] = a__; }} }}"
+        ));
+        self.lines
+            .push(format!("for (int {i} = 0; {i} < {k_}; ++{i}) {{"));
+        let pv = self.gen(e, &[i.clone()])?;
+        let av = adj(self, &[i.clone()])?;
+        self.lines.push(format!("{dot} += ({av}) * ({pv}); }}"));
+        self.lines
+            .push(format!("for (int {i} = 0; {i} < {k_}; ++{i}) {{"));
+        let pv = self.gen(e, &[i.clone()])?;
+        let av = adj(self, &[i.clone()])?;
+        self.lines.push(format!(
+            "{dda}[{i}] = ({pv}) * (({av}) - {dot}) * {scale}f; }}"
+        ));
+        self.lines.push(format!(
+            "for (int {j} = 0; {j} < {p_}; ++{j}) {{ float a__ = 0.0f; for (int {i} = 0; {i} < {k_}; ++{i}) {{ a__ += {dda}[{i}] * {kn}[({i})*{p_}+{j}]; }} {dqn}[{j}] = a__; }}"
+        ));
+        self.lines.push(format!(
+            "for (int {i} = 0; {i} < {k_}; ++{i}) {{ for (int {j} = 0; {j} < {p_}; ++{j}) {{ {dkn}[({i})*{p_}+{j}] = {dda}[{i}] * {qn}[{j}]; }} }}"
+        ));
+        Ok((qn, kn, dqn, dkn))
     }
 
     /// element of a matmul rhs `b` at logical coords `rc` ([contract,
@@ -1881,11 +2007,7 @@ impl Ge {
                             // writes/expr statements are primal effects,
                             // not adjoint paths.
                             TStmt::StateUpdate { .. } | TStmt::Expr(_) => {}
-                            _ => {
-                                return Err(
-                                    "gpu emit: non-let statement inside grad loss".into()
-                                )
-                            }
+                            _ => return Err("gpu emit: non-let statement inside grad loss".into()),
                         }
                     }
                     (**ret).clone()
@@ -2244,6 +2366,86 @@ impl Ge {
                         };
                         self.back(&synth, wrt, f, adj)
                     }
+                    "decide" => {
+                        // mirrors eval: softmax jacobian then pointer-head
+                        // adjoints through both projections. declared
+                        // coords — the leaf owns storage layout.
+                        let d = args[0].ty.dims[0];
+                        let k_ = args[1].ty.dims[0];
+                        let p_ = args[2].ty.dims[1];
+                        let (qn, _kn, dqn, dkn) = self.decide_pre(e, args, adj)?;
+                        let mut out = None;
+                        if self.can_grad(&args[0], wrt) {
+                            let (dq2, a2) = (dqn.clone(), args[2].clone());
+                            let rb = self.back(&args[0], wrt, f, &mut |em, c| {
+                                let (acc, j) = (em.tmp(), em.tmp());
+                                em.lines.push(format!("float {acc} = 0.0f;"));
+                                em.lines.push(format!(
+                                    "for (int {j} = 0; {j} < {p_}; ++{j}) {{"
+                                ));
+                                let wv = em.decide_wread(&a2, &j, &c[0], d, p_)?;
+                                em.lines.push(format!("{acc} += ({dq2}[{j}]) * ({wv});"));
+                                em.lines.push("}".into());
+                                Ok(acc)
+                            })?;
+                            out = add(out, rb);
+                        }
+                        if self.can_grad(&args[1], wrt) {
+                            let (dk2, a3) = (dkn.clone(), args[3].clone());
+                            let rb = self.back(&args[1], wrt, f, &mut |em, c| {
+                                let (acc, j) = (em.tmp(), em.tmp());
+                                em.lines.push(format!("float {acc} = 0.0f;"));
+                                em.lines.push(format!(
+                                    "for (int {j} = 0; {j} < {p_}; ++{j}) {{"
+                                ));
+                                let wv = em.decide_wread(&a3, &j, &c[1], d, p_)?;
+                                em.lines.push(format!(
+                                    "{acc} += ({dk2}[({})*{p_}+{j}]) * ({wv});",
+                                    c[0]
+                                ));
+                                em.lines.push("}".into());
+                                Ok(acc)
+                            })?;
+                            out = add(out, rb);
+                        }
+                        if self.can_grad(&args[2], wrt) {
+                            // leaf flat f is storage [P,D] order —
+                            // coords_of over [P,D] gives [p,d] directly,
+                            // same convention as the matmul rhs arm.
+                            // dwq[p,d] = hq[d] · dq[p].
+                            let (dq2, a0) = (dqn.clone(), args[0].clone());
+                            let rb = self.back(&args[2], wrt, f, &mut |em, c| {
+                                let _ = c;
+                                let sc = Ge::coords_of(f, &[p_, d]);
+                                let hv = em.gen(&a0, &[sc[1].clone()])?;
+                                Ok(format!("({dq2}[{}]) * ({hv})", sc[0]))
+                            })?;
+                            out = add(out, rb);
+                        }
+                        if self.can_grad(&args[3], wrt) {
+                            // dwk[p,d] = Σ_i hos[i,d] · dk[i,p].
+                            let (dk2, a1) = (dkn.clone(), args[1].clone());
+                            let rb = self.back(&args[3], wrt, f, &mut |em, c| {
+                                let _ = c;
+                                let sc = Ge::coords_of(f, &[p_, d]);
+                                let (acc, i) = (em.tmp(), em.tmp());
+                                em.lines.push(format!("float {acc} = 0.0f;"));
+                                em.lines.push(format!(
+                                    "for (int {i} = 0; {i} < {k_}; ++{i}) {{"
+                                ));
+                                let hv =
+                                    em.gen(&a1, &[i.clone(), sc[1].clone()])?;
+                                em.lines.push(format!(
+                                    "{acc} += ({dk2}[({i})*{p_}+({})]) * ({hv});",
+                                    sc[0]
+                                ));
+                                em.lines.push("}".into());
+                                Ok(acc)
+                            })?;
+                            out = add(out, rb);
+                        }
+                        Ok(out)
+                    }
                     "mse" => {
                         let (p2, t2) = (args[0].clone(), args[1].clone());
                         self.back(&args[0], wrt, f, &mut |em: &mut Ge, c: &[String]| {
@@ -2473,7 +2675,8 @@ impl Ge {
             self.lines
                 .push(format!("uint pj1 = min(pj0 + {cs}u, {contract}u);"));
             self.lines.push("float acc = 0.0f;".into());
-            self.lines.push("for (uint pj = pj0; pj < pj1; ++pj) {".into());
+            self.lines
+                .push("for (uint pj = pj0; pj < pj1; ++pj) {".into());
             let ocoords = Self::coords_of("oi", out_dims);
             let jc = vec!["pj".to_string()];
             let tv = term(self, &jc, &ocoords)?;
@@ -2493,7 +2696,8 @@ impl Ge {
         // reduce: out[gid] = Σ_c part[c·m_out + gid]
         let saved = std::mem::take(&mut self.lines);
         self.lines.push("float acc = 0.0f;".into());
-        self.lines.push(format!("for (uint pc = 0; pc < {c_num}; ++pc) {{"));
+        self.lines
+            .push(format!("for (uint pc = 0; pc < {c_num}; ++pc) {{"));
         let pv = self.ld(&part, &format!("pc * {m_out} + gid"));
         self.lines.push(format!("acc += {pv};"));
         self.lines.push("}".into());
@@ -2546,11 +2750,9 @@ impl Ge {
                 Ok(())
             }
             TExpr::Lit(_) | TExpr::Int(_) => Ok(()),
-            TExpr::Unary(UnOp::Neg, a) => {
-                self.back_tape(a, &mut |em: &mut Ge, c: &[String]| {
-                    Ok(format!("(-({}))", adj(em, c)?))
-                })
-            }
+            TExpr::Unary(UnOp::Neg, a) => self.back_tape(a, &mut |em: &mut Ge, c: &[String]| {
+                Ok(format!("(-({}))", adj(em, c)?))
+            }),
             TExpr::Unary(UnOp::Not, _) => Err("gpu grad: `!` is host-stratum".into()),
             TExpr::Bin(BinOp::Add, a, b) => {
                 self.back_tape(a, &mut *adj)?;
@@ -2607,11 +2809,9 @@ impl Ge {
                 // param-weight grad: dW[j,i] = Σ_br adj[br,j] · x[br,i]
                 if let Some(p) = &pname {
                     if self.grad_params.contains(p) && self.is_param(p) {
-                        let pty = self.param_tys.get(p).cloned().unwrap_or_else(|| {
-                            CTy {
-                                dt: a.ty.dt,
-                                dims: vec![nn as i64, kd as i64],
-                            }
+                        let pty = self.param_tys.get(p).cloned().unwrap_or_else(|| CTy {
+                            dt: a.ty.dt,
+                            dims: vec![nn as i64, kd as i64],
                         });
                         let ag = self.ag_buf(p, &pty);
                         let m_batch = if a.ty.dims.len() == 2 {
@@ -2631,8 +2831,9 @@ impl Ge {
                                 let acc = em.tmp();
                                 let br = em.tmp();
                                 em.lines.push(format!("float {acc} = 0.0f;"));
-                                em.lines
-                                    .push(format!("for (int {br} = 0; {br} < {m_batch}; ++{br}) {{"));
+                                em.lines.push(format!(
+                                    "for (int {br} = 0; {br} < {m_batch}; ++{br}) {{"
+                                ));
                                 let av = adjw(em, &[br.clone(), sc[0].clone()])?;
                                 let xv = em.gen(a, &[br.clone(), sc[1].clone()])?;
                                 em.lines.push(format!("{acc} += ({av}) * ({xv});"));
@@ -2668,7 +2869,11 @@ impl Ge {
                     }
                 };
                 let (m_dim, kd_dim, m_out) = if matches!(adims.len(), 1 | 2) {
-                    let md = if adims.len() == 2 { adims[0] as usize } else { 1 };
+                    let md = if adims.len() == 2 {
+                        adims[0] as usize
+                    } else {
+                        1
+                    };
                     let kd = *adims.last().unwrap() as usize;
                     (md, kd, md * kd)
                 } else {
@@ -2704,11 +2909,11 @@ impl Ge {
                             self.lines.push(format!("uint pc = gid / {kd_dim};"));
                         }
                         self.lines.push(format!("uint pj0 = pc * {cs}u;"));
-                        self.lines.push(format!(
-                            "uint pj1 = min(pj0 + {cs}u, {nn}u);"
-                        ));
+                        self.lines
+                            .push(format!("uint pj1 = min(pj0 + {cs}u, {nn}u);"));
                         self.lines.push("float acc = 0.0f;".into());
-                        self.lines.push("for (uint pj = pj0; pj < pj1; ++pj) {".into());
+                        self.lines
+                            .push("for (uint pj = pj0; pj < pj1; ++pj) {".into());
                         let acoords: Vec<String> = if batched {
                             vec!["pbr".into(), "pj".into()]
                         } else {
@@ -2732,7 +2937,8 @@ impl Ge {
                     // reduce: dadj[i] = Σ_c part[c·m_out + i]
                     let saved = std::mem::take(&mut self.lines);
                     self.lines.push("float acc = 0.0f;".into());
-                    self.lines.push(format!("for (uint pc = 0; pc < {c_num}; ++pc) {{"));
+                    self.lines
+                        .push(format!("for (uint pc = 0; pc < {c_num}; ++pc) {{"));
                     let pv = self.ld(&part, &format!("pc * {m_out} + gid"));
                     self.lines.push(format!("acc += {pv};"));
                     self.lines.push("}".into());
@@ -2758,7 +2964,8 @@ impl Ge {
                     let acc = em.tmp();
                     let j = em.tmp();
                     em.lines.push(format!("float {acc} = 0.0f;"));
-                    em.lines.push(format!("for (int {j} = 0; {j} < {nn}; ++{j}) {{"));
+                    em.lines
+                        .push(format!("for (int {j} = 0; {j} < {nn}; ++{j}) {{"));
                     let av = if batched {
                         adj3(em, &[c[0].clone(), j.clone()])?
                     } else {
@@ -3011,6 +3218,79 @@ impl Ge {
                         };
                         self.back_tape(&synth, adj)
                     }
+                    "decide" => {
+                        // every contrib is its own kernel — the shared
+                        // precompute reruns inside each closure's lines.
+                        let d = args[0].ty.dims[0];
+                        let k_ = args[1].ty.dims[0];
+                        let p_ = args[2].ty.dims[1];
+                        let e2 = e.clone();
+                        let (a0, a1, a2, a3) = (
+                            args[0].clone(),
+                            args[1].clone(),
+                            args[2].clone(),
+                            args[3].clone(),
+                        );
+                        let adjw = &mut *adj;
+                        self.back_tape(&args[0], &mut |em, c| {
+                            let (_qn, _kn, dqn, _dkn) =
+                                em.decide_pre(&e2, args, &mut *adjw)?;
+                            let (acc, j) = (em.tmp(), em.tmp());
+                            em.lines.push(format!("float {acc} = 0.0f;"));
+                            em.lines.push(format!(
+                                "for (int {j} = 0; {j} < {p_}; ++{j}) {{"
+                            ));
+                            let wv = em.decide_wread(&a2, &j, &c[0], d, p_)?;
+                            em.lines
+                                .push(format!("{acc} += ({dqn}[{j}]) * ({wv});"));
+                            em.lines.push("}".into());
+                            Ok(acc)
+                        })?;
+                        self.back_tape(&args[1], &mut |em, c| {
+                            let (_qn, _kn, _dqn, dkn) =
+                                em.decide_pre(&e2, args, &mut *adjw)?;
+                            let (acc, j) = (em.tmp(), em.tmp());
+                            em.lines.push(format!("float {acc} = 0.0f;"));
+                            em.lines.push(format!(
+                                "for (int {j} = 0; {j} < {p_}; ++{j}) {{"
+                            ));
+                            let wv = em.decide_wread(&a3, &j, &c[1], d, p_)?;
+                            em.lines.push(format!(
+                                "{acc} += ({dkn}[({})*{p_}+{j}]) * ({wv});",
+                                c[0]
+                            ));
+                            em.lines.push("}".into());
+                            Ok(acc)
+                        })?;
+                        self.back_tape(&args[2], &mut |em, c| {
+                            let (_qn, _kn, dqn, _dkn) =
+                                em.decide_pre(&e2, args, &mut *adjw)?;
+                            let _ = c;
+                            // gid is storage [P,D] flat — coords over
+                            // [P,D] give [p,d], same as the matmul arm.
+                            let sc = Ge::coords_of("gid", &[p_, d]);
+                            let hv = em.gen(&a0, &[sc[1].clone()])?;
+                            Ok(format!("({dqn}[{}]) * ({hv})", sc[0]))
+                        })?;
+                        self.back_tape(&args[3], &mut |em, c| {
+                            let (_qn, _kn, _dqn, dkn) =
+                                em.decide_pre(&e2, args, &mut *adjw)?;
+                            let _ = c;
+                            let sc = Ge::coords_of("gid", &[p_, d]);
+                            let (acc, i) = (em.tmp(), em.tmp());
+                            em.lines.push(format!("float {acc} = 0.0f;"));
+                            em.lines.push(format!(
+                                "for (int {i} = 0; {i} < {k_}; ++{i}) {{"
+                            ));
+                            let hv = em.gen(&a1, &[i.clone(), sc[1].clone()])?;
+                            em.lines.push(format!(
+                                "{acc} += ({dkn}[({i})*{p_}+({})]) * ({hv});",
+                                sc[0]
+                            ));
+                            em.lines.push("}".into());
+                            Ok(acc)
+                        })
+                    }
                     "mse" => {
                         let (p2, t2) = (args[0].clone(), args[1].clone());
                         let nn = e.ty.numel().max(1);
@@ -3097,7 +3377,11 @@ impl Ge {
         // unstable order here renames scratch buffers and reshuffles
         // kernel fusion/dedup, so identical sources emitted different
         // (sometimes broken) kernels run to run.
-        let mut gps: Vec<(String, CTy)> = self.grad_param_tys.iter().map(|(p, t)| (p.clone(), t.clone())).collect();
+        let mut gps: Vec<(String, CTy)> = self
+            .grad_param_tys
+            .iter()
+            .map(|(p, t)| (p.clone(), t.clone()))
+            .collect();
         gps.sort_by(|a, b| a.0.cmp(&b.0));
         for (p, ty) in gps {
             let ag = self.ag_buf(&p, &ty);
@@ -3145,11 +3429,7 @@ impl Ge {
                         match s {
                             TStmt::Let { .. } => self.stmt(s)?,
                             TStmt::StateUpdate { .. } | TStmt::Expr(_) => {}
-                            _ => {
-                                return Err(
-                                    "gpu emit: non-let statement inside grad loss".into()
-                                )
-                            }
+                            _ => return Err("gpu emit: non-let statement inside grad loss".into()),
                         }
                     }
                     (**ret).clone()
@@ -3307,9 +3587,7 @@ impl Ge {
                     } else {
                         self.grad_elem(loss, param, "gid")
                             .map_err(|e| format!("grad({param}): {e}"))?
-                            .ok_or_else(|| {
-                                format!("gpu emit: loss does not depend on {param}")
-                            })?
+                            .ok_or_else(|| format!("gpu emit: loss does not depend on {param}"))?
                     };
                     self.lines
                         .push(self.param_st(param, "+=", &format!("float({scale}) * ({g})")));
@@ -3360,9 +3638,7 @@ impl Ge {
                         let g = self
                             .grad_elem(loss, param, "gid")
                             .map_err(|e| format!("grad({param}): {e}"))?
-                            .ok_or_else(|| {
-                                format!("gpu emit: loss does not depend on {param}")
-                            })?;
+                            .ok_or_else(|| format!("gpu emit: loss does not depend on {param}"))?;
                         self.lines.push(format!("ag_{param}[gid] = ({g});"));
                         let body = std::mem::replace(&mut self.lines, saved);
                         self.emit_q.extend(self.scratch.drain(mark..));
@@ -3540,7 +3816,10 @@ impl Ge {
                         ),
                     },
                 };
-                self.scopes.last_mut().unwrap().push((name.clone(), new_e.clone()));
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .push((name.clone(), new_e.clone()));
                 self.orig_scopes
                     .last_mut()
                     .unwrap()
@@ -3797,9 +4076,7 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
                         cur.push(ch);
                     } else {
                         match map.get(cur.as_str()) {
-                            Some(&(k, cast)) => {
-                                out.push_str(&format!("(({cast})__ptrs->p[{k}])"))
-                            }
+                            Some(&(k, cast)) => out.push_str(&format!("(({cast})__ptrs->p[{k}])")),
                             None => out.push_str(&cur),
                         }
                         cur.clear();
@@ -4035,10 +4312,10 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
                 let mut rest = line.as_str();
                 while let Some(p) = rest.find(&pat) {
                     let inner = &rest[p + pat.len()..];
-                    let Some(e) = inner.find(']') else { return false };
-                    let idx = inner[..e]
-                        .replace(['(', ')', ' '], "")
-                        .replace("*1", "");
+                    let Some(e) = inner.find(']') else {
+                        return false;
+                    };
+                    let idx = inner[..e].replace(['(', ')', ' '], "").replace("*1", "");
                     if idx != "gid" && idx != want {
                         return false;
                     }
@@ -4213,29 +4490,29 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
             }
         }
     } else {
-    for ek in &ge.emit_q {
-        let kname = format!("coyote_{name}_{}", ek.name);
-        let idents = body_idents(&ek.body);
-        // pooled params all share the `__params_pool` entry name —
-        // dedup keeps the FIRST index so each kernel binds the pool
-        // exactly once regardless of how many params it touches.
-        let mut seen = std::collections::HashSet::new();
-        let uses: Vec<u32> = entries
-            .iter()
-            .enumerate()
-            .filter(|(_, (n, _))| idents.contains(n) && seen.insert(n.clone()))
-            .map(|(i, _)| i as u32)
-            .collect();
-        if uses.len() > ptrs_max {
-            if entries.len() > PTRS_SLOTS {
-                return Err(format!(
+        for ek in &ge.emit_q {
+            let kname = format!("coyote_{name}_{}", ek.name);
+            let idents = body_idents(&ek.body);
+            // pooled params all share the `__params_pool` entry name —
+            // dedup keeps the FIRST index so each kernel binds the pool
+            // exactly once regardless of how many params it touches.
+            let mut seen = std::collections::HashSet::new();
+            let uses: Vec<u32> = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, (n, _))| idents.contains(n) && seen.insert(n.clone()))
+                .map(|(i, _)| i as u32)
+                .collect();
+            if uses.len() > ptrs_max {
+                if entries.len() > PTRS_SLOTS {
+                    return Err(format!(
                     "gpu emit ({name}/{}): {} buffers exceeds pointer-table capacity {PTRS_SLOTS}",
                     ek.name,
                     entries.len()
                 ));
-            }
-            ptrs_used = true;
-            kernel_srcs.push(format!(
+                }
+                ptrs_used = true;
+                kernel_srcs.push(format!(
                 "kernel void {kname}(\n    device __CoyotePtrs* __ptrs [[buffer(0)]],\n    {}\n)\n{{\n{}\n}}\n",
                 match ek.dispatch {
                     Dispatch::Linear(_) => "uint gid [[thread_position_in_grid]]",
@@ -4256,45 +4533,45 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
                     .collect::<Vec<_>>()
                     .join("\n"),
             ));
-            kernels.push((kname, ek.dispatch));
-            kernel_uses.push(vec![u32::MAX]); // sentinel → ptrs table
-            // every entry this kernel's body references is reached
-            // through `p[K]` — the residency set is `uses` itself.
-            kernel_indirect.push(uses);
-            continue;
-        }
-        let ksig: Vec<String> = uses
-            .iter()
-            .enumerate()
-            .map(|(li, &gi)| {
-                let s = format!("{} [[buffer({li})]]", entries[gi as usize].1);
-                match &ek.writable {
-                    Some(param) => {
-                        let s = s
-                            .replace(
-                                &format!("device const float* b_{param}"),
-                                &format!("device float* b_{param}"),
-                            )
-                            .replace(
-                                &format!("device const half* b_{param}"),
-                                &format!("device half* b_{param}"),
-                            );
-                        // a pooled param's update kernel writes through
-                        // the shared pool — make its decl writable.
-                        if ge.param_off.contains_key(param.as_str()) {
-                            s.replace(
-                                "device const float* __params_pool",
-                                "device float* __params_pool",
-                            )
-                        } else {
-                            s
+                kernels.push((kname, ek.dispatch));
+                kernel_uses.push(vec![u32::MAX]); // sentinel → ptrs table
+                                                  // every entry this kernel's body references is reached
+                                                  // through `p[K]` — the residency set is `uses` itself.
+                kernel_indirect.push(uses);
+                continue;
+            }
+            let ksig: Vec<String> = uses
+                .iter()
+                .enumerate()
+                .map(|(li, &gi)| {
+                    let s = format!("{} [[buffer({li})]]", entries[gi as usize].1);
+                    match &ek.writable {
+                        Some(param) => {
+                            let s = s
+                                .replace(
+                                    &format!("device const float* b_{param}"),
+                                    &format!("device float* b_{param}"),
+                                )
+                                .replace(
+                                    &format!("device const half* b_{param}"),
+                                    &format!("device half* b_{param}"),
+                                );
+                            // a pooled param's update kernel writes through
+                            // the shared pool — make its decl writable.
+                            if ge.param_off.contains_key(param.as_str()) {
+                                s.replace(
+                                    "device const float* __params_pool",
+                                    "device float* __params_pool",
+                                )
+                            } else {
+                                s
+                            }
                         }
+                        None => s,
                     }
-                    None => s,
-                }
-            })
-            .collect();
-        let thread_decl = match ek.dispatch {
+                })
+                .collect();
+            let thread_decl = match ek.dispatch {
             Dispatch::Linear(_) => "uint gid [[thread_position_in_grid]]",
             Dispatch::Group(_) => "uint lid [[thread_position_in_threadgroup]]",
             Dispatch::Gemv(_) => {
@@ -4307,19 +4584,19 @@ pub fn emit(src: &str, name: &str, p: &TProgram) -> Result<GpuOut, String> {
                 "uint2 tgid2 [[threadgroup_position_in_grid]],\n    uint2 lid2 [[thread_position_in_threadgroup]]"
             }
         };
-        kernel_srcs.push(format!(
-            "kernel void {kname}(\n    {},\n    {thread_decl})\n{{\n{}\n}}\n",
-            ksig.join(",\n    "),
-            ek.body
-                .iter()
-                .map(|l| format!("    {l}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ));
-        kernels.push((kname, ek.dispatch));
-        kernel_uses.push(uses);
-        kernel_indirect.push(Vec::new()); // direct bindings self-resident
-    }
+            kernel_srcs.push(format!(
+                "kernel void {kname}(\n    {},\n    {thread_decl})\n{{\n{}\n}}\n",
+                ksig.join(",\n    "),
+                ek.body
+                    .iter()
+                    .map(|l| format!("    {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ));
+            kernels.push((kname, ek.dispatch));
+            kernel_uses.push(uses);
+            kernel_indirect.push(Vec::new()); // direct bindings self-resident
+        }
     }
     desc_templates.resize(kernels.len(), Vec::new());
     kernel_indirect.resize(kernels.len(), Vec::new());

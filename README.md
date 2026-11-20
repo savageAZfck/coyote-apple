@@ -9,11 +9,14 @@ Apple mesh wire (HMAC mutual auth, AES-256-GCM sealed packets),
 verify-before-secrets, signed results, and one hash-chained witness
 log that spans every machine a computation touches.
 
-This is the private Apple edition of
+This is the source-available Apple edition of
 [Coyote](https://github.com/savageAZfck/coyote): the public language stays
 MIT and clean-room, this distribution carries the first-party engines
 (`gpu fn` → Metal, `fn` → MIL/Espresso, `enc fn` → LWE ciphertext) and
-the org surface (oracle, audit, witness chains, package signing).
+the org surface (oracle, audit, witness chains, package signing,
+universal dissection). Licensed under the
+[SOURCE-AVAILABLE LICENSE](LICENSE) — read, audit, and build freely;
+commercial use requires consent.
 
 ## the headline: resident ANE decode
 
@@ -153,7 +156,8 @@ five-organ fusion `badapple_organs.cy`) — importable as
 organs are library code now.
 
 plus the full distribution surface — `new doc test spec watch gold
-weights genmask oracle audit diff bench prof package verify unpack emit`
+weights genmask oracle audit diff bench prof package verify unpack
+inspect emit`
 — documented in [APPLE.md](APPLE.md). Language guide: [LANGUAGE.md](LANGUAGE.md).
 
 ## language
@@ -229,3 +233,10 @@ carries `enc fn`, `import "x" as m`, dtype generics (`fn f<D>`), and the
 `?` propagate operator, none of which exists upstream. The engines and
 the toolchain surface live here. `import "name"` resolves installed
 packages from `~/.coyote/pkg`.
+
+## license
+
+Source-available, proprietary — see [LICENSE](LICENSE). Personal,
+educational, research, audit, and security-review use is granted to
+everyone; commercial use requires the Owner's written consent. The
+public `coyote` language remains MIT.

@@ -17,6 +17,7 @@
 //   coyote-apple-gen-cy4b --out cy4b.cy [--layers N] [--model DIR]
 
 use std::fmt::Write as _;
+use std::path::PathBuf;
 
 const L: usize = 36;
 const D: usize = 2560;
@@ -48,7 +49,12 @@ fn main() {
         .unwrap_or(S)
         .min(S);
     let model = get("--model")
-        .unwrap_or_else(|| "/Users/savag3/cy4b/cy4b_model/model.safetensors".to_string());
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+            home.join("cy4b/cy4b_model/model.safetensors")
+                .display()
+                .to_string()
+        });
     let out = get("--out").unwrap_or_else(|| "cy4b.cy".to_string());
     let m = &model;
 

@@ -855,7 +855,8 @@ fn cy4b_decode_bin() -> PathBuf {
     std::env::var_os("CY4B_DECODE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from("/Users/savag3/mil_spec/target/release/examples/cy4b_decode")
+            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+            home.join("mil_spec/target/release/examples/cy4b_decode")
         })
 }
 
@@ -976,23 +977,19 @@ fn ranknode_cy4b(args: &[String]) -> Result<(), String> {
     // The world's action grammar — constrain generated tokens to
     // these verbs (bare + leading-space BPE variants), exactly the
     // trie cy4b_decode's `verbs` command builds.
-    if let (Some(verbs), Some(t)) = (std::env::var("CY4B_VERBS").ok(), &tok) {
-        if !verbs.is_empty() {
-            let mut groups: Vec<String> = Vec::new();
-            for v in verbs.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                for form in [v.to_string(), format!(" {v}")] {
-                    if let Ok(enc) = t.encode(form.as_str(), false) {
-                        let ids: Vec<String> =
-                            enc.get_ids().iter().map(|i| i.to_string()).collect();
-                        if !ids.is_empty() {
-                            groups.push(ids.join(","));
-                        }
-                    }
-                }
-            }
-            if !groups.is_empty() {
-                let _ = dec.cmd(&format!("verbs {}", groups.join(";")));
-            }
+    if let Some(t) = &tok {
+        let seqs = cy4b_verb_seqs(t);
+        if !seqs.is_empty() {
+            let groups: Vec<String> = seqs
+                .iter()
+                .map(|s| {
+                    s.iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect();
+            let _ = dec.cmd(&format!("verbs {}", groups.join(";")));
         }
     }
 
@@ -1168,6 +1165,107 @@ fn ensure_cy_shards(cy: &Path, force: bool) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// CY4B_VERBS env → token-id sequences: each verb encoded bare and
+/// with a leading space, exactly the forms cy4b_decode's `verbs`
+/// command builds. No env or empty list → unconstrained decode.
+fn cy4b_verb_seqs(tok: &Tokenizer) -> Vec<Vec<u32>> {
+    let Ok(verbs) = std::env::var("CY4B_VERBS") else {
+        return Vec::new();
+    };
+    let mut seqs = Vec::new();
+    for v in verbs.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        for form in [v.to_string(), format!(" {v}")] {
+            if let Ok(enc) = tok.encode(form.as_str(), false) {
+                let ids: Vec<u32> = enc.get_ids().to_vec();
+                if !ids.is_empty() {
+                    seqs.push(ids);
+                }
+            }
+        }
+    }
+    seqs
+}
+
+fn logits_argmax(logits: &[u16]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| {
+            half::f16::from_bits(**a)
+                .to_f32()
+                .total_cmp(&half::f16::from_bits(**b).to_f32())
+        })
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
+}
+
+/// `Decoder::generate` with the cy4b_decode `verbs` semantics: while
+/// the generated stream sits inside a known action prefix, argmax is
+/// masked to trie continuations — the substrate picks WHICH verb by
+/// its own probabilities, grammar does the rest. Releases once every
+/// live path completes a verb. Empty `vseqs` → plain greedy decode.
+fn cy_generate(
+    dec: &mut Decoder,
+    prompt: &[u32],
+    max_new: usize,
+    vseqs: &[Vec<u32>],
+) -> Result<Vec<u32>, mil_infer::e5rt::E5Error> {
+    if prompt.is_empty() {
+        return Err(mil_infer::e5rt::E5Error::Call("decoder: empty prompt", -1));
+    }
+    for &t in &prompt[..prompt.len() - 1] {
+        dec.push(t, false)?;
+    }
+    // The last prompt token steps the pipeline; the head logits then
+    // predict the first generated token.
+    dec.push(prompt[prompt.len() - 1], false)?;
+
+    let mut vactive: Vec<(usize, usize)> = (0..vseqs.len()).map(|i| (i, 0)).collect();
+    let mut vdone = vseqs.is_empty();
+    let mut out = Vec::new();
+    for _ in 0..max_new {
+        let logits = dec.logits();
+        let mut next = u32::MAX;
+        if !vdone {
+            let mut bv = f32::NEG_INFINITY;
+            for &(si, p) in &vactive {
+                if p < vseqs[si].len() {
+                    let id = vseqs[si][p] as usize;
+                    if id < logits.len() {
+                        let v = half::f16::from_bits(logits[id]).to_f32();
+                        if v > bv {
+                            bv = v;
+                            next = id as u32;
+                        }
+                    }
+                }
+            }
+            if next != u32::MAX {
+                let chosen = next;
+                vactive.retain_mut(|(si, p)| {
+                    if *p < vseqs[*si].len() && vseqs[*si][*p] == chosen {
+                        *p += 1;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if vactive.iter().all(|&(si, p)| p >= vseqs[si].len()) {
+                    vdone = true;
+                }
+            } else {
+                vdone = true;
+            }
+        }
+        if next == u32::MAX {
+            next = logits_argmax(&logits);
+        }
+        out.push(next);
+        dec.push(next, false)?;
+    }
+    Ok(out)
+}
+
 fn ranknode_cy(args: &[String]) -> Result<(), String> {
     let get = |flag: &str| -> Option<String> {
         args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
@@ -1181,6 +1279,10 @@ fn ranknode_cy(args: &[String]) -> Result<(), String> {
     });
     if tok.is_some() {
         eprintln!("  tokenizer: {}", get("--tokenizer").unwrap_or_default());
+    }
+    let vseqs = tok.as_ref().map(cy4b_verb_seqs).unwrap_or_default();
+    if !vseqs.is_empty() {
+        eprintln!("  verbs: {} sequences constrain decode", vseqs.len());
     }
     let force = args.iter().any(|a| a == "--reshardize");
     let shards = ensure_cy_shards(Path::new(&cy), force)?;
@@ -1204,8 +1306,7 @@ fn ranknode_cy(args: &[String]) -> Result<(), String> {
         let mut g = |max: usize, ids: &[i64]| -> Result<Vec<i64>, String> {
             dec.reset().map_err(|e| format!("decoder reset: {e}"))?;
             let prompt: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
-            let out = dec
-                .generate(&prompt, max)
+            let out = cy_generate(&mut dec, &prompt, max, &vseqs)
                 .map_err(|e| format!("decoder generate: {e}"))?;
             Ok(out.into_iter().map(|t| t as i64).collect())
         };

@@ -927,9 +927,8 @@ pub fn run(args: &[String]) -> Result<(), i32> {
             .find(|w| w[0] == "--tmpl")
             .map(|w| PathBuf::from(&w[1]))
             .unwrap_or_else(|| {
-                PathBuf::from(
-                    "/Users/savag3/bad_apple/ane_artifacts/qwen3b_v2/layer_s00-01.mlmodelc",
-                )
+                let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+                home.join("bad_apple/ane_artifacts/qwen3b_v2/layer_s00-01.mlmodelc")
             });
         let only: Option<String> = args
             .windows(2)

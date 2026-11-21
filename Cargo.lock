@@ -879,7 +879,7 @@ dependencies = [
 [[package]]
 name = "mil_compile"
 version = "0.2.0"
-source = "git+https://github.com/savageAZfck/mil_spec#6d4f1f62ccfac75c9ba79f09ed9abf4184d85f5d"
+source = "git+https://github.com/savageAZfck/mil_spec#c4bd133e412f45d39a99c6d5512963843f8e7c3c"
 dependencies = [
  "mil_spec",
 ]
@@ -887,7 +887,7 @@ dependencies = [
 [[package]]
 name = "mil_infer"
 version = "0.6.0"
-source = "git+https://github.com/savageAZfck/mil_spec#6d4f1f62ccfac75c9ba79f09ed9abf4184d85f5d"
+source = "git+https://github.com/savageAZfck/mil_spec#c4bd133e412f45d39a99c6d5512963843f8e7c3c"
 dependencies = [
  "half",
  "libc",
@@ -900,7 +900,7 @@ dependencies = [
 [[package]]
 name = "mil_spec"
 version = "0.4.2"
-source = "git+https://github.com/savageAZfck/mil_spec#6d4f1f62ccfac75c9ba79f09ed9abf4184d85f5d"
+source = "git+https://github.com/savageAZfck/mil_spec#c4bd133e412f45d39a99c6d5512963843f8e7c3c"
 dependencies = [
  "half",
 ]

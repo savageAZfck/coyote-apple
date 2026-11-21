@@ -7,15 +7,24 @@
 // drives l0..l35 -> head directly when this file is loaded as a
 // decoder organism.
 //
-// Weights bind frozen to the HF repack at cy4b/cy4b_model/
-// (own4b_hf output). Layout notes verified against own4b_hf.rs:
+// Weights bind frozen to a safetensors checkpoint. Layout notes
+// verified against own4b_hf.rs and HF Qwen3:
 //   q/k/v/o_proj rows/cols interleave head lo/hi halves:
 //     head h half hf -> rows [h*128 + hf*64, +64)
-//   gate/up_proj rows: FFN block b -> rows [b*5120, +5120)
-//   down_proj cols:    FFN block b -> cols [b*5120, +5120)
+//   gate/up_proj rows: FFN block b -> rows [b*FFN, +FFN)
+//   down_proj cols:    FFN block b -> cols [b*FFN, +FFN)
 //
-//   coyote-apple-gen-cy4b --out cy4b.cy [--layers N] [--model DIR]
+//   coyote-apple-gen-cy4b --out cy4b.cy [--layers N] [--model FILE]
+//       [--ffn-dim N] [--ffn-branches N] [--vocab N] [--attn-scale F]
+//       [--joint-qk] [--rope-k] [--tie-lm] [--index index.json]
+//       [--model-dir DIR]
+//
+// --qwen presets the Qwen3-4B spec (ffn=9728x1, V=151936,
+// attn scale 1/sqrt(128), joint 128-dim QK-norm, RoPE on K, tied
+// lm_head -> embed_tokens) for use with --index/--model-dir pointing
+// at a HuggingFace checkpoint dir.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -32,12 +41,14 @@ const S: usize = 512; // kv horizon / seq len
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let has = |flag: &str| args.iter().any(|a| a == flag);
     let get = |flag: &str| -> Option<String> {
         args.iter()
             .position(|a| a == flag)
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
+    let qwen = has("--qwen");
     let layers: usize = get("--layers")
         .and_then(|v| v.parse().ok())
         .unwrap_or(L)
@@ -46,17 +57,73 @@ fn main() {
     // horizon must clamp to the largest legal window below it.
     let sq: usize = get("--seq")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(S)
+        .unwrap_or(if qwen { 256 } else { S })
         .min(S);
-    let model = get("--model")
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-            home.join("cy4b/cy4b_model/model.safetensors")
-                .display()
-                .to_string()
+    let ffd: usize = get("--ffn-dim")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if qwen { 9728 } else { FD });
+    let fbr: usize = get("--ffn-branches")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if qwen { 1 } else { FB });
+    let voc: usize = get("--vocab")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if qwen { 151936 } else { V });
+    let scale: f64 = get("--attn-scale")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if qwen {
+            0.08838834764831845 // 1/sqrt(128)
+        } else {
+            0.125 // 1/sqrt(64) — cy4b's trained convention
         });
+    let joint_qk = has("--joint-qk") || qwen;
+    let rope_k = has("--rope-k") || qwen;
+    let tie_lm = has("--tie-lm") || qwen;
+    let model_dir = get("--model-dir").unwrap_or_else(|| {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        home.join("cy4b/qwen4b").display().to_string()
+    });
+    // tensor name -> shard file, from a safetensors index.json. When
+    // absent, every binding points at the single --model file.
+    let shard_map: Option<HashMap<String, String>> = get("--index").map(|p| {
+        let txt = std::fs::read_to_string(&p).expect("read index");
+        let mut map = HashMap::new();
+        // hand-rolled scan: "tensor.name": "model-0000X-of-0000Y.safetensors"
+        let mut rest = txt.as_str();
+        while let Some(i) = rest.find("\": \"") {
+            let name_start = rest[..i].rfind('"').unwrap();
+            let name = &rest[name_start + 1..i];
+            let after = &rest[i + 4..];
+            let end = after.find('"').unwrap();
+            let file = &after[..end];
+            if file.ends_with(".safetensors") {
+                map.insert(name.to_string(), file.to_string());
+            }
+            rest = &after[end..];
+        }
+        map
+    });
+    // full "path::tensor" prefix for a HF tensor name
+    let bind = |tensor: &str| -> String {
+        match &shard_map {
+            Some(map) => {
+                let shard = map
+                    .get(tensor)
+                    .unwrap_or_else(|| panic!("tensor {tensor} not in index"));
+                format!("{model_dir}/{shard}::{tensor}")
+            }
+            None => {
+                let m = get("--model").unwrap_or_else(|| {
+                    let home =
+                        std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+                    home.join("cy4b/cy4b_model/model.safetensors")
+                        .display()
+                        .to_string()
+                });
+                format!("{m}::{tensor}")
+            }
+        }
+    };
     let out = get("--out").unwrap_or_else(|| "cy4b.cy".to_string());
-    let m = &model;
 
     let mut o = String::new();
     macro_rules! w {
@@ -66,30 +133,44 @@ fn main() {
     w!("// cy4b.cy — CY4B decode organism, generated by coyote-apple-gen-cy4b.");
     w!("// {layers} layer programs on the chip, each with its own instanced");
     w!("// KV cache; gather/dispatch/argmax live on the host. Weights are");
-    w!("// frozen bindings into the own4b_hf repack.");
+    w!("// frozen bindings into a safetensors checkpoint.");
     w!("//");
-    w!("// spec: L={L} D={D} Q={QH} KV={KVH} ffn={FB}x{FD} V={V} S={sq}");
+    w!("// spec: L={L} D={D} Q={QH} KV={KVH} ffn={fbr}x{ffd} V={voc} S={sq} scale={scale}");
     w!();
 
     // ---- params: lnf/lmh first (head), then per-layer blocks ----
-    w!("param lnf: frozen f16[{D}] @ \"{m}::model.norm.weight\"");
-    w!("param lmh: frozen f16[{D}, {V}] @ \"{m}::lm_head.weight\"");
+    w!("param lnf: frozen f16[{D}] @ \"{}\"", bind("model.norm.weight"));
+    let lm_tensor = if tie_lm {
+        "model.embed_tokens.weight"
+    } else {
+        "lm_head.weight"
+    };
+    w!(
+        "param lmh: frozen f16[{D}, {voc}] @ \"{}\"",
+        bind(lm_tensor)
+    );
     w!();
     for l in 0..layers {
         let p = format!("model.layers.{l}");
-        w!("param l{l}_ln1: frozen f16[{D}] @ \"{m}::{p}.input_layernorm.weight\"");
-        w!("param l{l}_ln2: frozen f16[{D}] @ \"{m}::{p}.post_attention_layernorm.weight\"");
-        w!("param l{l}_qnl: frozen f16[{HD}] @ \"{m}::{p}.self_attn.q_norm.weight[0:{HD}]\"");
-        w!("param l{l}_qnh: frozen f16[{HD}] @ \"{m}::{p}.self_attn.q_norm.weight[{HD}:{FHD}]\"");
-        w!("param l{l}_knl: frozen f16[{HD}] @ \"{m}::{p}.self_attn.k_norm.weight[0:{HD}]\"");
-        w!("param l{l}_knh: frozen f16[{HD}] @ \"{m}::{p}.self_attn.k_norm.weight[{HD}:{FHD}]\"");
+        w!("param l{l}_ln1: frozen f16[{D}] @ \"{}\"", bind(&format!("{p}.input_layernorm.weight")));
+        w!("param l{l}_ln2: frozen f16[{D}] @ \"{}\"", bind(&format!("{p}.post_attention_layernorm.weight")));
+        if joint_qk {
+            w!("param l{l}_qn: frozen f16[{FHD}] @ \"{}\"", bind(&format!("{p}.self_attn.q_norm.weight")));
+            w!("param l{l}_kn: frozen f16[{FHD}] @ \"{}\"", bind(&format!("{p}.self_attn.k_norm.weight")));
+        } else {
+            w!("param l{l}_qnl: frozen f16[{HD}] @ \"{}[0:{HD}]\"", bind(&format!("{p}.self_attn.q_norm.weight")));
+            w!("param l{l}_qnh: frozen f16[{HD}] @ \"{}[{HD}:{FHD}]\"", bind(&format!("{p}.self_attn.q_norm.weight")));
+            w!("param l{l}_knl: frozen f16[{HD}] @ \"{}[0:{HD}]\"", bind(&format!("{p}.self_attn.k_norm.weight")));
+            w!("param l{l}_knh: frozen f16[{HD}] @ \"{}[{HD}:{FHD}]\"", bind(&format!("{p}.self_attn.k_norm.weight")));
+        }
         for h in 0..KVH {
             for (pr, hf) in [("k", 0usize), ("k", 1), ("v", 0), ("v", 1)] {
                 let nm = if hf == 0 { "lo" } else { "hi" };
                 let r0 = h * FHD + hf * HD;
                 w!(
-                    "param l{l}_{pr}{h}{nm}: frozen f16[{D}, {HD}] @ \"{m}::{p}.self_attn.{pr}_proj.weight[{r0}:{}]\"",
-                    r0 + HD
+                    "param l{l}_{pr}{h}{nm}: frozen f16[{D}, {HD}] @ \"{}[{r0}:{r1}]\"",
+                    bind(&format!("{p}.self_attn.{pr}_proj.weight")),
+                    r1 = r0 + HD
                 );
             }
         }
@@ -98,22 +179,25 @@ fn main() {
                 let nm = if hf == 0 { "lo" } else { "hi" };
                 let r0 = h * FHD + hf * HD;
                 w!(
-                    "param l{l}_q{h}{nm}: frozen f16[{D}, {HD}] @ \"{m}::{p}.self_attn.q_proj.weight[{r0}:{}]\"",
-                    r0 + HD
+                    "param l{l}_q{h}{nm}: frozen f16[{D}, {HD}] @ \"{}[{r0}:{r1}]\"",
+                    bind(&format!("{p}.self_attn.q_proj.weight")),
+                    r1 = r0 + HD
                 );
                 w!(
-                    "param l{l}_o{h}{nm}: frozen f16[{HD}, {D}] @ \"{m}::{p}.self_attn.o_proj.weight[0:{D},{r0}:{}]\"",
-                    r0 + HD
+                    "param l{l}_o{h}{nm}: frozen f16[{HD}, {D}] @ \"{}[0:{D},{r0}:{r1}]\"",
+                    bind(&format!("{p}.self_attn.o_proj.weight")),
+                    r1 = r0 + HD
                 );
             }
         }
-        for b in 0..FB {
-            let f0 = b * FD;
-            w!("param l{l}_wg{b}: frozen f16[{D}, {FD}] @ \"{m}::{p}.mlp.gate_proj.weight[{f0}:{}]\"", f0 + FD);
-            w!("param l{l}_wu{b}: frozen f16[{D}, {FD}] @ \"{m}::{p}.mlp.up_proj.weight[{f0}:{}]\"", f0 + FD);
+        for b in 0..fbr {
+            let f0 = b * ffd;
+            w!("param l{l}_wg{b}: frozen f16[{D}, {ffd}] @ \"{}[{f0}:{}]\"", bind(&format!("{p}.mlp.gate_proj.weight")), f0 + ffd);
+            w!("param l{l}_wu{b}: frozen f16[{D}, {ffd}] @ \"{}[{f0}:{}]\"", bind(&format!("{p}.mlp.up_proj.weight")), f0 + ffd);
             w!(
-                "param l{l}_wd{b}: frozen f16[{FD}, {D}] @ \"{m}::{p}.mlp.down_proj.weight[0:{D},{f0}:{}]\"",
-                f0 + FD
+                "param l{l}_wd{b}: frozen f16[{ffd}, {D}] @ \"{}[0:{D},{f0}:{}]\"",
+                bind(&format!("{p}.mlp.down_proj.weight")),
+                f0 + ffd
             );
         }
         w!();
@@ -132,7 +216,7 @@ fn main() {
     w!();
 
     // ---- tables ----
-    w!("table emb: f16[{V}, {D}] @ \"{m}::model.embed_tokens.weight\"");
+    w!("table emb: f16[{voc}, {D}] @ \"{}\"", bind("model.embed_tokens.weight"));
     w!();
 
     // ---- layer fns ----
@@ -143,18 +227,37 @@ fn main() {
         );
         w!("    let h{l} = rmsnorm(x, l{l}_ln1);");
         for h in 0..QH {
-            w!("    let q{h}l = rmsnorm(h{l} @ l{l}_q{h}lo, l{l}_qnl);");
-            w!("    let q{h}h = rmsnorm(h{l} @ l{l}_q{h}hi, l{l}_qnh);");
+            if joint_qk {
+                w!("    let qn{h} = rmsnorm(concat(h{l} @ l{l}_q{h}lo, h{l} @ l{l}_q{h}hi), l{l}_qn);");
+                w!("    let q{h}l = qn{h}[0..{HD}];");
+                w!("    let q{h}h = qn{h}[{HD}..{FHD}];");
+            } else {
+                w!("    let q{h}l = rmsnorm(h{l} @ l{l}_q{h}lo, l{l}_qnl);");
+                w!("    let q{h}h = rmsnorm(h{l} @ l{l}_q{h}hi, l{l}_qnh);");
+            }
             w!("    let rq{h}l = q{h}l * cos - q{h}h * sin;");
             w!("    let rq{h}h = q{h}h * cos + q{h}l * sin;");
         }
         for h in 0..KVH {
-            w!("    let k{h}l = rmsnorm(h{l} @ l{l}_k{h}lo, l{l}_knl);");
-            w!("    let k{h}h = rmsnorm(h{l} @ l{l}_k{h}hi, l{l}_knh);");
+            if joint_qk {
+                w!("    let kn{h} = rmsnorm(concat(h{l} @ l{l}_k{h}lo, h{l} @ l{l}_k{h}hi), l{l}_kn);");
+                w!("    let k{h}l = kn{h}[0..{HD}];");
+                w!("    let k{h}h = kn{h}[{HD}..{FHD}];");
+            } else {
+                w!("    let k{h}l = rmsnorm(h{l} @ l{l}_k{h}lo, l{l}_knl);");
+                w!("    let k{h}h = rmsnorm(h{l} @ l{l}_k{h}hi, l{l}_knh);");
+            }
             w!("    let v{h}l = h{l} @ l{l}_v{h}lo;");
             w!("    let v{h}h = h{l} @ l{l}_v{h}hi;");
-            w!("    kv.k{h}lo[pos] = k{h}l;");
-            w!("    kv.k{h}hi[pos] = k{h}h;");
+            if rope_k {
+                w!("    let rk{h}l = k{h}l * cos - k{h}h * sin;");
+                w!("    let rk{h}h = k{h}h * cos + k{h}l * sin;");
+                w!("    kv.k{h}lo[pos] = rk{h}l;");
+                w!("    kv.k{h}hi[pos] = rk{h}h;");
+            } else {
+                w!("    kv.k{h}lo[pos] = k{h}l;");
+                w!("    kv.k{h}hi[pos] = k{h}h;");
+            }
             w!("    kv.v{h}lo[pos] = v{h}l;");
             w!("    kv.v{h}hi[pos] = v{h}h;");
         }
@@ -162,7 +265,7 @@ fn main() {
         for h in 0..QH {
             let kvh = h / ratio;
             w!(
-                "    let s{h} = softmax((rq{h}l @ kv.k{kvh}lo.T + rq{h}h @ kv.k{kvh}hi.T) * 0.125 + mask);"
+                "    let s{h} = softmax((rq{h}l @ kv.k{kvh}lo.T + rq{h}h @ kv.k{kvh}hi.T) * {scale} + mask);"
             );
             w!("    let c{h}l = s{h} @ kv.v{kvh}lo;");
             w!("    let c{h}h = s{h} @ kv.v{kvh}hi;");
@@ -175,17 +278,17 @@ fn main() {
         w!("    let att{l} = {att};");
         w!("    let r{l} = x + att{l};");
         w!("    let n{l} = rmsnorm(r{l}, l{l}_ln2);");
-        for b in 0..FB {
+        for b in 0..fbr {
             w!("    let f{l}_{b} = (silu(n{l} @ l{l}_wg{b}) * (n{l} @ l{l}_wu{b})) @ l{l}_wd{b};");
         }
-        let fsum: Vec<String> = (0..FB).map(|b| format!("f{l}_{b}")).collect();
+        let fsum: Vec<String> = (0..fbr).map(|b| format!("f{l}_{b}")).collect();
         w!("    r{l} + {}", fsum.join(" + "));
         w!("}}");
         w!();
     }
 
     // ---- head ----
-    w!("fn head(h: f16[{D}]) -> f16[{V}] {{");
+    w!("fn head(h: f16[{D}]) -> f16[{voc}] {{");
     w!("    rmsnorm(h, lnf) @ lmh");
     w!("}}");
     w!();

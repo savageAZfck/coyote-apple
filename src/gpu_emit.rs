@@ -331,6 +331,7 @@ fn scan_grads_s(s: &TStmt, out: &mut std::collections::HashSet<String>) {
         | TStmt::StateUpdate { expr, .. }
         | TStmt::Expr(expr) => scan_grads_e(expr, out),
         TStmt::ParamUpdate { grad, .. } | TStmt::AdamUpdate { grad, .. } => scan_grads_e(grad, out),
+        TStmt::Swap { .. } => {}
     }
 }
 
@@ -1983,6 +1984,7 @@ impl Ge {
                     TStmt::ParamUpdate { grad, .. } | TStmt::AdamUpdate { grad, .. } => {
                         self.can_grad_d(grad, wrt, depth + 1)
                     }
+                    TStmt::Swap { .. } => false,
                 }) || self.can_grad_d(ret, wrt, depth + 1)
             }
             _ => false,
@@ -2500,7 +2502,9 @@ impl Ge {
                             // forward pass already emitted, and state
                             // reads are non-differentiable on both
                             // substrates, so they carry no adjoint.
-                            TStmt::StateUpdate { .. } | TStmt::Expr(_) => {}
+                            TStmt::StateUpdate { .. }
+                            | TStmt::Swap { .. }
+                            | TStmt::Expr(_) => {}
                             other => {
                                 let k = match other {
                                     TStmt::Assign { .. } => "Assign",
@@ -2508,6 +2512,7 @@ impl Ge {
                                     TStmt::AdamUpdate { .. } => "AdamUpdate",
                                     TStmt::Let { .. }
                                     | TStmt::StateUpdate { .. }
+                                    | TStmt::Swap { .. }
                                     | TStmt::Expr(_) => unreachable!(),
                                 };
                                 return Err(format!(
@@ -3775,6 +3780,7 @@ impl Ge {
                         AssignOp::Sub => "-=",
                         AssignOp::Mul => "*=",
                         AssignOp::Div => "/=",
+                        AssignOp::Xor => "^=",
                     };
                     self.lines.push(self.param_st(name, op_s, &v));
                     let body = std::mem::replace(&mut self.lines, saved);
@@ -3798,6 +3804,12 @@ impl Ge {
                     AssignOp::Sub => Some(BinOp::Sub),
                     AssignOp::Mul => Some(BinOp::Mul),
                     AssignOp::Div => Some(BinOp::Div),
+                    AssignOp::Xor => {
+                        return Err(
+                            "gpu emit: '^=' on a local is not lowerable — reversible programs run through the rev stratum"
+                                .into(),
+                        )
+                    }
                 };
                 if self.pos_of(name).is_none() && self.bufs.get(name).is_none() {
                     return Err(format!("gpu emit: assign to unbound {name}"));
@@ -3826,6 +3838,10 @@ impl Ge {
                     .push((name.clone(), new_e));
                 Ok(())
             }
+            TStmt::Swap { .. } => Err(
+                "gpu emit: '<=>' is not lowerable to Metal yet — rev programs run through the CPU reference"
+                    .into(),
+            ),
             TStmt::Expr(_) => Ok(()),
         }
     }

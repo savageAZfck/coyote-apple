@@ -451,6 +451,17 @@ fn exec_stmt(s: &TStmt, env: &mut Env) -> Result<(), String> {
             env.vals.insert(name.clone(), v);
             Ok(())
         }
+        TStmt::Swap { left, right } => {
+            let a = env.vals.get(left).cloned();
+            let b = env.vals.get(right).cloned();
+            if let Some(v) = b {
+                env.vals.insert(left.clone(), v);
+            }
+            if let Some(v) = a {
+                env.vals.insert(right.clone(), v);
+            }
+            Ok(())
+        }
         TStmt::Expr(e) => {
             eval(e, env)?;
             Ok(())

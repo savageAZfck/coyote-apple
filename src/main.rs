@@ -57,6 +57,8 @@ mod referee;
 mod registry;
 mod repl;
 mod replay;
+mod rev_backend;
+mod revcheck;
 mod run;
 mod serve;
 mod shardize;
@@ -107,6 +109,12 @@ fn main() {
         coyote::ast::Target::Enc,
         std::sync::Arc::new(enc_ckks::EncBackend),
     );
+    // the `rev` stratum — bijective programs whose reference engine
+    // is the reversible evaluator; every substrate must agree with it.
+    coyote::backend::register_backend(
+        coyote::ast::Target::Rev,
+        std::sync::Arc::new(rev_backend::RevBackend),
+    );
     // execution sites — `mesh fn` dispatches to treaty'd peers, `pcc fn`
     // to attested nodes. Both ride the Bad Apple mesh wire (wire.rs).
     mesh::register();
@@ -151,6 +159,7 @@ fn main() {
         "bench" => bench::run(&args[2..]),
         "prof" => prof::run(&args[2..]),
         "oracle" => oracle::run(&args[2..]),
+        "revcheck" => revcheck::run(&args[2..]),
         "genmask" => genmask::run(&args[2..]),
         "diff" => diff::run(&args[2..]),
         "test" => test::run(&args[2..]),

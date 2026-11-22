@@ -48,23 +48,28 @@ fn certify(file: &Path, out: Option<&Path>) -> Result<(), String> {
     let src_sha = sha256_hex(&std::fs::read(file).map_err(|e| e.to_string())?);
 
     // claim 1: compiles — parse + typecheck is the first proof obligation.
-    let compiles: Result<(), String> = coyote::parser::parse_file(file)
+    // The checked AST/program table is kept: the reversible claim
+    // re-derives inverse roundtrips from it.
+    let checked = coyote::parser::parse_file(file)
         .map_err(|d| d.to_string())
         .and_then(|(_s, ast)| {
             coyote::typeck::check_all(&ast)
+                .map(|ck| (ast, ck))
                 .map_err(|d| d.to_string())
-                .map(|_| ())
         });
-    if let Err(e) = compiles {
-        let v = json!({
-            "spec": "cycert/0.1",
-            "program": file.display().to_string(),
-            "claims": {"compiles": {"held": false, "error": e}},
-            "verdict": "BROKEN",
-        });
-        println!("{}", serde_json::to_string_pretty(&v).unwrap());
-        return Err("does not compile".into());
-    }
+    let (ast, ck) = match checked {
+        Ok(x) => x,
+        Err(e) => {
+            let v = json!({
+                "spec": "cycert/0.1",
+                "program": file.display().to_string(),
+                "claims": {"compiles": {"held": false, "error": e}},
+                "verdict": "BROKEN",
+            });
+            println!("{}", serde_json::to_string_pretty(&v).unwrap());
+            return Err("does not compile".into());
+        }
+    };
 
     // claims 2-4: dual-backend execution + replay determinism.
     let tmp = std::env::temp_dir().join(format!("cycert-{}", std::process::id()));
@@ -80,6 +85,61 @@ fn certify(file: &Path, out: Option<&Path>) -> Result<(), String> {
     let parity = dev_ret == cpu_ret && dev_trace == cpu_trace;
     let replay = c_dev == c_dev2;
 
+    // claim 5: reversible — every `rev fn`'s inverse actually inverts
+    // on the reference engine (inv∘f = id, measured not asserted).
+    // Vacuously held for programs with no rev fns.
+    let mut rev_held = true;
+    let mut rev_map = serde_json::Map::new();
+    for (i, (fname, iname)) in crate::revcheck::rev_pairs(&ast).iter().enumerate() {
+        let key = format!("{fname}↔{iname}");
+        let pair = ck
+            .ane
+            .iter()
+            .find(|(n, _)| n == fname)
+            .zip(ck.ane.iter().find(|(n, _)| n == iname));
+        match pair {
+            Some(((_, f), (_, v))) => match crate::revcheck::roundtrip(f, v, i * 31 + 7) {
+                Ok((d, _, _)) => {
+                    rev_held &= d <= 0.0;
+                    rev_map.insert(key, json!({"max_diff": d, "held": d <= 0.0}));
+                }
+                Err(e) => {
+                    rev_held = false;
+                    rev_map.insert(key, json!({"held": false, "error": e}));
+                }
+            },
+            None => {
+                rev_held = false;
+                rev_map.insert(key, json!({"held": false, "error": "inverse program missing"}));
+            }
+        }
+    }
+    // host stratum pairs — verified through the VM, exact match.
+    let hpairs = crate::revcheck::host_rev_pairs(&ast);
+    if let Some(host) = &ck.host {
+        match crate::revcheck::host_pairs_check(host, &hpairs) {
+            Ok(rows) => {
+                for (n, d, p) in rows {
+                    rev_held &= p;
+                    rev_map.insert(n, json!({"max_diff": d, "held": p}));
+                }
+            }
+            Err(e) => {
+                rev_held = false;
+                rev_map.insert(
+                    "host".to_string(),
+                    json!({"held": false, "error": e}),
+                );
+            }
+        }
+    } else if !hpairs.is_empty() {
+        rev_held = false;
+        rev_map.insert(
+            "host".to_string(),
+            json!({"held": false, "error": "rev host fn present, no host program"}),
+        );
+    }
+
     let mut claims = json!({
         "compiles": {"held": true},
         "parity": {
@@ -89,6 +149,7 @@ fn certify(file: &Path, out: Option<&Path>) -> Result<(), String> {
         },
         "commitments": {"silicon": c_dev, "cpu_reference": c_cpu, "silicon_replay": c_dev2},
         "replay_determinism": {"held": replay},
+        "reversible": {"held": rev_held, "tol": 0.0, "pairs": rev_map},
     });
     let cert_sha = sha256_hex(serde_json::to_string(&claims).unwrap().as_bytes());
     claims["cert_sha256"] = json!(cert_sha);
@@ -104,7 +165,7 @@ fn certify(file: &Path, out: Option<&Path>) -> Result<(), String> {
         "built": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
         "claims": claims,
-        "verdict": if parity && replay { "CERTIFIED" } else { "BROKEN" },
+        "verdict": if parity && replay && rev_held { "CERTIFIED" } else { "BROKEN" },
     });
     let s = serde_json::to_string_pretty(&v).unwrap();
     match out {
@@ -119,7 +180,7 @@ fn certify(file: &Path, out: Option<&Path>) -> Result<(), String> {
         }
         None => println!("{s}"),
     }
-    if parity && replay {
+    if parity && replay && rev_held {
         Ok(())
     } else {
         Err("certificate claims broken".into())
@@ -158,6 +219,54 @@ fn check(cert_path: &Path) -> Result<(), String> {
                     .as_str()
                     .unwrap_or(""),
     );
+    // reversible claim — re-derive every rev pair's roundtrip and
+    // compare against what the certificate recorded.
+    let rev_ok = (|| -> Result<bool, String> {
+        let (_s, ast) = coyote::parser::parse_file(file).map_err(|d| d.to_string())?;
+        let ck = coyote::typeck::check_all(&ast).map_err(|d| d.to_string())?;
+        let recorded = &claims["reversible"]["pairs"];
+        for (i, (fname, iname)) in crate::revcheck::rev_pairs(&ast).iter().enumerate() {
+            let key = format!("{fname}↔{iname}");
+            let claimed = recorded
+                .get(&key)
+                .and_then(|c| c["held"].as_bool())
+                .unwrap_or(false);
+            let pair = ck
+                .ane
+                .iter()
+                .find(|(n, _)| n == fname)
+                .zip(ck.ane.iter().find(|(n, _)| n == iname));
+            let held = match pair {
+                Some(((_, f), (_, v))) => crate::revcheck::roundtrip(f, v, i * 31 + 7)
+                    .map(|(d, _, _)| d <= 0.0)
+                    .unwrap_or(false),
+                None => false,
+            };
+            if held != claimed {
+                return Ok(false);
+            }
+        }
+        // host pairs — re-derive through the VM and compare held flags.
+        let hpairs = crate::revcheck::host_rev_pairs(&ast);
+        if let Some(host) = &ck.host {
+            for (n, _d, p) in
+                crate::revcheck::host_pairs_check(host, &hpairs).unwrap_or_default()
+            {
+                let claimed = recorded
+                    .get(&n)
+                    .and_then(|c| c["held"].as_bool())
+                    .unwrap_or(false);
+                if p != claimed {
+                    return Ok(false);
+                }
+            }
+        } else if !hpairs.is_empty() {
+            return Ok(false);
+        }
+        Ok(true)
+    })()
+    .unwrap_or(false);
+    check("reversible", rev_ok);
     if ok {
         println!("✓ certificate verified — all claims hold");
         Ok(())
